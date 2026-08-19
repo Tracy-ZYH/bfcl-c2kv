@@ -61,6 +61,54 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _detail_drift_ids(
+    details: list[dict[str, Any]],
+    key: str,
+) -> set[str]:
+    ids = set()
+    for row in details:
+        sample_id = str(row.get("id"))
+        for step in row.get("drift_steps") or []:
+            if step.get(key) is True:
+                ids.add(sample_id)
+                break
+            if key == "candidate_action_drift" and step.get("action_matches_reference") is False:
+                ids.add(sample_id)
+                break
+            if key == "state_drift" and step.get("state_matches_reference") is False:
+                ids.add(sample_id)
+                break
+    return ids
+
+
+def _first_action_divergence_turns(
+    details: list[dict[str, Any]],
+    metrics: list[dict[str, Any]],
+) -> list[float]:
+    by_id = {
+        str(row.get("id")): row
+        for row in details
+        if row.get("id") is not None
+    }
+    turns = []
+    used_ids = set()
+    for row in metrics:
+        first = row.get("first_action_divergence")
+        if isinstance(first, dict) and first.get("turn") is not None:
+            turns.append(float(first["turn"]))
+            if row.get("id") is not None:
+                used_ids.add(str(row.get("id")))
+    for sample_id, row in by_id.items():
+        if sample_id in used_ids:
+            continue
+        for step in row.get("drift_steps") or []:
+            if step.get("candidate_action_drift") is True or step.get("action_matches_reference") is False:
+                if step.get("turn") is not None:
+                    turns.append(float(step["turn"]))
+                break
+    return turns
+
+
 def _mode_summary(
     run_root: Path,
     mode: str,
@@ -69,6 +117,7 @@ def _mode_summary(
     step_rows: list[dict[str, Any]],
 ) -> dict[str, Any]:
     mode_root = run_root / mode
+    details = _load_jsonl(mode_root / "logs" / "details.jsonl")
     metrics = _load_jsonl(mode_root / "logs" / "drift_metrics.jsonl")
     score = _score_header(mode_root, category)
     original = sum(int(row.get("history_original_tokens") or 0) for row in metrics)
@@ -77,12 +126,21 @@ def _mode_summary(
     extract_success = sum(int(row.get("extract_success") or 0) for row in metrics)
     chat_calls = sum(int(row.get("chat_calls") or 0) for row in metrics)
     chat_seconds = sum(float(row.get("chat_seconds") or 0.0) for row in metrics)
-    action_diverged = [
-        row for row in metrics if row.get("first_action_divergence") is not None
-    ]
-    state_diverged = [
-        row for row in metrics if row.get("first_state_divergence") is not None
-    ]
+    action_diverged_ids = _detail_drift_ids(details, "candidate_action_drift")
+    executed_action_diverged_ids = _detail_drift_ids(details, "executed_action_drift")
+    state_diverged_ids = _detail_drift_ids(details, "state_drift")
+    if not action_diverged_ids:
+        action_diverged_ids = {
+            str(row.get("id"))
+            for row in metrics
+            if row.get("first_action_divergence") is not None
+        }
+    if not state_diverged_ids:
+        state_diverged_ids = {
+            str(row.get("id"))
+            for row in metrics
+            if row.get("first_state_divergence") is not None
+        }
     turn_total = len(turn_rows)
     step_total = len(step_rows)
     parsed_steps = [
@@ -109,14 +167,13 @@ def _mode_summary(
             extract_success / extract_calls if extract_calls else None
         ),
         "average_chat_latency": (chat_seconds / chat_calls if chat_calls else None),
-        "samples_with_action_divergence": len(action_diverged),
-        "samples_with_state_divergence": len(state_diverged),
+        "samples_with_action_divergence": len(action_diverged_ids),
+        "samples_with_executed_action_divergence": len(
+            executed_action_diverged_ids
+        ),
+        "samples_with_state_divergence": len(state_diverged_ids),
         "average_first_action_divergence_turn": _mean(
-            [
-                float(row["first_action_divergence"]["turn"])
-                for row in action_diverged
-                if isinstance(row.get("first_action_divergence"), dict)
-            ]
+            _first_action_divergence_turns(details, metrics)
         ),
         "turn_state_pass_rate": _rate(
             sum(1 for row in turn_rows if row.get("state_pass")),
@@ -192,18 +249,22 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
             "",
             "## History Compression / Drift",
             "",
-            "| Method | Hist Compression | Avg Chat s | Extract Success | Action Drift Samples | State Drift Samples | Avg Action Drift Turn |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Method | Hist Compression | Avg Chat s | Extract Success | Candidate Action Drift Samples | Executed Action Drift Samples | State Drift Samples | Avg Action Drift Turn |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in rows:
         lines.append(
-            "| {method} | {comp}x | {chat} | {extract} | {action_drift} | {state_drift} | {turn} |".format(
+            "| {method} | {comp}x | {chat} | {extract} | {action_drift} | {exec_action_drift} | {state_drift} | {turn} |".format(
                 method=names.get(row["method"], row["method"]),
                 comp=_fmt(row.get("history_compression_ratio")),
                 chat=_fmt(row.get("average_chat_latency")),
                 extract=_fmt(row.get("extract_success_rate")),
                 action_drift=_fmt(row.get("samples_with_action_divergence"), 0),
+                exec_action_drift=_fmt(
+                    row.get("samples_with_executed_action_divergence"),
+                    0,
+                ),
                 state_drift=_fmt(row.get("samples_with_state_divergence"), 0),
                 turn=_fmt(row.get("average_first_action_divergence_turn")),
             )
@@ -249,7 +310,12 @@ def run(args: argparse.Namespace) -> None:
     )
     prompt_by_id, answer_by_id = _load_prompts_and_answers(args.category)
     rows = []
-    for mode in MODES:
+    modes = [
+        item.strip()
+        for item in (args.modes or ",".join(MODES)).split(",")
+        if item.strip()
+    ]
+    for mode in modes:
         turn_rows, step_rows = _analysis_rows(
             run_root,
             mode,
@@ -281,6 +347,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-root", required=True)
     parser.add_argument("--category", default="multi_turn_base")
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--modes",
+        default=",".join(MODES),
+        help="Comma-separated drift mode directories to summarize.",
+    )
     return parser.parse_args()
 
 

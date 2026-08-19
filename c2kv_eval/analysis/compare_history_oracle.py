@@ -26,10 +26,13 @@ from c2kv_eval.analysis.compare_multiturn_modes import (
 
 
 MODES = (
+    "pure_full_replay",
+    "c2kv4_oracle_action_mismatch",
     "c2kv4_oracle_correct1",
     "c2kv4_oracle_correct2",
     "c2kv4_oracle_correct4",
     "c2kv4_oracle_correct_all",
+    "c2kv4_oracle_correct_all_strict",
 )
 
 
@@ -111,28 +114,46 @@ def _summary_row(
     candidate_action_drift_ids = set()
     executed_action_drift_ids = set()
     extra_executed_action_ids = set()
+    decode_error_ids = set()
+    candidate_response_drift_ids = set()
+    response_drift_ids = set()
     state_drift_ids = set()
+    serialization_mismatch_ids = set()
     for row in details:
         sample_id = str(row.get("id"))
         for step in row.get("drift_steps") or []:
+            if step.get("decode_error") or step.get("candidate_status") == "decode_error":
+                decode_error_ids.add(sample_id)
+            if step.get("candidate_response_matches_reference") is False:
+                candidate_response_drift_ids.add(sample_id)
+            if step.get("response_matches_reference") is False:
+                response_drift_ids.add(sample_id)
             reference_action = step.get("reference_action")
             decoded_action = step.get("decoded_action")
             executed_action = step.get("executed_action")
-            candidate_match = step.get("action_matches_reference")
+            if step.get("serialization_mismatch"):
+                serialization_mismatch_ids.add(sample_id)
+            if step.get("candidate_action_drift") is True:
+                candidate_action_drift_ids.add(sample_id)
+            candidate_match = step.get("candidate_action_matches_reference")
+            if candidate_match is None:
+                candidate_match = step.get("action_matches_reference")
             if candidate_match is None and reference_action is None:
                 candidate_match = _is_empty_action(decoded_action)
             if candidate_match is False:
                 candidate_action_drift_ids.add(sample_id)
+            if step.get("executed_action_drift") is True:
+                executed_action_drift_ids.add(sample_id)
             executed_match = step.get("executed_action_matches_reference")
             if executed_match is None and reference_action is None:
                 executed_match = _is_empty_action(executed_action)
-            elif executed_match is None:
+            if executed_match is None:
                 executed_match = step.get("action_matches_reference")
             if executed_match is False:
                 executed_action_drift_ids.add(sample_id)
                 if reference_action is None and not _is_empty_action(executed_action):
                     extra_executed_action_ids.add(sample_id)
-            if step.get("state_matches_reference") is False:
+            if step.get("state_drift") is True or step.get("state_matches_reference") is False:
                 state_drift_ids.add(sample_id)
     total_corrections = sum(correction_by_id.values())
     return {
@@ -156,11 +177,25 @@ def _summary_row(
         "extra_executed_action_rate": _rate(
             len(extra_executed_action_ids), total_samples
         ),
+        "decode_error_rate": _rate(len(decode_error_ids), total_samples),
+        "decode_error_count": len(decode_error_ids),
+        "candidate_response_drift_rate": _rate(
+            len(candidate_response_drift_ids),
+            total_samples,
+        ),
+        "candidate_response_drift_count": len(candidate_response_drift_ids),
+        "response_drift_rate": _rate(len(response_drift_ids), total_samples),
+        "response_drift_count": len(response_drift_ids),
         # Backward-compatible alias. For Oracle reports this is candidate drift.
         "action_drift_rate": _rate(len(candidate_action_drift_ids), total_samples),
         "action_drift_count": len(candidate_action_drift_ids),
         "state_drift_rate": _rate(len(state_drift_ids), total_samples),
         "state_drift_count": len(state_drift_ids),
+        "serialization_mismatch_rate": _rate(
+            len(serialization_mismatch_ids),
+            total_samples,
+        ),
+        "serialization_mismatch_count": len(serialization_mismatch_ids),
         "average_corrections": total_corrections / total_samples if total_samples else None,
         "total_corrections": total_corrections,
         "corrected_episode_count": len(corrected_ids),
@@ -171,24 +206,36 @@ def _summary_row(
     }
 
 
+def _display_method(mode: str) -> str:
+    return {
+        "pure_full_replay": "Pure Full Replay",
+        "c2kv4_oracle_action_mismatch": "Oracle Action-Mismatch",
+        "c2kv4_oracle_correct_all_strict": "Correct-All-Strict",
+    }.get(mode, mode)
+
+
 def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
     lines = [
         "# BFCL History C2KV Oracle Recovery",
         "",
-        "| Method | BFCL Acc | Correct | Turn Joint | Candidate Action Drift | Executed Action Drift | Extra Executed Action | State Drift | Avg Corrections | Recovery Success |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Method | BFCL Acc | Correct | Turn Joint | Candidate Action Drift | Executed Action Drift | Decode Error | Candidate Response Drift | Executed Response Drift | Extra Executed Action | State Drift | Serialization Mismatch | Avg Corrections | Recovery Success |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {method} | {acc} | {correct} | {joint} | {cand_action} | {exec_action} | {extra_action} | {state} | {avg_corr} | {recovery} |".format(
-                method=row["method"],
+            "| {method} | {acc} | {correct} | {joint} | {cand_action} | {exec_action} | {decode} | {cand_response} | {response} | {extra_action} | {state} | {serial} | {avg_corr} | {recovery} |".format(
+                method=_display_method(row["method"]),
                 acc=_fmt(row.get("bfcl_accuracy")),
                 correct=_fmt(row.get("correct_count")),
                 joint=_fmt(row.get("turn_joint_pass_rate")),
                 cand_action=_fmt(row.get("candidate_action_drift_rate")),
                 exec_action=_fmt(row.get("executed_action_drift_rate")),
+                decode=_fmt(row.get("decode_error_rate")),
+                cand_response=_fmt(row.get("candidate_response_drift_rate")),
+                response=_fmt(row.get("response_drift_rate")),
                 extra_action=_fmt(row.get("extra_executed_action_rate")),
                 state=_fmt(row.get("state_drift_rate")),
+                serial=_fmt(row.get("serialization_mismatch_rate")),
                 avg_corr=_fmt(row.get("average_corrections")),
                 recovery=_fmt(row.get("recovery_success_rate")),
             )
@@ -198,6 +245,9 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
             "",
             "Candidate Action Drift is `C2KV generated action != Full reference action`, even if the oracle later rejects it.",
             "Executed Action Drift is `actually executed action != Full reference action`, after oracle correction.",
+            "Decode Error is an episode with at least one C2KV candidate that failed BFCL handler decoding.",
+            "Candidate Response Drift is a no-tool-call reference step where the C2KV candidate text differed from the Full reference text.",
+            "Executed Response Drift is measured after oracle correction.",
             "Extra Executed Action means the Full reference has no action for this turn/step, but the evaluated trajectory executed one.",
             "State Drift is measured after the executed action.",
             "Recovery Success Rate is BFCL success among episodes where at least one oracle correction was applied.",
@@ -217,7 +267,12 @@ def run(args: argparse.Namespace) -> None:
     )
     prompt_by_id, answer_by_id = _load_prompts_and_answers(args.category)
     rows = []
-    for mode in MODES:
+    modes = [
+        item.strip()
+        for item in (args.modes or ",".join(MODES)).split(",")
+        if item.strip()
+    ]
+    for mode in modes:
         turn_rows, _ = _analysis_rows(
             run_root,
             mode,
@@ -256,6 +311,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-root", required=True)
     parser.add_argument("--category", default="multi_turn_base")
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--modes",
+        default=",".join(MODES),
+        help="Comma-separated oracle mode directories to summarize.",
+    )
     return parser.parse_args()
 
 

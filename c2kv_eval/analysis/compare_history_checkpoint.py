@@ -303,6 +303,15 @@ def _summary_row(
     full_verifier_tokens = sum(
         int(row.get("full_probe_prompt_tokens") or 0) for row in checkpoint_steps
     )
+    c2kv_verifier_tokens = sum(
+        int(row.get("c2kv_probe_prompt_tokens") or 0) for row in checkpoint_steps
+    )
+    total_candidate_tokens = sum(
+        int(row.get("history_prompt_tokens") or 0) for row in checkpoint_steps
+    )
+    baseline_full_prompt_tokens = sum(
+        int(row.get("full_history_tokens") or 0) for row in checkpoint_steps
+    )
     refreshed_steps = [row for row in checkpoint_steps if row.get("refresh_triggered")]
     regen_same_count = sum(
         1 for row in refreshed_steps if row.get("regenerated_same_as_candidate")
@@ -320,6 +329,14 @@ def _summary_row(
     state_drift_ids = {
         str(row.get("id")) for row in checkpoint_steps if row.get("state_drift")
     }
+    serialization_mismatch_ids = {
+        str(row.get("id"))
+        for row in checkpoint_steps
+        if row.get("serialization_mismatch")
+    }
+    candidate_readout_reused = sum(
+        1 for row in checkpoint_steps if row.get("candidate_readout_reused")
+    )
     refreshed_ids = {
         str(row.get("id")) for row in checkpoint_steps if row.get("refresh_triggered")
     }
@@ -329,7 +346,12 @@ def _summary_row(
     effective_history_tokens = sum(
         int(row.get("history_effective_tokens") or 0) for row in metrics
     )
-    effective_total = (
+    total_verify_tokens = full_verifier_tokens + c2kv_verifier_tokens
+    total_recovery_tokens = full_regenerated_tokens
+    e2e_work_tokens = (
+        total_candidate_tokens + total_verify_tokens + total_recovery_tokens
+    )
+    legacy_effective_total = (
         effective_history_tokens + full_regenerated_tokens + full_verifier_tokens
     )
     chat_calls = sum(int(row.get("chat_calls") or 0) for row in metrics)
@@ -359,9 +381,17 @@ def _summary_row(
             len(executed_action_drift_ids), total_samples
         ),
         "state_drift_rate": _rate(len(state_drift_ids), total_samples),
+        "serialization_mismatch_rate": _rate(
+            len(serialization_mismatch_ids),
+            total_samples,
+        ),
         "verify_rate": _rate(verify_count, total_steps),
         "refresh_rate": _rate(refresh_count, total_steps),
         "readout_available_rate": calibration.get("readout_available_rate"),
+        "candidate_readout_reuse_rate": _rate(
+            candidate_readout_reused,
+            total_steps,
+        ),
         "regenerated_same_as_candidate_rate": _rate(
             regen_same_count, len(refreshed_steps)
         ),
@@ -372,10 +402,34 @@ def _summary_row(
         "average_regenerated_steps": (
             regenerated_steps / total_samples if total_samples else None
         ),
+        "history_full_tokens": original_history_tokens,
+        "history_effective_c2kv_tokens": effective_history_tokens,
+        "history_memory_compression_ratio": (
+            original_history_tokens / effective_history_tokens
+            if effective_history_tokens
+            else 1.0
+        ),
+        "baseline_full_prompt_tokens": baseline_full_prompt_tokens,
+        "candidate_prompt_tokens": total_candidate_tokens,
+        "candidate_effective_history_tokens": effective_history_tokens,
+        "c2kv_verify_prompt_tokens": c2kv_verifier_tokens,
+        "full_verify_prompt_tokens": full_verifier_tokens,
+        "recovery_prompt_tokens": total_recovery_tokens,
+        "recovery_full_history_tokens": full_regenerated_tokens,
+        "total_candidate_tokens": total_candidate_tokens,
+        "total_verify_tokens": total_verify_tokens,
+        "total_recovery_tokens": total_recovery_tokens,
         "full_regenerated_tokens": full_regenerated_tokens,
         "full_verifier_tokens": full_verifier_tokens,
+        "c2kv_verifier_tokens": c2kv_verifier_tokens,
+        "e2e_token_work_ratio": (
+            baseline_full_prompt_tokens / e2e_work_tokens if e2e_work_tokens else 1.0
+        ),
+        "legacy_effective_compression_ratio": (
+            original_history_tokens / legacy_effective_total if legacy_effective_total else 1.0
+        ),
         "effective_compression_ratio": (
-            original_history_tokens / effective_total if effective_total else 1.0
+            original_history_tokens / legacy_effective_total if legacy_effective_total else 1.0
         ),
         "average_chat_latency": chat_seconds / chat_calls if chat_calls else None,
         "kv_divergence_auroc": calibration.get("kv_divergence_auroc"),
@@ -406,12 +460,12 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
     lines = [
         "# BFCL History Checkpoint Recovery",
         "",
-        "| Method | BFCL Acc | Correct | Turn Joint | Candidate Action Drift | Executed Action Drift | State Drift | Verify Rate | Refresh Rate | Readout | KV AUROC | KL AUROC | Ent AUROC | Margin AUROC | Config F1 | Config Thr | Best F1 | Best Thr | Recovery Success | Avg Regen Steps | Full Regen Tokens | Full Verify Tokens | Effective Compression | Avg Chat s |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Method | BFCL Acc | Correct | Turn Joint | Candidate Action Drift | Executed Action Drift | State Drift | Serialization Mismatch | Verify Rate | Refresh Rate | Readout | Reuse Readout | KV AUROC | KL AUROC | Ent AUROC | Margin AUROC | Config F1 | Config Thr | Best F1 | Best Thr | Recovery Success | Avg Regen Steps | History KV Compression | E2E Token Work Ratio | Legacy Effective Compression | Avg Chat s |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {method} | {acc} | {correct} | {joint} | {cand} | {execd} | {state} | {verify} | {refresh} | {readout} | {kv_auc} | {kl_auc} | {ent_auc} | {margin_auc} | {config_f1} | {config_threshold} | {best_f1} | {best_threshold} | {recovery} | {regen} | {tokens} | {verify_tokens} | {comp}x | {chat} |".format(
+            "| {method} | {acc} | {correct} | {joint} | {cand} | {execd} | {state} | {serial} | {verify} | {refresh} | {readout} | {reuse} | {kv_auc} | {kl_auc} | {ent_auc} | {margin_auc} | {config_f1} | {config_threshold} | {best_f1} | {best_threshold} | {recovery} | {regen} | {hist_comp}x | {e2e_ratio}x | {legacy_comp}x | {chat} |".format(
                 method=row["method"],
                 acc=_fmt(row.get("bfcl_accuracy")),
                 correct=_fmt(row.get("correct_count")),
@@ -419,9 +473,11 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
                 cand=_fmt(row.get("candidate_action_drift_rate")),
                 execd=_fmt(row.get("executed_action_drift_rate")),
                 state=_fmt(row.get("state_drift_rate")),
+                serial=_fmt(row.get("serialization_mismatch_rate")),
                 verify=_fmt(row.get("verify_rate")),
                 refresh=_fmt(row.get("refresh_rate")),
                 readout=_fmt(row.get("readout_available_rate")),
+                reuse=_fmt(row.get("candidate_readout_reuse_rate")),
                 kv_auc=_fmt(row.get("kv_divergence_auroc")),
                 kl_auc=_fmt(row.get("logit_kl_auroc")),
                 ent_auc=_fmt(row.get("entropy_auroc")),
@@ -432,9 +488,9 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
                 best_threshold=_fmt(row.get("best_threshold")),
                 recovery=_fmt(row.get("recovery_success_rate")),
                 regen=_fmt(row.get("average_regenerated_steps")),
-                tokens=_fmt(row.get("full_regenerated_tokens")),
-                verify_tokens=_fmt(row.get("full_verifier_tokens")),
-                comp=_fmt(row.get("effective_compression_ratio")),
+                hist_comp=_fmt(row.get("history_memory_compression_ratio")),
+                e2e_ratio=_fmt(row.get("e2e_token_work_ratio")),
+                legacy_comp=_fmt(row.get("legacy_effective_compression_ratio")),
                 chat=_fmt(row.get("average_chat_latency")),
             )
         )
@@ -445,7 +501,9 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
             "Executed Action Drift and State Drift are measured after rollback/refresh/regeneration.",
             "KV AUROC and threshold sweep use Candidate Action Drift as the label.",
             "The full sweep is written to each mode's `logs/kv_threshold_sweep.csv` when KV scores are available.",
-            "Effective Compression includes C2KV effective history tokens plus full tokens spent by verifier probes and regeneration.",
+            "History KV Compression = Full History Tokens / Effective History KV Tokens.",
+            "E2E Token Work Ratio = Full Baseline Prompt Token Work / (Candidate + Verify + Recovery Prompt Token Work).",
+            "`Legacy Effective Compression` is the previous mixed accounting and is retained only for continuity.",
         ]
     )
     (run_root / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

@@ -78,6 +78,7 @@ def analyze(args: argparse.Namespace) -> None:
     }
     aligned_rows: list[dict[str, Any]] = []
     drift_sample_count = 0
+    all_action_drift_ids = set()
 
     for row in details:
         sample_id = str(row.get("id"))
@@ -85,10 +86,24 @@ def analyze(args: argparse.Namespace) -> None:
             continue
         metrics = row.get("c2kv_drift_metrics") or {}
         first = metrics.get("first_action_divergence")
+        steps = row.get("drift_steps") or []
+        if isinstance(steps, list):
+            for step in steps:
+                if (
+                    step.get("candidate_action_drift") is True
+                    or step.get("action_matches_reference") is False
+                ):
+                    all_action_drift_ids.add(sample_id)
+                    if not isinstance(first, dict) or first.get("global_step") is None:
+                        first = {
+                            "turn": step.get("turn"),
+                            "step": step.get("step"),
+                            "global_step": step.get("global_step"),
+                        }
+                    break
         if not isinstance(first, dict) or first.get("global_step") is None:
             continue
         drift_step = int(first["global_step"])
-        steps = row.get("drift_steps") or []
         if not isinstance(steps, list):
             continue
         drift_sample_count += 1
@@ -98,10 +113,14 @@ def analyze(args: argparse.Namespace) -> None:
                 continue
             step = steps[global_step]
             metric = step_by_key.get((sample_id, global_step), {})
-            action_matches = step.get("action_matches_reference")
-            state_matches = step.get("state_matches_reference")
-            action_drift = action_matches is False
-            state_drift = state_matches is False
+            action_drift = (
+                step.get("candidate_action_drift") is True
+                or step.get("action_matches_reference") is False
+            )
+            state_drift = (
+                step.get("state_drift") is True
+                or step.get("state_matches_reference") is False
+            )
             state_pass = metric.get("state_pass_after_turn")
             response_pass = metric.get("response_pass_after_turn")
             turn_failure = None
@@ -159,6 +178,13 @@ def analyze(args: argparse.Namespace) -> None:
         run_root / "analysis" / f"{args.mode}_after_first_drift"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
+    warnings = []
+    rel0_samples = buckets.get(0, {}).get("samples", 0)
+    if len(all_action_drift_ids) != rel0_samples:
+        warnings.append(
+            "Action Drift Samples does not match Relative Step 0 Samples: "
+            f"{len(all_action_drift_ids)} vs {rel0_samples}"
+        )
     (output_dir / "aligned_steps.jsonl").write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in aligned_rows),
         encoding="utf-8",
@@ -170,6 +196,9 @@ def analyze(args: argparse.Namespace) -> None:
                 "mode": args.mode,
                 "ids_path": args.ids_path or None,
                 "drift_sample_count": drift_sample_count,
+                "action_drift_sample_count": len(all_action_drift_ids),
+                "relative_step_0_samples": rel0_samples,
+                "warnings": warnings,
                 "rows": summary_rows,
             },
             ensure_ascii=False,
@@ -188,6 +217,8 @@ def analyze(args: argparse.Namespace) -> None:
         "",
         f"Mode: `{args.mode}`",
         f"Drift samples: {drift_sample_count}",
+        f"Action drift sample count: {len(all_action_drift_ids)}",
+        f"Relative step 0 samples: {rel0_samples}",
         "",
         "| Relative Step | Samples | Action Drift | State Drift | Turn Failure | Executable Tool |",
         "| ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -203,6 +234,9 @@ def analyze(args: argparse.Namespace) -> None:
                 exec_rate=_fmt(row["executable_tool_rate"]),
             )
         )
+    if warnings:
+        lines.extend(["", "## Warnings", ""])
+        lines.extend(f"- {warning}" for warning in warnings)
     (output_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(json.dumps({"output_dir": str(output_dir), "drift_sample_count": drift_sample_count}, ensure_ascii=False, indent=2))
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import re
 import time
 import traceback
@@ -42,6 +44,15 @@ from c2kv_eval.adapters.bfcl_history_drift import (
     _token_count,
     _tool_payload,
 )
+from c2kv_eval.adapters.history_step_common import (
+    action_matches,
+    build_step_record,
+    decode_candidate,
+    mark_first_divergence,
+    reference_by_turn_step,
+    reference_step_for,
+    serialization_roundtrip,
+)
 
 
 CHECKPOINT_MODES = {
@@ -52,6 +63,16 @@ CHECKPOINT_MODES = {
 }
 
 KV_VERIFIERS = {"instant_kv", "cumulative_kv", "kv_divergence"}
+
+
+def _stable_hash(value: Any) -> str:
+    payload = json.dumps(
+        make_json_serializable(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _extract_numeric_vector(value: Any, *, max_items: int = 8192) -> list[float]:
@@ -206,11 +227,13 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         drift_args.mode = "history_c2kv4_closed_loop"
         super().__init__(drift_args)
         self.checkpoint_interval = args.checkpoint_interval
+        self.requested_verifier = args.verifier
         self.verifier = args.verifier
         self.verify_threshold = args.verify_threshold
         self.recovery_mode = args.recovery_mode
         self.verify_layers = args.verify_layers
         self.online_verify = bool(args.online_verify)
+        self.reuse_candidate_readout = bool(args.reuse_candidate_readout)
         self._cumulative_divergence = 0.0
         if self.verifier in {"instant_kv", "cumulative_kv"}:
             self.verifier = "kv_divergence"
@@ -238,14 +261,111 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
     def _reference_maps(self, sample_id: str) -> tuple[dict[tuple[int, int], dict[str, Any]], list[Any]]:
         row = self.reference_by_id.get(sample_id) or {}
         steps = row.get("drift_steps") or []
-        by_turn_step = {
-            (int(step.get("turn")), int(step.get("step"))): step
-            for step in steps
-            if isinstance(step, dict)
-            and step.get("turn") is not None
-            and step.get("step") is not None
+        return reference_by_turn_step(steps), row.get("result") or []
+
+    def _message_fingerprint(self, messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        out = []
+        for index, message in enumerate(messages):
+            out.append(
+                {
+                    "index": index,
+                    "role": message.get("role"),
+                    "content_hash": _stable_hash(message.get("content")),
+                    "content": message.get("content"),
+                    "has_c2kv_key_hash": bool(message.get("c2kv_key_hash")),
+                    "c2kv_key_hash": message.get("c2kv_key_hash"),
+                    "tool_call_hash": _stable_hash(message.get("tool_calls")),
+                    "tool_call_id": message.get("tool_call_id"),
+                }
+            )
+        return out
+
+    def _message_diffs(
+        self,
+        left: Sequence[dict[str, Any]],
+        right: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        diffs = []
+        max_len = max(len(left), len(right))
+        for index in range(max_len):
+            if index >= len(left) or index >= len(right):
+                diffs.append(
+                    {
+                        "index": index,
+                        "field": "__len__",
+                        "static": index < len(left),
+                        "checkpoint": index < len(right),
+                    }
+                )
+                continue
+            for field in (
+                "role",
+                "content",
+                "tool_calls",
+                "tool_call_id",
+                "c2kv_key_hash",
+            ):
+                if left[index].get(field) != right[index].get(field):
+                    diffs.append(
+                        {
+                            "index": index,
+                            "field": field,
+                            "static": left[index].get(field),
+                            "checkpoint": right[index].get(field),
+                        }
+                    )
+        return diffs
+
+    def _maybe_write_recent2_parity(
+        self,
+        *,
+        checkpoint_messages: Sequence[dict[str, Any]],
+        recovery_messages: Sequence[dict[str, Any]],
+        recovery_debug: dict[str, Any],
+    ) -> None:
+        if os.environ.get("C2KV_DEBUG_RECENT2_PARITY") != "1":
+            return
+        output_path = os.environ.get("C2KV_DEBUG_RECENT2_PARITY_PATH")
+        if output_path:
+            path = Path(output_path)
+        else:
+            path = Path(self.args.summary_path).parent / "recent2_payload_parity.json"
+        old_mode = self.mode
+        try:
+            probe_stats = DriftStats(
+                "recent2_payload_parity",
+                "history_recent2_full_rest_c2kv4",
+                self.ratio,
+            )
+            self.mode = "history_recent2_full_rest_c2kv4"
+            static_messages = self._build_request_messages(
+                checkpoint_messages,
+                probe_stats,
+            )
+        finally:
+            self.mode = old_mode
+        payload = {
+            "static_message_hash": _stable_hash(static_messages),
+            "checkpoint_message_hash": _stable_hash(recovery_messages),
+            "static_message_count": len(static_messages),
+            "checkpoint_message_count": len(recovery_messages),
+            "static_history_units": len(_history_units(static_messages)),
+            "checkpoint_history_units": len(_history_units(recovery_messages)),
+            "static_token_count": _token_count(self.tokenizer, static_messages),
+            "checkpoint_token_count": _token_count(self.tokenizer, recovery_messages),
+            "recovery_debug": recovery_debug,
+            "different_fields": self._message_diffs(
+                static_messages,
+                recovery_messages,
+            ),
+            "static_messages": self._message_fingerprint(static_messages),
+            "checkpoint_messages": self._message_fingerprint(recovery_messages),
         }
-        return by_turn_step, row.get("result") or []
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
     def _build_recovery_messages(
         self,
@@ -305,17 +425,23 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     messages.append({"role": "user", "content": text})
                     full_units += 1
             messages.extend(current)
+            recovery_debug = {
+                "recovery_prompt_mode": "recent2",
+                "c2kv_history_units": c2kv_units,
+                "full_history_units": full_units,
+                "current_messages": len(current),
+                "completed_units": len(units),
+                "recent_full_units": self.recent_full_units,
+            }
+            self._maybe_write_recent2_parity(
+                checkpoint_messages=checkpoint_messages,
+                recovery_messages=messages,
+                recovery_debug=recovery_debug,
+            )
             return (
                 messages,
                 _token_count(self.tokenizer, messages),
-                {
-                    "recovery_prompt_mode": "recent2",
-                    "c2kv_history_units": c2kv_units,
-                    "full_history_units": full_units,
-                    "current_messages": len(current),
-                    "completed_units": len(units),
-                    "recent_full_units": self.recent_full_units,
-                },
+                recovery_debug,
             )
         raise ValueError(f"Unknown recovery mode: {self.recovery_mode}")
 
@@ -327,10 +453,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         ref_step: dict[str, Any] | None,
     ) -> dict[str, Any]:
         reference_action = ref_step.get("decoded_action") if ref_step else None
-        candidate_action_matches = (
-            _normalize_action_text(decoded_action)
-            == _normalize_action_text(reference_action or [])
-        )
+        candidate_action_matches = action_matches(decoded_action, reference_action or [])
         if ref_step is None:
             state_matches = is_empty_execute_response(decoded_action)
         else:
@@ -430,6 +553,9 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         c2kv_messages: Sequence[dict[str, Any]],
         tools: Sequence[dict[str, Any]],
         stats: DriftStats,
+        candidate_raw: dict[str, Any] | None = None,
+        candidate_usage: dict[str, Any] | None = None,
+        candidate_elapsed: float | None = None,
     ) -> dict[str, Any]:
         _, _, full_elapsed, full_usage, full_raw = self._query_with_raw(
             full_messages,
@@ -438,15 +564,33 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             max_completion_tokens=2,
             readout_probe=True,
         )
-        _, _, c2kv_elapsed, c2kv_usage, c2kv_raw = self._query_with_raw(
-            c2kv_messages,
-            tools,
-            stats,
-            max_completion_tokens=2,
-            readout_probe=True,
-        )
         full_readout = self._readout_payload(full_raw)
-        c2kv_readout = self._readout_payload(c2kv_raw)
+        candidate_readout_reused = False
+        if self.reuse_candidate_readout and candidate_raw:
+            c2kv_readout = self._readout_payload(candidate_raw)
+            candidate_readout_reused = bool(c2kv_readout["readout_available"])
+        else:
+            c2kv_readout = {
+                "vector": [],
+                "log_probs": {},
+                "readout_available": False,
+                "readout_source": None,
+                "readout_dim": 0,
+                "entropy": None,
+                "top1_top2_margin": None,
+            }
+        if candidate_readout_reused:
+            c2kv_elapsed = 0.0
+            c2kv_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        else:
+            _, _, c2kv_elapsed, c2kv_usage, c2kv_raw = self._query_with_raw(
+                c2kv_messages,
+                tools,
+                stats,
+                max_completion_tokens=2,
+                readout_probe=True,
+            )
+            c2kv_readout = self._readout_payload(c2kv_raw)
         kv_divergence = _cosine_distance(
             full_readout["vector"],
             c2kv_readout["vector"],
@@ -458,7 +602,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             self._cumulative_divergence += kv_divergence
         score = (
             self._cumulative_divergence
-            if self.verifier == "cumulative_kv"
+            if self.requested_verifier == "cumulative_kv"
             else kv_divergence
         )
         verify_failed = (
@@ -480,6 +624,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             ),
             "full_readout_source": full_readout["readout_source"],
             "c2kv_readout_source": c2kv_readout["readout_source"],
+            "candidate_readout_reused": candidate_readout_reused,
             "full_readout_dim": full_readout["readout_dim"],
             "c2kv_readout_dim": c2kv_readout["readout_dim"],
             "full_probe_seconds": full_elapsed,
@@ -502,9 +647,11 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             **stats.as_dict(),
             "checkpoint_interval": self.checkpoint_interval,
             "verifier": self.verifier,
+            "requested_verifier": self.requested_verifier,
             "verify_threshold": self.verify_threshold,
             "verify_layers": self.verify_layers,
             "online_verify": self.online_verify,
+            "reuse_candidate_readout": self.reuse_candidate_readout,
             "recovery_mode": self.recovery_mode,
             "verify_count": metadata.get("verify_count", 0),
             "refresh_count": metadata.get("refresh_count", 0),
@@ -585,29 +732,36 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     request_messages,
                     tools,
                     stats,
+                    readout_probe=(
+                        self.verifier == "kv_divergence"
+                        and self.reuse_candidate_readout
+                    ),
                 )
                 candidate_assistant = _assistant_history_message(
                     candidate_text,
                     candidate_message.get("tool_calls"),
                 )
-                try:
-                    candidate_action = self._decode(candidate_text)
-                except Exception:
-                    candidate_action = []
+                candidate = decode_candidate(self.decoder, candidate_text)
+                candidate_action = candidate.action
 
                 messages.append(candidate_assistant)
+                candidate_execution_error = None
                 if is_empty_execute_response(candidate_action):
                     execution_results = []
                 else:
-                    execution_results, involved_instances = execute_multi_turn_func_call(
-                        candidate_action,
-                        initial_config,
-                        involved_classes,
-                        self.decoder.model_name_underline_replaced,
-                        test_entry_id,
-                        long_context=long_context,
-                        is_evaL_run=False,
-                    )
+                    try:
+                        execution_results, involved_instances = execute_multi_turn_func_call(
+                            candidate_action,
+                            initial_config,
+                            involved_classes,
+                            self.decoder.model_name_underline_replaced,
+                            test_entry_id,
+                            long_context=long_context,
+                            is_evaL_run=False,
+                        )
+                    except Exception as exc:
+                        candidate_execution_error = str(exc)
+                        execution_results = []
                     for idx, execution_result in enumerate(execution_results):
                         messages.append(
                             {
@@ -618,7 +772,13 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         )
 
                 state_after_candidate = _state_log(involved_instances)
-                ref_step = reference_by_turn_step.get((turn_idx, count))
+                ref_step, alignment_status = reference_step_for(
+                    reference_by_turn_step,
+                    reference_result,
+                    turn_idx,
+                    count,
+                    fallback_state=state_after_candidate,
+                )
                 if self.verifier == "oracle":
                     verify = self._verify_oracle(
                         decoded_action=candidate_action,
@@ -633,6 +793,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             "readout_available": False,
                             "full_readout_source": None,
                             "c2kv_readout_source": None,
+                            "candidate_readout_reused": False,
                             "full_readout_dim": 0,
                             "c2kv_readout_dim": 0,
                             "full_probe_seconds": 0.0,
@@ -647,11 +808,14 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         c2kv_messages=request_messages,
                         tools=tools,
                         stats=stats,
+                        candidate_raw=candidate_raw,
+                        candidate_usage=candidate_usage,
+                        candidate_elapsed=candidate_elapsed,
                     )
                     reference_action = ref_step.get("decoded_action") if ref_step else None
-                    candidate_action_matches = (
-                        _normalize_action_text(candidate_action)
-                        == _normalize_action_text(reference_action or [])
+                    candidate_action_matches = action_matches(
+                        candidate_action,
+                        reference_action or [],
                     )
                     if ref_step is None:
                         state_matches = is_empty_execute_response(candidate_action)
@@ -698,10 +862,8 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         text,
                         response_message.get("tool_calls"),
                     )
-                    try:
-                        executed_action = self._decode(text)
-                    except Exception:
-                        executed_action = []
+                    recovery_candidate = decode_candidate(self.decoder, text)
+                    executed_action = recovery_candidate.action
                     messages.append(assistant_history)
                     executed_text = text
                     executed_elapsed = elapsed
@@ -710,11 +872,12 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         "candidate_text": candidate_text,
                         "candidate_assistant_message": candidate_assistant,
                         "candidate_action": candidate_action,
+                        "candidate_status": candidate.status,
                         "regenerated_text": text,
                         "regenerated_action": executed_action,
+                        "regenerated_status": recovery_candidate.status,
                         "regenerated_same_as_candidate": (
-                            _normalize_action_text(candidate_action)
-                            == _normalize_action_text(executed_action)
+                            action_matches(candidate_action, executed_action)
                         ),
                         **recovery_debug,
                     }
@@ -734,18 +897,23 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     }
 
                 if refresh_triggered:
+                    execution_error = None
                     if is_empty_execute_response(executed_action):
                         execution_results = []
                     else:
-                        execution_results, involved_instances = execute_multi_turn_func_call(
-                            executed_action,
-                            initial_config,
-                            involved_classes,
-                            self.decoder.model_name_underline_replaced,
-                            test_entry_id,
-                            long_context=long_context,
-                            is_evaL_run=False,
-                        )
+                        try:
+                            execution_results, involved_instances = execute_multi_turn_func_call(
+                                executed_action,
+                                initial_config,
+                                involved_classes,
+                                self.decoder.model_name_underline_replaced,
+                                test_entry_id,
+                                long_context=long_context,
+                                is_evaL_run=False,
+                            )
+                        except Exception as exc:
+                            execution_error = str(exc)
+                            execution_results = []
                         for idx, execution_result in enumerate(execution_results):
                             messages.append(
                                 {
@@ -754,12 +922,14 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                                     "tool_call_id": f"call_{turn_idx}_{count}_{idx}",
                                 }
                             )
+                else:
+                    execution_error = candidate_execution_error
 
                 state_after_step = _state_log(involved_instances)
                 reference_action = ref_step.get("decoded_action") if ref_step else None
-                executed_action_matches = (
-                    _normalize_action_text(executed_action)
-                    == _normalize_action_text(reference_action or [])
+                executed_action_matches = action_matches(
+                    executed_action,
+                    reference_action or [],
                 )
                 if ref_step is None:
                     state_matches = is_empty_execute_response(executed_action)
@@ -777,8 +947,14 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     {"role": "assistant", "content": executed_text},
                     {
                         "role": "handler_log",
-                        "content": "Successfully decoded model response.",
+                        "content": (
+                            "Successfully decoded model response."
+                            if candidate.status == "decoded_action"
+                            else f"Candidate status: {candidate.status}."
+                        ),
                         "model_response_decoded": executed_action,
+                        "candidate_status": candidate.status,
+                        "candidate_decode_error": candidate.decode_error,
                     },
                 ]
                 if candidate_debug is not None:
@@ -795,37 +971,71 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     step_log.append({"role": "tool", "content": execution_result})
                 turn_log[f"step_{count}"] = step_log
 
-                drift_steps.append(
-                    {
-                        "turn": turn_idx,
-                        "step": count,
-                        "assistant_message": (
-                            candidate_assistant if not refresh_triggered else candidate_assistant
-                        ),
-                        "executed_assistant_message": assistant_history,
-                        "decoded_action": candidate_action,
-                        "executed_action": executed_action,
-                        "execution_results": execution_results,
-                        "history_execution_results": execution_results,
-                        "state": state_after_step,
-                        "reference_action": reference_action,
-                        "reference_state": ref_step.get("state") if ref_step else None,
-                        "action_matches_reference": verify[
-                            "candidate_action_matches_reference"
-                        ],
-                        "executed_action_matches_reference": executed_action_matches,
-                        "state_matches_reference": state_matches,
-                    }
+                executed_roundtrip = serialization_roundtrip(
+                    self.decoder,
+                    executed_text,
+                    executed_action,
                 )
+                step_record = build_step_record(
+                    sample_id=test_entry_id,
+                    turn_idx=turn_idx,
+                    step_idx=count,
+                    global_step=len(drift_steps),
+                    candidate_raw_text=candidate_text,
+                    candidate_action=candidate_action,
+                    candidate_status=candidate.status,
+                    reference_step=ref_step,
+                    alignment_status=alignment_status,
+                    executed_action=executed_action,
+                    state=state_after_step,
+                    decode_error=candidate.decode_error,
+                    empty_response=candidate.empty_response,
+                    execution_error=execution_error,
+                    candidate_assistant_message=candidate_assistant,
+                    executed_assistant_message=assistant_history,
+                    execution_results=execution_results,
+                    history_execution_results=execution_results,
+                    response_matches_reference=None,
+                    candidate_response_matches_reference=None,
+                    roundtrip=executed_roundtrip,
+                    extra={
+                        "checkpoint_id": checkpoint_id,
+                        "refresh_triggered": refresh_triggered,
+                        "candidate_execution_error": candidate_execution_error,
+                    },
+                )
+                step_record["candidate_action_matches_reference"] = verify[
+                    "candidate_action_matches_reference"
+                ]
+                step_record["candidate_action_drift"] = not verify[
+                    "candidate_action_matches_reference"
+                ]
+                step_record["executed_action_matches_reference"] = executed_action_matches
+                step_record["executed_action_drift"] = not executed_action_matches
+                step_record["state_matches_reference"] = state_matches
+                step_record["state_drift"] = state_matches is False
+                drift_steps.append(step_record)
+                mark_first_divergence(stats, step_record)
+                if executed_roundtrip["serialization_mismatch"]:
+                    stats.errors.append(
+                        "serialization mismatch at "
+                        f"{test_entry_id} turn={turn_idx} step={count}"
+                    )
                 checkpoint_steps.append(
                     {
                         "id": test_entry_id,
                         "global_step": len(drift_steps) - 1,
+                        "candidate_global_step": len(drift_steps) - 1,
+                        "reference_global_step": (
+                            ref_step.get("global_step") if ref_step else None
+                        ),
+                        "alignment_status": alignment_status,
                         "turn": turn_idx,
                         "step": count,
                         "checkpoint_id": checkpoint_id,
                         "checkpoint_interval": self.checkpoint_interval,
                         "verifier": self.verifier,
+                        "requested_verifier": self.requested_verifier,
                         "verify_threshold": self.verify_threshold,
                         "online_verify": self.online_verify,
                         "kv_divergence": verify["kv_divergence"],
@@ -836,6 +1046,9 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         "readout_available": verify.get("readout_available"),
                         "full_readout_source": verify.get("full_readout_source"),
                         "c2kv_readout_source": verify.get("c2kv_readout_source"),
+                        "candidate_readout_reused": verify.get(
+                            "candidate_readout_reused"
+                        ),
                         "full_readout_dim": verify.get("full_readout_dim"),
                         "c2kv_readout_dim": verify.get("c2kv_readout_dim"),
                         "full_probe_seconds": verify.get("full_probe_seconds"),
@@ -868,11 +1081,19 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             if candidate_debug
                             else None
                         ),
-                        "candidate_action_drift": not verify[
-                            "candidate_action_matches_reference"
+                        "candidate_status": candidate.status,
+                        "decode_error": candidate.decode_error,
+                        "empty_response": candidate.empty_response,
+                        "candidate_action_drift": step_record[
+                            "candidate_action_drift"
                         ],
-                        "executed_action_drift": not executed_action_matches,
-                        "state_drift": not state_matches,
+                        "executed_action_drift": step_record[
+                            "executed_action_drift"
+                        ],
+                        "state_drift": step_record["state_drift"],
+                        "serialization_mismatch": executed_roundtrip[
+                            "serialization_mismatch"
+                        ],
                         "executable": not is_empty_execute_response(candidate_action),
                         "executed_executable": not is_empty_execute_response(
                             executed_action
@@ -970,6 +1191,7 @@ def run(args: argparse.Namespace) -> None:
         "verify_threshold": args.verify_threshold,
         "verify_layers": args.verify_layers,
         "online_verify": args.online_verify,
+        "reuse_candidate_readout": args.reuse_candidate_readout,
         "recovery_mode": args.recovery_mode,
         "verify_count": sum(int(row.get("verify_count") or 0) for row in metrics_rows),
         "refresh_count": sum(int(row.get("refresh_count") or 0) for row in metrics_rows),
@@ -1021,6 +1243,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--online-verify", action="store_true")
+    parser.add_argument(
+        "--reuse-candidate-readout",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument(
         "--recovery-mode",
         choices=sorted(CHECKPOINT_MODES),

@@ -37,6 +37,19 @@ from bfcl_eval.utils import (
     sort_key,
 )
 
+from c2kv_eval.adapters.history_step_common import (
+    action_matches,
+    build_step_record,
+    decode_candidate,
+    mark_first_divergence,
+    normalize_action_text,
+    normalize_state,
+    reference_by_turn_step,
+    reference_step_for,
+    serialization_roundtrip,
+    stringify_mapping_keys,
+)
+
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507-FC"
 DEFAULT_TOKENIZER_PATH = "/home/zhuyuhan/project/c2kv/models/Qwen3-4B-Instruct-2507"
@@ -196,18 +209,15 @@ def _state_log(involved_instances: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _normalize_action_text(text: Any) -> str:
-    if not isinstance(text, str):
-        return _json_dumps(text)
-    return re.sub(r"\s+", "", text)
+    return normalize_action_text(text)
+
+
+def _stringify_mapping_keys(value: Any) -> Any:
+    return stringify_mapping_keys(value)
 
 
 def _normalize_state(value: Any) -> str:
-    return json.dumps(
-        make_json_serializable(value),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    return normalize_state(value)
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -539,6 +549,8 @@ class HistoryDriftRunner:
         latency: list[list[float]] = []
         drift_steps: list[dict[str, Any]] = []
         reference_steps = self._reference_steps(test_entry_id)
+        reference_map = reference_by_turn_step(reference_steps)
+        reference_result = (self.reference_by_id.get(test_entry_id) or {}).get("result") or []
         force_quit = False
 
         for turn_idx, current_turn_message in enumerate(test_case["question"]):
@@ -571,59 +583,86 @@ class HistoryDriftRunner:
                 ]
                 turn_log[f"step_{count}"] = step_log
 
-                try:
-                    decoded_prediction = self._decode(text)
+                candidate = decode_candidate(self.decoder, text)
+                if candidate.decode_error:
+                    step_log.append(
+                        {
+                            "role": "handler_log",
+                            "content": "Error decoding the model response.",
+                            "error": candidate.decode_error,
+                            "model_response_decoded": candidate.action,
+                        }
+                    )
+                else:
                     step_log.append(
                         {
                             "role": "handler_log",
                             "content": "Successfully decoded model response.",
-                            "model_response_decoded": decoded_prediction,
+                            "model_response_decoded": candidate.action,
                         }
                     )
-                except Exception as exc:
-                    step_log.append(
-                        {
-                            "role": "handler_log",
-                            "content": "Error decoding the model response. Proceed to next turn.",
-                            "error": str(exc),
-                        }
-                    )
-                    break
-
-                if is_empty_execute_response(decoded_prediction):
-                    break
 
                 ref_index = len(drift_steps)
-                ref_step = self._compare_reference_action(
-                    stats=stats,
-                    reference_steps=reference_steps,
-                    ref_index=ref_index,
-                    turn_idx=turn_idx,
-                    step_idx=count,
-                    decoded_prediction=decoded_prediction,
-                )
+                state_before_execution = _state_log(involved_instances)
+                if self.mode == "history_full_closed_loop":
+                    ref_step = None
+                    alignment_status = "not_applicable"
+                else:
+                    ref_step, alignment_status = reference_step_for(
+                        reference_map,
+                        reference_result,
+                        turn_idx,
+                        count,
+                        fallback_state=state_before_execution,
+                    )
+                reference_action = ref_step.get("decoded_action") if ref_step else None
+
+                should_stop_after_record = False
                 if self.mode == "history_c2kv4_teacher_forced":
                     if ref_step is None:
-                        break
-                    decoded_to_execute = ref_step.get("decoded_action") or []
-                    messages.append(deepcopy(ref_step.get("assistant_message") or assistant_history))
-                    execution_results_for_history = list(
-                        ref_step.get("execution_results") or []
-                    )
+                        decoded_to_execute = []
+                        assistant_for_history = assistant_history
+                        execution_results_for_history = []
+                        should_stop_after_record = True
+                    else:
+                        decoded_to_execute = list(reference_action or [])
+                        assistant_for_history = deepcopy(
+                            ref_step.get("assistant_message") or assistant_history
+                        )
+                        execution_results_for_history = list(
+                            ref_step.get("execution_results") or []
+                        )
+                        if is_empty_execute_response(decoded_to_execute):
+                            should_stop_after_record = True
                 else:
-                    decoded_to_execute = decoded_prediction
-                    messages.append(assistant_history)
+                    decoded_to_execute = candidate.action
+                    assistant_for_history = assistant_history
                     execution_results_for_history = None
+                    if (
+                        candidate.status in {"decode_error", "invalid_format", "empty_response"}
+                        or is_empty_execute_response(decoded_to_execute)
+                    ):
+                        should_stop_after_record = True
 
-                execution_results, involved_instances = execute_multi_turn_func_call(
-                    decoded_to_execute,
-                    initial_config,
-                    involved_classes,
-                    self.decoder.model_name_underline_replaced,
-                    test_entry_id,
-                    long_context=long_context,
-                    is_evaL_run=False,
-                )
+                messages.append(deepcopy(assistant_for_history))
+                execution_error = None
+                if is_empty_execute_response(decoded_to_execute):
+                    execution_results = []
+                else:
+                    try:
+                        execution_results, involved_instances = execute_multi_turn_func_call(
+                            decoded_to_execute,
+                            initial_config,
+                            involved_classes,
+                            self.decoder.model_name_underline_replaced,
+                            test_entry_id,
+                            long_context=long_context,
+                            is_evaL_run=False,
+                        )
+                    except Exception as exc:
+                        execution_error = str(exc)
+                        execution_results = []
+                        should_stop_after_record = True
                 history_execution_results = (
                     execution_results_for_history
                     if execution_results_for_history is not None
@@ -640,44 +679,55 @@ class HistoryDriftRunner:
                     step_log.append({"role": "tool", "content": execution_result})
 
                 state_after_step = _state_log(involved_instances)
-                self._compare_reference_state(
-                    stats=stats,
-                    ref_step=ref_step,
-                    ref_index=ref_index,
+                executed_text = _message_text(assistant_for_history)
+                if assistant_for_history.get("tool_calls"):
+                    tool_call_text = _tool_calls_to_text(assistant_for_history.get("tool_calls"))
+                    executed_text = (
+                        (executed_text + "\n" + tool_call_text).strip()
+                        if executed_text
+                        else tool_call_text
+                    )
+                roundtrip = serialization_roundtrip(
+                    self.decoder,
+                    executed_text,
+                    decoded_to_execute,
+                )
+                step_record = build_step_record(
+                    sample_id=test_entry_id,
                     turn_idx=turn_idx,
                     step_idx=count,
-                    state_after_step=state_after_step,
+                    global_step=ref_index,
+                    candidate_raw_text=text,
+                    candidate_action=candidate.action,
+                    candidate_status=candidate.status,
+                    reference_step=ref_step,
+                    alignment_status=alignment_status,
+                    executed_action=decoded_to_execute,
+                    state=state_after_step,
+                    decode_error=candidate.decode_error,
+                    empty_response=candidate.empty_response,
+                    execution_error=execution_error,
+                    candidate_assistant_message=assistant_history,
+                    executed_assistant_message=assistant_for_history,
+                    execution_results=execution_results,
+                    history_execution_results=history_execution_results,
+                    roundtrip=roundtrip,
                 )
-                drift_steps.append(
-                    {
-                        "turn": turn_idx,
-                        "step": count,
-                        "assistant_message": assistant_history,
-                        "decoded_action": decoded_prediction,
-                        "executed_action": decoded_to_execute,
-                        "execution_results": execution_results,
-                        "history_execution_results": history_execution_results,
-                        "state": state_after_step,
-                        "reference_action": (
-                            ref_step.get("decoded_action") if ref_step else None
-                        ),
-                        "reference_state": (
-                            ref_step.get("state") if ref_step else None
-                        ),
-                        "action_matches_reference": (
-                            None
-                            if ref_step is None
-                            else _normalize_action_text(decoded_prediction)
-                            == _normalize_action_text(ref_step.get("decoded_action") or [])
-                        ),
-                        "state_matches_reference": (
-                            None
-                            if ref_step is None
-                            else _normalize_state(state_after_step)
-                            == _normalize_state(ref_step.get("state"))
-                        ),
-                    }
-                )
+                if self.mode != "history_full_closed_loop":
+                    mark_first_divergence(stats, step_record)
+                    if alignment_status == "missing_reference":
+                        stats.errors.append(
+                            f"missing reference action at turn={turn_idx}, step={count}, "
+                            f"candidate_global_step={ref_index}"
+                        )
+                drift_steps.append(step_record)
+                if roundtrip["serialization_mismatch"]:
+                    stats.errors.append(
+                        f"serialization mismatch at turn={turn_idx}, step={count}, "
+                        f"candidate_global_step={ref_index}"
+                    )
+                if should_stop_after_record:
+                    break
                 count += 1
                 if count > MAXIMUM_STEP_LIMIT:
                     force_quit = True
