@@ -236,6 +236,7 @@ def build_step_record(
     state_match = state_matches(state, reference_state)
     tool_name, arguments = _first_tool_call(candidate_action)
     record = {
+        "schema_version": 2,
         "id": sample_id,
         "turn": turn_idx,
         "step": step_idx,

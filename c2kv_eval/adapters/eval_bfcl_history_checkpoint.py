@@ -237,12 +237,6 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         self._cumulative_divergence = 0.0
         if self.verifier in {"instant_kv", "cumulative_kv"}:
             self.verifier = "kv_divergence"
-        if self.checkpoint_interval != 1:
-            raise NotImplementedError(
-                "The first checkpoint framework version supports oracle + "
-                "checkpoint_interval=1. The CLI keeps 1/2/4 for the planned "
-                "speculative multi-step extension."
-            )
 
     def _restore_instances(
         self,
@@ -634,6 +628,893 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "verify_failed": verify_failed,
         }
 
+    def _snapshot(
+        self,
+        *,
+        checkpoint_id: int,
+        global_step: int,
+        messages: list[dict[str, Any]],
+        involved_instances: dict[str, Any],
+        current_turn_response: list[str],
+        current_turn_inputs: list[int],
+        current_turn_outputs: list[int],
+        current_turn_latency: list[float],
+        turn_log: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "checkpoint_id": checkpoint_id,
+            "global_step": global_step,
+            "messages": deepcopy(messages),
+            "instances": deepcopy(involved_instances),
+            "state": _state_log(involved_instances),
+            "current_turn_response": deepcopy(current_turn_response),
+            "current_turn_inputs": deepcopy(current_turn_inputs),
+            "current_turn_outputs": deepcopy(current_turn_outputs),
+            "current_turn_latency": deepcopy(current_turn_latency),
+            "turn_log": deepcopy(turn_log),
+        }
+
+    def _restore_snapshot(
+        self,
+        *,
+        test_entry_id: str,
+        snapshot: dict[str, Any],
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[str, Any],
+        list[str],
+        list[int],
+        list[int],
+        list[float],
+        dict[str, Any],
+        list[dict[str, Any]],
+        bool,
+    ]:
+        instances = deepcopy(snapshot["instances"])
+        self._restore_instances(test_entry_id, instances)
+        restored_state = _state_log(instances)
+        matches = _normalize_state(restored_state) == _normalize_state(
+            snapshot.get("state")
+        )
+        return (
+            deepcopy(snapshot["messages"]),
+            instances,
+            deepcopy(snapshot["current_turn_response"]),
+            deepcopy(snapshot["current_turn_inputs"]),
+            deepcopy(snapshot["current_turn_outputs"]),
+            deepcopy(snapshot["current_turn_latency"]),
+            deepcopy(snapshot["turn_log"]),
+            restored_state,
+            matches,
+        )
+
+    def _execute_action(
+        self,
+        *,
+        action: list[str],
+        initial_config: dict[str, Any],
+        involved_classes: list[str],
+        test_entry_id: str,
+        long_context: bool,
+    ) -> tuple[list[Any], dict[str, Any] | None, str | None]:
+        if is_empty_execute_response(action):
+            return [], None, None
+        try:
+            execution_results, involved_instances = execute_multi_turn_func_call(
+                action,
+                initial_config,
+                involved_classes,
+                self.decoder.model_name_underline_replaced,
+                test_entry_id,
+                long_context=long_context,
+                is_evaL_run=False,
+            )
+            return execution_results, involved_instances, None
+        except Exception as exc:
+            return [], None, str(exc)
+
+    @staticmethod
+    def _oracle_verify_stub(
+        *,
+        candidate_action_matches: bool,
+        state_matches: bool | None,
+    ) -> dict[str, Any]:
+        return {
+            "kv_divergence": None,
+            "cumulative_divergence": None,
+            "candidate_action_matches_reference": candidate_action_matches,
+            "state_matches_reference": state_matches,
+            "verify_failed": not candidate_action_matches,
+            "logit_kl": None,
+            "entropy": None,
+            "top1_top2_margin": None,
+            "readout_available": False,
+            "full_readout_source": None,
+            "c2kv_readout_source": None,
+            "candidate_readout_reused": False,
+            "full_readout_dim": 0,
+            "c2kv_readout_dim": 0,
+            "full_probe_seconds": 0.0,
+            "full_probe_prompt_tokens": 0,
+            "c2kv_probe_seconds": 0.0,
+            "c2kv_probe_prompt_tokens": 0,
+        }
+
+    def _checkpoint_step_row(
+        self,
+        *,
+        step_record: dict[str, Any],
+        checkpoint_id: int,
+        segment_index: int,
+        segment_start_step: int,
+        segment_length: int,
+        verify: dict[str, Any],
+        verify_triggered: bool,
+        refresh_triggered: bool,
+        regenerated_steps: int,
+        full_regenerated_tokens: int,
+        recovery_debug: dict[str, Any],
+        regenerated_same_as_candidate: bool | None,
+        history_prompt_tokens: int,
+        request_history_tokens: int,
+        full_history_tokens: int,
+        candidate_readout_reused: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": 2,
+            "id": step_record["id"],
+            "global_step": step_record["global_step"],
+            "candidate_global_step": step_record["candidate_global_step"],
+            "reference_global_step": step_record.get("reference_global_step"),
+            "alignment_status": step_record.get("alignment_status"),
+            "turn": step_record["turn"],
+            "step": step_record["step"],
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_interval": self.checkpoint_interval,
+            "segment_index": segment_index,
+            "segment_start_step": segment_start_step,
+            "segment_length": segment_length,
+            "verifier": self.verifier,
+            "requested_verifier": self.requested_verifier,
+            "verify_threshold": self.verify_threshold,
+            "online_verify": self.online_verify,
+            "kv_divergence": verify.get("kv_divergence"),
+            "cumulative_divergence": verify.get("cumulative_divergence"),
+            "logit_kl": verify.get("logit_kl"),
+            "entropy": verify.get("entropy"),
+            "top1_top2_margin": verify.get("top1_top2_margin"),
+            "readout_available": verify.get("readout_available"),
+            "full_readout_source": verify.get("full_readout_source"),
+            "c2kv_readout_source": verify.get("c2kv_readout_source"),
+            "candidate_readout_reused": candidate_readout_reused
+            or bool(verify.get("candidate_readout_reused")),
+            "full_readout_dim": verify.get("full_readout_dim"),
+            "c2kv_readout_dim": verify.get("c2kv_readout_dim"),
+            "full_probe_seconds": verify.get("full_probe_seconds"),
+            "c2kv_probe_seconds": verify.get("c2kv_probe_seconds"),
+            "full_probe_prompt_tokens": verify.get("full_probe_prompt_tokens", 0),
+            "c2kv_probe_prompt_tokens": verify.get("c2kv_probe_prompt_tokens", 0),
+            "verify_triggered": verify_triggered,
+            "refresh_triggered": refresh_triggered,
+            "rollback_triggered": refresh_triggered,
+            "recovery_mode": self.recovery_mode,
+            "regenerated_steps": regenerated_steps,
+            "full_regenerated_tokens": full_regenerated_tokens,
+            "recovery_prompt_mode": recovery_debug.get("recovery_prompt_mode"),
+            "c2kv_history_units": recovery_debug.get("c2kv_history_units", 0),
+            "full_history_units": recovery_debug.get("full_history_units", 0),
+            "current_messages": recovery_debug.get("current_messages", 0),
+            "regenerated_same_as_candidate": regenerated_same_as_candidate,
+            "candidate_status": step_record.get("candidate_status"),
+            "decode_error": step_record.get("decode_error"),
+            "empty_response": step_record.get("empty_response"),
+            "candidate_action_drift": step_record.get("candidate_action_drift"),
+            "executed_action_drift": step_record.get("executed_action_drift"),
+            "state_drift": step_record.get("state_drift"),
+            "serialization_mismatch": step_record.get("serialization_mismatch"),
+            "executable": not is_empty_execute_response(
+                step_record.get("candidate_action") or []
+            ),
+            "executed_executable": not is_empty_execute_response(
+                step_record.get("executed_action") or []
+            ),
+            "history_prompt_tokens": history_prompt_tokens,
+            "request_history_tokens": request_history_tokens,
+            "full_history_tokens": full_history_tokens,
+        }
+
+    def _make_final_step_record(
+        self,
+        *,
+        spec_info: dict[str, Any],
+        executed_text: str,
+        executed_message: dict[str, Any],
+        executed_action: list[str],
+        execution_results: list[Any],
+        state_after_step: list[dict[str, Any]],
+        execution_error: str | None,
+        global_step: int,
+        oracle_corrected: bool,
+        extra: dict[str, Any],
+    ) -> dict[str, Any]:
+        roundtrip = serialization_roundtrip(
+            self.decoder,
+            executed_text,
+            executed_action,
+        )
+        return build_step_record(
+            sample_id=spec_info["sample_id"],
+            turn_idx=spec_info["turn_idx"],
+            step_idx=spec_info["step_idx"],
+            global_step=global_step,
+            candidate_raw_text=spec_info["candidate_text"],
+            candidate_action=spec_info["candidate_action"],
+            candidate_status=spec_info["candidate_status"],
+            reference_step=spec_info["ref_step"],
+            alignment_status=spec_info["alignment_status"],
+            executed_action=executed_action,
+            state=state_after_step,
+            decode_error=spec_info["candidate_decode_error"],
+            empty_response=spec_info["candidate_empty_response"],
+            execution_error=execution_error,
+            candidate_assistant_message=spec_info["candidate_assistant"],
+            executed_assistant_message=executed_message,
+            execution_results=execution_results,
+            history_execution_results=execution_results,
+            oracle_corrected=oracle_corrected,
+            response_matches_reference=None,
+            candidate_response_matches_reference=None,
+            roundtrip=roundtrip,
+            extra=extra,
+        )
+
+    def _run_sample_checkpoint_impl_oracle_multistep(
+        self,
+        test_case: dict[str, Any],
+        stats: DriftStats,
+    ) -> tuple[list[list[str]], dict[str, Any]]:
+        if self.recovery_mode == "recent2" and self.checkpoint_interval != 1:
+            raise NotImplementedError(
+                "recent2 multi-step rollback is intentionally not compared yet; "
+                "use current_step or since_checkpoint for checkpoint_interval > 1."
+            )
+
+        initial_config = test_case.get("initial_config", {})
+        involved_classes = test_case["involved_classes"]
+        test_entry_id = test_case["id"]
+        test_category = test_entry_id.rsplit("_", 1)[0]
+        tools = _tool_payload(test_case["function"])
+        long_context = "long_context" in test_category or "composite" in test_category
+        ref_map, reference_result = self._reference_maps(test_entry_id)
+
+        _, involved_instances = execute_multi_turn_func_call(
+            [],
+            initial_config,
+            involved_classes,
+            self.decoder.model_name_underline_replaced,
+            test_entry_id,
+            long_context=long_context,
+            is_evaL_run=False,
+        )
+
+        inference_log: list[Any] = []
+        initial_state = _state_log(involved_instances)
+        if initial_state:
+            inference_log.append(initial_state)
+
+        messages: list[dict[str, Any]] = []
+        all_model_response: list[list[str]] = []
+        input_token_count: list[list[int]] = []
+        output_token_count: list[list[int]] = []
+        latency: list[list[float]] = []
+        checkpoint_steps: list[dict[str, Any]] = []
+        checkpoint_segments: list[dict[str, Any]] = []
+        drift_steps: list[dict[str, Any]] = []
+        verify_count = 0
+        refresh_count = 0
+        regenerated_steps_total = 0
+        full_regenerated_tokens_total = 0
+        checkpoint_id = 0
+        force_quit = False
+
+        for turn_idx, current_turn_message in enumerate(test_case["question"]):
+            messages.extend(deepcopy(current_turn_message))
+            current_turn_response: list[str] = []
+            current_turn_inputs: list[int] = []
+            current_turn_outputs: list[int] = []
+            current_turn_latency: list[float] = []
+            turn_log: dict[str, Any] = {"begin_of_turn_query": current_turn_message}
+            count = 0
+
+            while True:
+                checkpoint_id += 1
+                segment_start_step = len(drift_steps)
+                segment_start_turn_step = count
+                segment_checkpoint = self._snapshot(
+                    checkpoint_id=checkpoint_id,
+                    global_step=segment_start_step,
+                    messages=messages,
+                    involved_instances=involved_instances,
+                    current_turn_response=current_turn_response,
+                    current_turn_inputs=current_turn_inputs,
+                    current_turn_outputs=current_turn_outputs,
+                    current_turn_latency=current_turn_latency,
+                    turn_log=turn_log,
+                )
+                segment_infos: list[dict[str, Any]] = []
+                terminal_after_segment = False
+
+                for segment_index in range(self.checkpoint_interval):
+                    micro_snapshot = self._snapshot(
+                        checkpoint_id=checkpoint_id,
+                        global_step=segment_start_step + len(segment_infos),
+                        messages=messages,
+                        involved_instances=involved_instances,
+                        current_turn_response=current_turn_response,
+                        current_turn_inputs=current_turn_inputs,
+                        current_turn_outputs=current_turn_outputs,
+                        current_turn_latency=current_turn_latency,
+                        turn_log=turn_log,
+                    )
+                    request_messages = self._build_request_messages(messages, stats)
+                    (
+                        candidate_text,
+                        candidate_message,
+                        candidate_elapsed,
+                        candidate_usage,
+                        candidate_raw,
+                    ) = self._query_with_raw(
+                        request_messages,
+                        tools,
+                        stats,
+                        readout_probe=False,
+                    )
+                    candidate_assistant = _assistant_history_message(
+                        candidate_text,
+                        candidate_message.get("tool_calls"),
+                    )
+                    candidate = decode_candidate(self.decoder, candidate_text)
+                    candidate_action = candidate.action
+                    messages.append(candidate_assistant)
+
+                    execution_results, next_instances, execution_error = (
+                        self._execute_action(
+                            action=candidate_action,
+                            initial_config=initial_config,
+                            involved_classes=involved_classes,
+                            test_entry_id=test_entry_id,
+                            long_context=long_context,
+                        )
+                    )
+                    if next_instances is not None:
+                        involved_instances = next_instances
+                    for idx, execution_result in enumerate(execution_results):
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "content": execution_result,
+                                "tool_call_id": f"call_{turn_idx}_{count}_{idx}",
+                            }
+                        )
+                    state_after_candidate = _state_log(involved_instances)
+                    ref_step, alignment_status = reference_step_for(
+                        ref_map,
+                        reference_result,
+                        turn_idx,
+                        count,
+                        fallback_state=state_after_candidate,
+                    )
+                    reference_action = ref_step.get("decoded_action") if ref_step else None
+                    candidate_matches = action_matches(
+                        candidate_action,
+                        reference_action or [],
+                    )
+                    if candidate.status in {"decode_error", "invalid_format"} and ref_step:
+                        candidate_matches = False
+                    reference_state = ref_step.get("state") if ref_step else None
+                    state_matches = (
+                        None
+                        if reference_state is None
+                        else _normalize_state(state_after_candidate)
+                        == _normalize_state(reference_state)
+                    )
+                    verify = self._oracle_verify_stub(
+                        candidate_action_matches=candidate_matches,
+                        state_matches=state_matches,
+                    )
+                    current_turn_response.append(candidate_text)
+                    current_turn_inputs.append(candidate_usage["prompt_tokens"])
+                    current_turn_outputs.append(candidate_usage["completion_tokens"])
+                    current_turn_latency.append(candidate_elapsed)
+                    step_log = [
+                        {"role": "assistant", "content": candidate_text},
+                        {
+                            "role": "handler_log",
+                            "content": (
+                                "Successfully decoded model response."
+                                if candidate.status == "decoded_action"
+                                else f"Candidate status: {candidate.status}."
+                            ),
+                            "model_response_decoded": candidate_action,
+                            "candidate_status": candidate.status,
+                            "candidate_decode_error": candidate.decode_error,
+                        },
+                    ]
+                    for execution_result in execution_results:
+                        step_log.append({"role": "tool", "content": execution_result})
+                    turn_log[f"step_{count}"] = step_log
+
+                    segment_infos.append(
+                        {
+                            "sample_id": test_entry_id,
+                            "turn_idx": turn_idx,
+                            "step_idx": count,
+                            "segment_index": segment_index,
+                            "micro_snapshot": micro_snapshot,
+                            "request_messages": request_messages,
+                            "candidate_text": candidate_text,
+                            "candidate_message": candidate_message,
+                            "candidate_assistant": candidate_assistant,
+                            "candidate_action": candidate_action,
+                            "candidate_status": candidate.status,
+                            "candidate_decode_error": candidate.decode_error,
+                            "candidate_empty_response": candidate.empty_response,
+                            "candidate_usage": candidate_usage,
+                            "candidate_elapsed": candidate_elapsed,
+                            "candidate_raw": candidate_raw,
+                            "execution_results": execution_results,
+                            "execution_error": execution_error,
+                            "state_after_candidate": state_after_candidate,
+                            "ref_step": ref_step,
+                            "alignment_status": alignment_status,
+                            "verify": verify,
+                            "terminal": (
+                                is_empty_execute_response(candidate_action)
+                                or execution_error is not None
+                            ),
+                            "request_history_tokens": _token_count(
+                                self.tokenizer,
+                                request_messages,
+                            ),
+                            "full_history_tokens": _token_count(
+                                self.tokenizer,
+                                micro_snapshot["messages"],
+                            ),
+                        }
+                    )
+                    count += 1
+                    if is_empty_execute_response(candidate_action):
+                        terminal_after_segment = True
+                        break
+                    if execution_error is not None:
+                        terminal_after_segment = True
+                        break
+                    if count > MAXIMUM_STEP_LIMIT:
+                        force_quit = True
+                        terminal_after_segment = True
+                        step_log.append(
+                            {
+                                "role": "handler_log",
+                                "content": (
+                                    "Model has been forced to quit after "
+                                    f"{MAXIMUM_STEP_LIMIT} steps."
+                                ),
+                            }
+                        )
+                        break
+
+                if not segment_infos:
+                    break
+
+                verify_count += 1
+                segment_has_drift = any(
+                    bool(info["verify"]["verify_failed"]) for info in segment_infos
+                )
+                speculative_end_state = _state_log(involved_instances)
+                regenerated_infos: list[dict[str, Any]] = []
+                final_records: list[dict[str, Any]] = []
+                segment_recovery_tokens = 0
+                rollback_steps = 0
+                restored_state: list[dict[str, Any]] | None = None
+                rollback_state_matches_checkpoint: bool | None = None
+
+                if not segment_has_drift:
+                    for info in segment_infos:
+                        step_record = self._make_final_step_record(
+                            spec_info=info,
+                            executed_text=info["candidate_text"],
+                            executed_message=info["candidate_assistant"],
+                            executed_action=info["candidate_action"],
+                            execution_results=info["execution_results"],
+                            state_after_step=info["state_after_candidate"],
+                            execution_error=info["execution_error"],
+                            global_step=len(drift_steps) + len(final_records),
+                            oracle_corrected=False,
+                            extra={
+                                "checkpoint_id": checkpoint_id,
+                                "segment_index": info["segment_index"],
+                                "segment_committed": True,
+                                "refresh_triggered": False,
+                                "rollback_triggered": False,
+                                "candidate_execution_error": info["execution_error"],
+                            },
+                        )
+                        final_records.append(step_record)
+                else:
+                    refresh_count += 1
+                    first_bad_index = next(
+                        index
+                        for index, info in enumerate(segment_infos)
+                        if info["verify"]["verify_failed"]
+                    )
+                    if self.recovery_mode == "current_step":
+                        kept_infos = segment_infos[:first_bad_index]
+                        for info in kept_infos:
+                            step_record = self._make_final_step_record(
+                                spec_info=info,
+                                executed_text=info["candidate_text"],
+                                executed_message=info["candidate_assistant"],
+                                executed_action=info["candidate_action"],
+                                execution_results=info["execution_results"],
+                                state_after_step=info["state_after_candidate"],
+                                execution_error=info["execution_error"],
+                                global_step=len(drift_steps) + len(final_records),
+                                oracle_corrected=False,
+                                extra={
+                                    "checkpoint_id": checkpoint_id,
+                                    "segment_index": info["segment_index"],
+                                    "segment_committed": True,
+                                    "refresh_triggered": False,
+                                    "rollback_triggered": False,
+                                    "candidate_execution_error": info["execution_error"],
+                                },
+                            )
+                            final_records.append(step_record)
+                        restore_target = segment_infos[first_bad_index][
+                            "micro_snapshot"
+                        ]
+                        rollback_steps = len(segment_infos) - first_bad_index
+                        target_infos = [segment_infos[first_bad_index]]
+                    else:
+                        restore_target = segment_checkpoint
+                        rollback_steps = len(segment_infos)
+                        target_infos = segment_infos
+
+                    (
+                        messages,
+                        involved_instances,
+                        current_turn_response,
+                        current_turn_inputs,
+                        current_turn_outputs,
+                        current_turn_latency,
+                        turn_log,
+                        restored_state,
+                        rollback_state_matches_checkpoint,
+                    ) = self._restore_snapshot(
+                        test_entry_id=test_entry_id,
+                        snapshot=restore_target,
+                    )
+                    if not rollback_state_matches_checkpoint:
+                        raise RuntimeError(
+                            "rollback_state_mismatch: "
+                            f"id={test_entry_id} checkpoint_id={checkpoint_id}"
+                        )
+                    count = int(target_infos[0]["step_idx"])
+
+                    for info in target_infos:
+                        recovery_messages, recovery_prompt_tokens, recovery_debug = (
+                            self._build_recovery_messages(messages, stats)
+                        )
+                        segment_recovery_tokens += recovery_prompt_tokens
+                        (
+                            recovery_text,
+                            recovery_message,
+                            recovery_elapsed,
+                            recovery_usage,
+                        ) = self._query(
+                            recovery_messages,
+                            tools,
+                            stats,
+                        )
+                        recovery_assistant = _assistant_history_message(
+                            recovery_text,
+                            recovery_message.get("tool_calls"),
+                        )
+                        recovery_candidate = decode_candidate(
+                            self.decoder,
+                            recovery_text,
+                        )
+                        executed_action = recovery_candidate.action
+                        messages.append(recovery_assistant)
+                        execution_results, next_instances, execution_error = (
+                            self._execute_action(
+                                action=executed_action,
+                                initial_config=initial_config,
+                                involved_classes=involved_classes,
+                                test_entry_id=test_entry_id,
+                                long_context=long_context,
+                            )
+                        )
+                        if next_instances is not None:
+                            involved_instances = next_instances
+                        for idx, execution_result in enumerate(execution_results):
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "content": execution_result,
+                                    "tool_call_id": f"call_{turn_idx}_{count}_{idx}",
+                                }
+                            )
+                        state_after_recovery = _state_log(involved_instances)
+                        current_turn_response.append(recovery_text)
+                        current_turn_inputs.append(recovery_usage["prompt_tokens"])
+                        current_turn_outputs.append(recovery_usage["completion_tokens"])
+                        current_turn_latency.append(recovery_elapsed)
+                        step_log = [
+                            {"role": "assistant", "content": recovery_text},
+                            {
+                                "role": "handler_log",
+                                "content": (
+                                    "Successfully decoded regenerated model response."
+                                    if recovery_candidate.status == "decoded_action"
+                                    else (
+                                        "Regenerated candidate status: "
+                                        f"{recovery_candidate.status}."
+                                    )
+                                ),
+                                "model_response_decoded": executed_action,
+                                "candidate_status": info["candidate_status"],
+                                "regenerated_status": recovery_candidate.status,
+                                "candidate_decode_error": info[
+                                    "candidate_decode_error"
+                                ],
+                            },
+                            {
+                                "role": "checkpoint_verify",
+                                "content": (
+                                    "Rolled back speculative C2KV segment and "
+                                    "regenerated with high precision history."
+                                ),
+                                "checkpoint_id": checkpoint_id,
+                                "recovery_mode": self.recovery_mode,
+                                "segment_index": info["segment_index"],
+                                "candidate_text": info["candidate_text"],
+                                "candidate_action": info["candidate_action"],
+                                "regenerated_text": recovery_text,
+                                "regenerated_action": executed_action,
+                                "regenerated_same_as_candidate": action_matches(
+                                    info["candidate_action"],
+                                    executed_action,
+                                ),
+                                **recovery_debug,
+                            },
+                        ]
+                        for execution_result in execution_results:
+                            step_log.append({"role": "tool", "content": execution_result})
+                        turn_log[f"step_{count}"] = step_log
+
+                        step_record = self._make_final_step_record(
+                            spec_info=info,
+                            executed_text=recovery_text,
+                            executed_message=recovery_assistant,
+                            executed_action=executed_action,
+                            execution_results=execution_results,
+                            state_after_step=state_after_recovery,
+                            execution_error=execution_error,
+                            global_step=len(drift_steps) + len(final_records),
+                            oracle_corrected=not action_matches(
+                                info["candidate_action"],
+                                executed_action,
+                            ),
+                            extra={
+                                "checkpoint_id": checkpoint_id,
+                                "segment_index": info["segment_index"],
+                                "segment_committed": True,
+                                "refresh_triggered": True,
+                                "rollback_triggered": True,
+                                "candidate_execution_error": info["execution_error"],
+                                "regenerated_status": recovery_candidate.status,
+                            },
+                        )
+                        final_records.append(step_record)
+                        regenerated_infos.append(
+                            {
+                                "info": info,
+                                "record": step_record,
+                                "recovery_prompt_tokens": recovery_prompt_tokens,
+                                "recovery_debug": recovery_debug,
+                                "regenerated_same_as_candidate": action_matches(
+                                    info["candidate_action"],
+                                    executed_action,
+                                ),
+                            }
+                        )
+                        count += 1
+                        regenerated_steps_total += 1
+                        if is_empty_execute_response(executed_action):
+                            terminal_after_segment = True
+                            break
+                        if execution_error is not None:
+                            terminal_after_segment = True
+                            break
+                        if count > MAXIMUM_STEP_LIMIT:
+                            force_quit = True
+                            terminal_after_segment = True
+                            step_log.append(
+                                {
+                                    "role": "handler_log",
+                                    "content": (
+                                        "Model has been forced to quit after "
+                                        f"{MAXIMUM_STEP_LIMIT} steps."
+                                    ),
+                                }
+                            )
+                            break
+
+                    full_regenerated_tokens_total += segment_recovery_tokens
+
+                for index, step_record in enumerate(final_records):
+                    drift_steps.append(step_record)
+                    mark_first_divergence(stats, step_record)
+                    if step_record.get("serialization_mismatch"):
+                        stats.errors.append(
+                            "serialization mismatch at "
+                            f"{test_entry_id} turn={step_record['turn']} "
+                            f"step={step_record['step']}"
+                        )
+                    spec_info = segment_infos[min(index, len(segment_infos) - 1)]
+                    regen_match = None
+                    step_recovery_tokens = 0
+                    step_recovery_debug = {
+                        "recovery_prompt_mode": None,
+                        "c2kv_history_units": 0,
+                        "full_history_units": 0,
+                        "current_messages": 0,
+                    }
+                    if step_record.get("refresh_triggered"):
+                        matched_regen = next(
+                            (
+                                item
+                                for item in regenerated_infos
+                                if item["record"] is step_record
+                            ),
+                            None,
+                        )
+                        if matched_regen:
+                            regen_match = matched_regen[
+                                "regenerated_same_as_candidate"
+                            ]
+                            step_recovery_tokens = matched_regen[
+                                "recovery_prompt_tokens"
+                            ]
+                            step_recovery_debug = matched_regen["recovery_debug"]
+                    checkpoint_steps.append(
+                        self._checkpoint_step_row(
+                            step_record=step_record,
+                            checkpoint_id=checkpoint_id,
+                            segment_index=int(step_record.get("segment_index") or 0),
+                            segment_start_step=segment_start_step,
+                            segment_length=len(segment_infos),
+                            verify=spec_info["verify"],
+                            verify_triggered=index == 0,
+                            refresh_triggered=bool(
+                                step_record.get("refresh_triggered")
+                            ),
+                            regenerated_steps=int(
+                                bool(step_record.get("refresh_triggered"))
+                            ),
+                            full_regenerated_tokens=step_recovery_tokens,
+                            recovery_debug=step_recovery_debug,
+                            regenerated_same_as_candidate=regen_match,
+                            history_prompt_tokens=spec_info["candidate_usage"][
+                                "prompt_tokens"
+                            ],
+                            request_history_tokens=spec_info[
+                                "request_history_tokens"
+                            ],
+                            full_history_tokens=spec_info["full_history_tokens"],
+                        )
+                    )
+
+                regenerated_end_state = _state_log(involved_instances)
+                checkpoint_segments.append(
+                    {
+                        "schema_version": 2,
+                        "id": test_entry_id,
+                        "checkpoint_id": checkpoint_id,
+                        "checkpoint_interval": self.checkpoint_interval,
+                        "interval": self.checkpoint_interval,
+                        "turn": turn_idx,
+                        "segment_start_step": segment_start_step,
+                        "segment_end_step": len(drift_steps) - 1,
+                        "segment_start_turn_step": segment_start_turn_step,
+                        "segment_end_turn_step": count - 1,
+                        "speculative_steps": len(segment_infos),
+                        "segment_length": len(segment_infos),
+                        "candidate_actions": [
+                            info["candidate_action"] for info in segment_infos
+                        ],
+                        "reference_actions": [
+                            (
+                                info["ref_step"].get("decoded_action")
+                                if info["ref_step"]
+                                else None
+                            )
+                            for info in segment_infos
+                        ],
+                        "candidate_drift_per_step": [
+                            bool(info["verify"]["verify_failed"])
+                            for info in segment_infos
+                        ],
+                        "segment_candidate_drift_count": sum(
+                            1
+                            for info in segment_infos
+                            if info["verify"]["verify_failed"]
+                        ),
+                        "segment_executed_drift_count": sum(
+                            1
+                            for record in final_records
+                            if record.get("executed_action_drift")
+                        ),
+                        "segment_has_drift": segment_has_drift,
+                        "verify_triggered": True,
+                        "rollback_triggered": segment_has_drift,
+                        "refresh_triggered": segment_has_drift,
+                        "checkpoint_state": segment_checkpoint.get("state"),
+                        "speculative_end_state": speculative_end_state,
+                        "restored_state": restored_state,
+                        "regenerated_end_state": regenerated_end_state,
+                        "rollback_state_matches_checkpoint": (
+                            rollback_state_matches_checkpoint
+                        ),
+                        "rollback_steps": rollback_steps,
+                        "regenerated_steps": len(regenerated_infos),
+                        "full_regenerated_tokens": segment_recovery_tokens,
+                        "final_executed_actions": [
+                            record.get("executed_action") for record in final_records
+                        ],
+                        "executed_drift_per_step": [
+                            bool(record.get("executed_action_drift"))
+                            for record in final_records
+                        ],
+                        "state_drift_after_recovery": any(
+                            bool(record.get("state_drift"))
+                            for record in final_records
+                        ),
+                        "terminal_after_segment": terminal_after_segment,
+                        "recovery_mode": self.recovery_mode,
+                    }
+                )
+
+                if terminal_after_segment or force_quit:
+                    break
+
+            all_model_response.append(current_turn_response)
+            input_token_count.append(current_turn_inputs)
+            output_token_count.append(current_turn_outputs)
+            latency.append(current_turn_latency)
+            inference_log.append(turn_log)
+            state = _state_log(involved_instances)
+            if state:
+                inference_log.append(state)
+            if force_quit:
+                break
+
+        metadata = {
+            "input_token_count": input_token_count,
+            "output_token_count": output_token_count,
+            "latency": latency,
+            "inference_log": inference_log,
+            "drift_steps": drift_steps,
+            "checkpoint_steps": checkpoint_steps,
+            "checkpoint_segments": checkpoint_segments,
+            "verify_count": verify_count,
+            "refresh_count": refresh_count,
+            "regenerated_steps": regenerated_steps_total,
+            "full_regenerated_tokens": full_regenerated_tokens_total,
+        }
+        return all_model_response, metadata
+
     def run_sample_checkpoint(self, test_case: dict[str, Any]) -> dict[str, Any]:
         stats = DriftStats(test_case["id"], "history_checkpoint", self.ratio)
         self._cumulative_divergence = 0.0
@@ -665,6 +1546,17 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         test_case: dict[str, Any],
         stats: DriftStats,
     ) -> tuple[list[list[str]], dict[str, Any]]:
+        if self.verifier == "oracle":
+            return self._run_sample_checkpoint_impl_oracle_multistep(
+                test_case,
+                stats,
+            )
+        if self.checkpoint_interval != 1:
+            raise NotImplementedError(
+                "KV/readout checkpoint verification currently supports "
+                "checkpoint_interval=1 only. Run verifier=oracle for true "
+                "multi-step rollback with interval=1/2/4."
+            )
         initial_config = test_case.get("initial_config", {})
         involved_classes = test_case["involved_classes"]
         test_entry_id = test_case["id"]
@@ -1170,19 +2062,24 @@ def run(args: argparse.Namespace) -> None:
     details_rows = []
     metrics_rows = []
     step_rows = []
+    segment_rows = []
     for test_case in tqdm(entries, desc=f"history_checkpoint:{args.category}", dynamic_ncols=True):
         row = runner.run_sample_checkpoint(deepcopy(test_case))
         runner.decoder.write(row, result_dir=result_dir, update_mode=False)
         details_rows.append(row)
         metrics_rows.append(row.get("c2kv_checkpoint_metrics", {}))
         step_rows.extend(row.get("checkpoint_steps") or [])
+        segment_rows.extend(row.get("checkpoint_segments") or [])
 
     for result_json in result_dir.rglob("*_result.json"):
         sort_file_content_by_id(result_json)
     _write_jsonl(Path(args.details_path), details_rows)
     _write_jsonl(Path(args.metrics_path), metrics_rows)
     _write_jsonl(Path(args.step_metrics_path), step_rows)
+    if args.segment_metrics_path:
+        _write_jsonl(Path(args.segment_metrics_path), segment_rows)
     summary = {
+        "schema_version": 2,
         "category": args.category,
         "num_examples": len(details_rows),
         "compression_ratio": args.compression_ratio,
@@ -1197,6 +2094,7 @@ def run(args: argparse.Namespace) -> None:
         "refresh_count": sum(int(row.get("refresh_count") or 0) for row in metrics_rows),
         "regenerated_steps": sum(int(row.get("regenerated_steps") or 0) for row in metrics_rows),
         "full_regenerated_tokens": sum(int(row.get("full_regenerated_tokens") or 0) for row in metrics_rows),
+        "segment_count": len(segment_rows),
     }
     Path(args.summary_path).parent.mkdir(parents=True, exist_ok=True)
     Path(args.summary_path).write_text(
@@ -1219,6 +2117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--details-path", required=True)
     parser.add_argument("--metrics-path", required=True)
     parser.add_argument("--step-metrics-path", required=True)
+    parser.add_argument("--segment-metrics-path", default="")
     parser.add_argument("--summary-path", required=True)
     parser.add_argument(
         "--compression-ratio",

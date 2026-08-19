@@ -62,6 +62,40 @@ def _score_ids(mode_root: Path, category: str) -> set[str]:
     return explicit_valid if explicit_valid else result_ids - invalid_ids
 
 
+def _check_schema(rows: list[dict[str, Any]], name: str) -> set[int]:
+    versions = {
+        int(row.get("schema_version", 1))
+        for row in rows
+        if isinstance(row, dict)
+    }
+    if len(versions) > 1:
+        raise ValueError(
+            f"Mixed schema versions in {name}: {sorted(versions)}. "
+            "Regenerate this mode with one runner version before comparing."
+        )
+    return versions
+
+
+def _reference_prompt_tokens(reference_details_path: str) -> dict[tuple[str, int], int]:
+    if not reference_details_path:
+        return {}
+    rows = _load_jsonl(Path(reference_details_path))
+    out: dict[tuple[str, int], int] = {}
+    for row in rows:
+        sample_id = str(row.get("id"))
+        global_step = 0
+        for turn_counts in row.get("input_token_count") or []:
+            if not isinstance(turn_counts, list):
+                continue
+            for value in turn_counts:
+                try:
+                    out[(sample_id, global_step)] = int(value)
+                except Exception:
+                    pass
+                global_step += 1
+    return out
+
+
 def _fmt(value: Any) -> str:
     if value is None:
         return "-"
@@ -283,6 +317,7 @@ def _summary_row(
     mode: str,
     category: str,
     turn_rows: list[dict[str, Any]],
+    reference_prompt_tokens: dict[tuple[str, int], int],
 ) -> dict[str, Any]:
     mode_root = run_root / mode
     score = _score_header(mode_root, category)
@@ -290,12 +325,38 @@ def _summary_row(
     details = _load_jsonl(mode_root / "logs" / "details.jsonl")
     metrics = _load_jsonl(mode_root / "logs" / "checkpoint_metrics.jsonl")
     checkpoint_steps = _load_jsonl(mode_root / "logs" / "checkpoint_steps.jsonl")
+    checkpoint_segments = _load_jsonl(
+        mode_root / "logs" / "checkpoint_segments.jsonl"
+    )
+    _check_schema(checkpoint_steps, f"{mode}/checkpoint_steps")
+    _check_schema(checkpoint_segments, f"{mode}/checkpoint_segments")
     correct_ids = _score_ids(mode_root, category)
 
     turn_total = len(turn_rows)
     total_steps = len(checkpoint_steps)
-    verify_count = sum(1 for row in checkpoint_steps if row.get("verify_triggered"))
-    refresh_count = sum(1 for row in checkpoint_steps if row.get("refresh_triggered"))
+    total_segments = len(checkpoint_segments)
+    if checkpoint_segments:
+        verify_count = sum(
+            1 for row in checkpoint_segments if row.get("verify_triggered")
+        )
+        refresh_count = sum(
+            1 for row in checkpoint_segments if row.get("refresh_triggered")
+        )
+        rollback_count = sum(
+            1 for row in checkpoint_segments if row.get("rollback_triggered")
+        )
+        total_verify_units = total_segments
+    else:
+        verify_count = sum(
+            1 for row in checkpoint_steps if row.get("verify_triggered")
+        )
+        refresh_count = sum(
+            1 for row in checkpoint_steps if row.get("refresh_triggered")
+        )
+        rollback_count = sum(
+            1 for row in checkpoint_steps if row.get("rollback_triggered")
+        )
+        total_verify_units = total_steps
     regenerated_steps = sum(int(row.get("regenerated_steps") or 0) for row in checkpoint_steps)
     full_regenerated_tokens = sum(
         int(row.get("full_regenerated_tokens") or 0) for row in checkpoint_steps
@@ -309,9 +370,15 @@ def _summary_row(
     total_candidate_tokens = sum(
         int(row.get("history_prompt_tokens") or 0) for row in checkpoint_steps
     )
-    baseline_full_prompt_tokens = sum(
-        int(row.get("full_history_tokens") or 0) for row in checkpoint_steps
-    )
+    baseline_full_prompt_tokens = 0
+    missing_reference_prompt_tokens = 0
+    for row in checkpoint_steps:
+        key = (str(row.get("id")), int(row.get("global_step") or 0))
+        value = reference_prompt_tokens.get(key)
+        if value is None:
+            value = int(row.get("full_history_tokens") or 0)
+            missing_reference_prompt_tokens += 1
+        baseline_full_prompt_tokens += int(value or 0)
     refreshed_steps = [row for row in checkpoint_steps if row.get("refresh_triggered")]
     regen_same_count = sum(
         1 for row in refreshed_steps if row.get("regenerated_same_as_candidate")
@@ -370,6 +437,15 @@ def _summary_row(
         "bfcl_accuracy": score.get("accuracy"),
         "correct_count": score.get("correct_count"),
         "total_samples": total_samples,
+        "checkpoint_interval": (
+            checkpoint_segments[0].get("checkpoint_interval")
+            if checkpoint_segments
+            else (
+                checkpoint_steps[0].get("checkpoint_interval")
+                if checkpoint_steps
+                else None
+            )
+        ),
         "turn_joint_pass_rate": _rate(
             sum(1 for row in turn_rows if row.get("joint_pass")),
             turn_total,
@@ -385,8 +461,21 @@ def _summary_row(
             len(serialization_mismatch_ids),
             total_samples,
         ),
-        "verify_rate": _rate(verify_count, total_steps),
-        "refresh_rate": _rate(refresh_count, total_steps),
+        "verify_rate": _rate(verify_count, total_verify_units),
+        "refresh_rate": _rate(refresh_count, total_verify_units),
+        "rollback_rate": _rate(rollback_count, total_verify_units),
+        "average_segment_length": (
+            sum(float(row.get("segment_length") or 0) for row in checkpoint_segments)
+            / total_segments
+            if total_segments
+            else 1.0
+        ),
+        "average_rollback_steps": (
+            sum(float(row.get("rollback_steps") or 0) for row in checkpoint_segments)
+            / total_segments
+            if total_segments
+            else 0.0
+        ),
         "readout_available_rate": calibration.get("readout_available_rate"),
         "candidate_readout_reuse_rate": _rate(
             candidate_readout_reused,
@@ -410,6 +499,12 @@ def _summary_row(
             else 1.0
         ),
         "baseline_full_prompt_tokens": baseline_full_prompt_tokens,
+        "baseline_full_prompt_tokens_source": (
+            "reference_details"
+            if reference_prompt_tokens
+            else "fallback_full_history_tokens"
+        ),
+        "missing_reference_prompt_token_steps": missing_reference_prompt_tokens,
         "candidate_prompt_tokens": total_candidate_tokens,
         "candidate_effective_history_tokens": effective_history_tokens,
         "c2kv_verify_prompt_tokens": c2kv_verifier_tokens,
@@ -448,6 +543,8 @@ def _summary_row(
         "configured_trigger_rate": calibration.get("configured_trigger_rate"),
         "verify_count": verify_count,
         "refresh_count": refresh_count,
+        "rollback_count": rollback_count,
+        "total_segments": total_segments,
         "total_steps": total_steps,
         "regenerated_steps": regenerated_steps,
         "history_original_tokens": original_history_tokens,
@@ -460,12 +557,12 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
     lines = [
         "# BFCL History Checkpoint Recovery",
         "",
-        "| Method | BFCL Acc | Correct | Turn Joint | Candidate Action Drift | Executed Action Drift | State Drift | Serialization Mismatch | Verify Rate | Refresh Rate | Readout | Reuse Readout | KV AUROC | KL AUROC | Ent AUROC | Margin AUROC | Config F1 | Config Thr | Best F1 | Best Thr | Recovery Success | Avg Regen Steps | History KV Compression | E2E Token Work Ratio | Legacy Effective Compression | Avg Chat s |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Method | BFCL Acc | Correct | Turn Joint | Candidate Action Drift | Executed Action Drift | State Drift | Serialization Mismatch | Interval | Verify Rate | Rollback Rate | Refresh Rate | Avg Segment | Avg Rollback Steps | Readout | Reuse Readout | KV AUROC | KL AUROC | Ent AUROC | Margin AUROC | Config F1 | Config Thr | Best F1 | Best Thr | Recovery Success | Avg Regen Steps | History KV Compression | Candidate Token Work | Verify Token Work | Recovery Token Work | E2E Token Work Ratio | E2E Source | Missing Ref Token Steps | Legacy Effective Compression | Avg Chat s |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {method} | {acc} | {correct} | {joint} | {cand} | {execd} | {state} | {serial} | {verify} | {refresh} | {readout} | {reuse} | {kv_auc} | {kl_auc} | {ent_auc} | {margin_auc} | {config_f1} | {config_threshold} | {best_f1} | {best_threshold} | {recovery} | {regen} | {hist_comp}x | {e2e_ratio}x | {legacy_comp}x | {chat} |".format(
+            "| {method} | {acc} | {correct} | {joint} | {cand} | {execd} | {state} | {serial} | {interval} | {verify} | {rollback} | {refresh} | {avg_segment} | {avg_rollback} | {readout} | {reuse} | {kv_auc} | {kl_auc} | {ent_auc} | {margin_auc} | {config_f1} | {config_threshold} | {best_f1} | {best_threshold} | {recovery} | {regen} | {hist_comp}x | {candidate_tokens} | {verify_tokens} | {recovery_tokens} | {e2e_ratio}x | {e2e_source} | {missing_ref} | {legacy_comp}x | {chat} |".format(
                 method=row["method"],
                 acc=_fmt(row.get("bfcl_accuracy")),
                 correct=_fmt(row.get("correct_count")),
@@ -474,8 +571,12 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
                 execd=_fmt(row.get("executed_action_drift_rate")),
                 state=_fmt(row.get("state_drift_rate")),
                 serial=_fmt(row.get("serialization_mismatch_rate")),
+                interval=_fmt(row.get("checkpoint_interval")),
                 verify=_fmt(row.get("verify_rate")),
+                rollback=_fmt(row.get("rollback_rate")),
                 refresh=_fmt(row.get("refresh_rate")),
+                avg_segment=_fmt(row.get("average_segment_length")),
+                avg_rollback=_fmt(row.get("average_rollback_steps")),
                 readout=_fmt(row.get("readout_available_rate")),
                 reuse=_fmt(row.get("candidate_readout_reuse_rate")),
                 kv_auc=_fmt(row.get("kv_divergence_auroc")),
@@ -489,7 +590,12 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
                 recovery=_fmt(row.get("recovery_success_rate")),
                 regen=_fmt(row.get("average_regenerated_steps")),
                 hist_comp=_fmt(row.get("history_memory_compression_ratio")),
+                candidate_tokens=_fmt(row.get("total_candidate_tokens")),
+                verify_tokens=_fmt(row.get("total_verify_tokens")),
+                recovery_tokens=_fmt(row.get("total_recovery_tokens")),
                 e2e_ratio=_fmt(row.get("e2e_token_work_ratio")),
+                e2e_source=row.get("baseline_full_prompt_tokens_source"),
+                missing_ref=_fmt(row.get("missing_reference_prompt_token_steps")),
                 legacy_comp=_fmt(row.get("legacy_effective_compression_ratio")),
                 chat=_fmt(row.get("average_chat_latency")),
             )
@@ -499,6 +605,7 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
             "",
             "Candidate Action Drift is measured before checkpoint recovery.",
             "Executed Action Drift and State Drift are measured after rollback/refresh/regeneration.",
+            "Verify Rate and Rollback Rate use segment count as the denominator when `checkpoint_segments.jsonl` is present.",
             "KV AUROC and threshold sweep use Candidate Action Drift as the label.",
             "The full sweep is written to each mode's `logs/kv_threshold_sweep.csv` when KV scores are available.",
             "History KV Compression = Full History Tokens / Effective History KV Tokens.",
@@ -506,7 +613,14 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
             "`Legacy Effective Compression` is the previous mixed accounting and is retained only for continuity.",
         ]
     )
-    (run_root / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    report_text = "\n".join(lines) + "\n"
+    (run_root / "report.md").write_text(report_text, encoding="utf-8")
+    (run_root / "checkpoint_summary.md").write_text(report_text, encoding="utf-8")
+    if any(str(row.get("method", "")).startswith("multistep_") for row in rows):
+        (run_root / "multistep_checkpoint_summary.md").write_text(
+            report_text,
+            encoding="utf-8",
+        )
 
 
 def run(args: argparse.Namespace) -> None:
@@ -519,6 +633,7 @@ def run(args: argparse.Namespace) -> None:
         is_fc_model=config.is_fc_model,
     )
     prompt_by_id, answer_by_id = _load_prompts_and_answers(args.category)
+    reference_tokens = _reference_prompt_tokens(args.reference_details_path)
     modes = args.modes.split(",") if args.modes else [
         path.name for path in sorted(run_root.iterdir()) if path.is_dir()
     ]
@@ -538,6 +653,7 @@ def run(args: argparse.Namespace) -> None:
                 mode=mode,
                 category=args.category,
                 turn_rows=turn_rows,
+                reference_prompt_tokens=reference_tokens,
             )
         )
     summary = {
@@ -563,6 +679,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--category", default="multi_turn_base")
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--modes", default="")
+    parser.add_argument("--reference-details-path", default="")
     return parser.parse_args()
 
 

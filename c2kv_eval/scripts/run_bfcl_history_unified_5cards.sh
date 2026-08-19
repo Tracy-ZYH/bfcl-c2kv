@@ -19,6 +19,7 @@ PORTS="${PORTS:-33500,33501,33502,33503,33504}"
 RUN_ROOT="${RUN_ROOT:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_unified_full_success_54_rerun}"
 IDS_PATH="${IDS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_closed_loop_multi_turn_base_200/correct_ids.txt}"
 REFERENCE_DETAILS="${REFERENCE_DETAILS:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_closed_loop_multi_turn_base_200/history_full_closed_loop/logs/details.jsonl}"
+REFERENCE_MODE="${REFERENCE_MODE:-current}"
 CLEAN_OUTPUT="${CLEAN_OUTPUT:-1}"
 
 IFS=',' read -r FULL_DEVICE PURE_DEVICE STRICT_DEVICE C2KV_DEVICE CKPT_DEVICE _ <<< "${DEVICES}"
@@ -176,18 +177,20 @@ wait_health() {
 run_drift_mode() {
   local mode="$1"
   local port="$2"
+  local ids_path="$3"
+  local reference_details="$4"
   (
     cd "${ROOT}"
     exec "${BFCL_PYTHON}" -m c2kv_eval.adapters.bfcl_history_drift \
       --mode "${mode}" \
       --category "${CATEGORY}" \
       --max-examples "${MAX_EXAMPLES}" \
-      --ids-path "${IDS_PATH}" \
+      --ids-path "${ids_path}" \
       --model "${MODEL_ID}" \
       --served-model-name "${MODEL_ID}" \
       --base-url "http://127.0.0.1:${port}" \
       --tokenizer-path "${TOKENIZER_PATH}" \
-      --reference-details-path "${REFERENCE_DETAILS}" \
+      --reference-details-path "${reference_details}" \
       --result-dir "${RUN_ROOT}/${mode}/result" \
       --details-path "${RUN_ROOT}/${mode}/logs/details.jsonl" \
       --metrics-path "${RUN_ROOT}/${mode}/logs/drift_metrics.jsonl" \
@@ -200,18 +203,20 @@ run_drift_mode() {
 run_oracle_mode() {
   local mode="$1"
   local base_url="$2"
+  local ids_path="$3"
+  local reference_details="$4"
   (
     cd "${ROOT}"
     exec "${BFCL_PYTHON}" -m c2kv_eval.adapters.bfcl_history_oracle \
       --oracle-mode "${mode}" \
       --category "${CATEGORY}" \
       --max-examples "${MAX_EXAMPLES}" \
-      --ids-path "${IDS_PATH}" \
+      --ids-path "${ids_path}" \
       --model "${MODEL_ID}" \
       --served-model-name "${MODEL_ID}" \
       --base-url "${base_url}" \
       --tokenizer-path "${TOKENIZER_PATH}" \
-      --reference-details-path "${REFERENCE_DETAILS}" \
+      --reference-details-path "${reference_details}" \
       --result-dir "${RUN_ROOT}/${mode}/result" \
       --details-path "${RUN_ROOT}/${mode}/logs/details.jsonl" \
       --metrics-path "${RUN_ROOT}/${mode}/logs/oracle_metrics.jsonl" \
@@ -222,18 +227,20 @@ run_oracle_mode() {
 }
 
 run_checkpoint_mode() {
+  local ids_path="$1"
+  local reference_details="$2"
   local mode="ckpt_i1_oracle_current_step"
   (
     cd "${ROOT}"
     exec "${BFCL_PYTHON}" -m c2kv_eval.adapters.eval_bfcl_history_checkpoint \
       --category "${CATEGORY}" \
       --max-examples "${MAX_EXAMPLES}" \
-      --ids-path "${IDS_PATH}" \
+      --ids-path "${ids_path}" \
       --model "${MODEL_ID}" \
       --served-model-name "${MODEL_ID}" \
       --base-url "http://127.0.0.1:${CKPT_PORT}" \
       --tokenizer-path "${TOKENIZER_PATH}" \
-      --reference-details-path "${REFERENCE_DETAILS}" \
+      --reference-details-path "${reference_details}" \
       --result-dir "${RUN_ROOT}/${mode}/result" \
       --details-path "${RUN_ROOT}/${mode}/logs/details.jsonl" \
       --metrics-path "${RUN_ROOT}/${mode}/logs/checkpoint_metrics.jsonl" \
@@ -262,7 +269,20 @@ evaluate_mode() {
   log_info "[eval] done: ${mode}"
 }
 
+export_success_ids() {
+  (
+    cd "${ROOT}"
+    exec "${BFCL_PYTHON}" c2kv_eval/analysis/export_success_ids.py \
+      --run-root "${RUN_ROOT}" \
+      --mode history_full_closed_loop \
+      --category "${CATEGORY}" \
+      --output-path "${RUN_ROOT}/current_full_success_ids.txt"
+  ) > "${RUN_ROOT}/history_full_closed_loop/logs/export_success_ids.log" 2>&1
+  log_info "[ids] current Full success ids: ${RUN_ROOT}/current_full_success_ids.txt"
+}
+
 write_reports() {
+  local reference_details="$1"
   (
     cd "${ROOT}"
     "${BFCL_PYTHON}" c2kv_eval/analysis/compare_history_drift.py \
@@ -283,7 +303,8 @@ write_reports() {
       --run-root "${RUN_ROOT}" \
       --category "${CATEGORY}" \
       --model "${MODEL_ID}" \
-      --modes ckpt_i1_oracle_current_step
+      --modes ckpt_i1_oracle_current_step \
+      --reference-details-path "${reference_details}"
     cp "${RUN_ROOT}/report.md" "${RUN_ROOT}/report_history_checkpoint.md"
 
     {
@@ -316,6 +337,7 @@ main() {
   log_info "DEVICES=${DEVICES} PORTS=${PORTS}"
   log_info "IDS_PATH=${IDS_PATH}"
   log_info "REFERENCE_DETAILS=${REFERENCE_DETAILS}"
+  log_info "REFERENCE_MODE=${REFERENCE_MODE}"
 
   source_env_file /usr/local/Ascend/cann-8.5.0/set_env.sh
   source_env_file /usr/local/Ascend/nnal/atb/set_env.sh
@@ -341,27 +363,38 @@ main() {
   wait_health "${c2kv_pid}" "${C2KV_PORT}" history_c2kv4_closed_loop
   wait_health "${ckpt_pid}" "${CKPT_PORT}" ckpt_i1_oracle_current_step
 
+  run_drift_mode history_full_closed_loop "${FULL_PORT}" "${IDS_PATH}" "${REFERENCE_DETAILS}"
+  evaluate_mode history_full_closed_loop
+
+  local downstream_ids_path="${IDS_PATH}"
+  local downstream_reference_details="${REFERENCE_DETAILS}"
+  if [ "${REFERENCE_MODE}" = "current" ]; then
+    export_success_ids
+    downstream_ids_path="${RUN_ROOT}/current_full_success_ids.txt"
+    downstream_reference_details="${RUN_ROOT}/history_full_closed_loop/logs/details.jsonl"
+    log_info "Downstream reference switched to current Full rerun."
+    log_info "downstream_ids_path=${downstream_ids_path}"
+    log_info "downstream_reference_details=${downstream_reference_details}"
+  fi
+
   local runner_pids=""
-  run_drift_mode history_full_closed_loop "${FULL_PORT}" &
+  run_oracle_mode pure_full_replay "http://127.0.0.1:1" "${downstream_ids_path}" "${downstream_reference_details}" &
   runner_pids="${runner_pids} $!"
-  run_oracle_mode pure_full_replay "http://127.0.0.1:1" &
+  run_oracle_mode c2kv4_oracle_correct_all_strict "http://127.0.0.1:${STRICT_PORT}" "${downstream_ids_path}" "${downstream_reference_details}" &
   runner_pids="${runner_pids} $!"
-  run_oracle_mode c2kv4_oracle_correct_all_strict "http://127.0.0.1:${STRICT_PORT}" &
+  run_drift_mode history_c2kv4_closed_loop "${C2KV_PORT}" "${downstream_ids_path}" "${downstream_reference_details}" &
   runner_pids="${runner_pids} $!"
-  run_drift_mode history_c2kv4_closed_loop "${C2KV_PORT}" &
-  runner_pids="${runner_pids} $!"
-  run_checkpoint_mode &
+  run_checkpoint_mode "${downstream_ids_path}" "${downstream_reference_details}" &
   runner_pids="${runner_pids} $!"
   for pid in ${runner_pids}; do
     wait "${pid}"
   done
 
-  evaluate_mode history_full_closed_loop
   evaluate_mode pure_full_replay
   evaluate_mode c2kv4_oracle_correct_all_strict
   evaluate_mode history_c2kv4_closed_loop
   evaluate_mode ckpt_i1_oracle_current_step
-  write_reports
+  write_reports "${downstream_reference_details}"
 
   log_info "done: ${RUN_ROOT}"
 }

@@ -129,18 +129,28 @@ def _mode_summary(
     action_diverged_ids = _detail_drift_ids(details, "candidate_action_drift")
     executed_action_diverged_ids = _detail_drift_ids(details, "executed_action_drift")
     state_diverged_ids = _detail_drift_ids(details, "state_drift")
+    is_full_mode = mode == "history_full_closed_loop"
+    if is_full_mode:
+        action_diverged_ids = set()
+        executed_action_diverged_ids = set()
+        state_diverged_ids = set()
     if not action_diverged_ids:
         action_diverged_ids = {
             str(row.get("id"))
             for row in metrics
             if row.get("first_action_divergence") is not None
         }
+    if is_full_mode:
+        action_diverged_ids = set()
+        executed_action_diverged_ids = set()
     if not state_diverged_ids:
         state_diverged_ids = {
             str(row.get("id"))
             for row in metrics
             if row.get("first_state_divergence") is not None
         }
+    if is_full_mode:
+        state_diverged_ids = set()
     turn_total = len(turn_rows)
     step_total = len(step_rows)
     parsed_steps = [
@@ -167,13 +177,15 @@ def _mode_summary(
             extract_success / extract_calls if extract_calls else None
         ),
         "average_chat_latency": (chat_seconds / chat_calls if chat_calls else None),
-        "samples_with_action_divergence": len(action_diverged_ids),
-        "samples_with_executed_action_divergence": len(
-            executed_action_diverged_ids
+        "samples_with_action_divergence": (
+            None if is_full_mode else len(action_diverged_ids)
         ),
-        "samples_with_state_divergence": len(state_diverged_ids),
+        "samples_with_executed_action_divergence": (
+            None if is_full_mode else len(executed_action_diverged_ids)
+        ),
+        "samples_with_state_divergence": None if is_full_mode else len(state_diverged_ids),
         "average_first_action_divergence_turn": _mean(
-            _first_action_divergence_turns(details, metrics)
+            [] if is_full_mode else _first_action_divergence_turns(details, metrics)
         ),
         "turn_state_pass_rate": _rate(
             sum(1 for row in turn_rows if row.get("state_pass")),
