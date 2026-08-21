@@ -96,6 +96,23 @@ def _reference_prompt_tokens(reference_details_path: str) -> dict[tuple[str, int
     return out
 
 
+def _details_prompt_tokens(details: list[dict[str, Any]]) -> dict[tuple[str, int], int]:
+    out: dict[tuple[str, int], int] = {}
+    for row in details:
+        sample_id = str(row.get("id"))
+        global_step = 0
+        for turn_counts in row.get("input_token_count") or []:
+            if not isinstance(turn_counts, list):
+                continue
+            for value in turn_counts:
+                try:
+                    out[(sample_id, global_step)] = int(value)
+                except Exception:
+                    pass
+                global_step += 1
+    return out
+
+
 def _fmt(value: Any) -> str:
     if value is None:
         return "-"
@@ -328,6 +345,7 @@ def _summary_row(
     checkpoint_segments = _load_jsonl(
         mode_root / "logs" / "checkpoint_segments.jsonl"
     )
+    detail_prompt_tokens = _details_prompt_tokens(details)
     _check_schema(checkpoint_steps, f"{mode}/checkpoint_steps")
     _check_schema(checkpoint_segments, f"{mode}/checkpoint_segments")
     correct_ids = _score_ids(mode_root, category)
@@ -356,19 +374,105 @@ def _summary_row(
         rollback_count = sum(
             1 for row in checkpoint_steps if row.get("rollback_triggered")
         )
+        if rollback_count == 0:
+            rollback_count = refresh_count
         total_verify_units = total_steps
-    regenerated_steps = sum(int(row.get("regenerated_steps") or 0) for row in checkpoint_steps)
-    full_regenerated_tokens = sum(
-        int(row.get("full_regenerated_tokens") or 0) for row in checkpoint_steps
+    regenerated_steps = sum(
+        int(row.get("regenerated_steps") or 0) for row in checkpoint_steps
     )
+    if checkpoint_segments:
+        full_regenerated_tokens = sum(
+            int(row.get("full_regenerated_tokens") or 0)
+            for row in checkpoint_segments
+        )
+    else:
+        full_regenerated_tokens = 0
+        for row in checkpoint_steps:
+            if not row.get("refresh_triggered"):
+                continue
+            logged = int(row.get("full_regenerated_tokens") or 0)
+            key = (str(row.get("id")), int(row.get("global_step") or 0))
+            if logged <= 2 and key in detail_prompt_tokens:
+                logged = detail_prompt_tokens[key]
+            full_regenerated_tokens += logged
     full_verifier_tokens = sum(
         int(row.get("full_probe_prompt_tokens") or 0) for row in checkpoint_steps
     )
     c2kv_verifier_tokens = sum(
         int(row.get("c2kv_probe_prompt_tokens") or 0) for row in checkpoint_steps
     )
-    total_candidate_tokens = sum(
-        int(row.get("history_prompt_tokens") or 0) for row in checkpoint_steps
+    if checkpoint_segments:
+        total_candidate_tokens = sum(
+            int(row.get("speculative_candidate_prompt_tokens") or 0)
+            for row in checkpoint_segments
+        )
+        if not total_candidate_tokens:
+            total_candidate_tokens = sum(
+                int(row.get("history_prompt_tokens") or 0)
+                for row in checkpoint_steps
+            )
+    else:
+        total_candidate_tokens = 0
+        for row in checkpoint_steps:
+            logged = int(row.get("history_prompt_tokens") or 0)
+            if not logged:
+                key = (str(row.get("id")), int(row.get("global_step") or 0))
+            logged = int(detail_prompt_tokens.get(key) or 0)
+            total_candidate_tokens += logged
+    exact_attr_count = sum(
+        1 for row in checkpoint_segments if row.get("exact_attribution")
+    )
+    within1_attr_count = sum(
+        1 for row in checkpoint_segments if row.get("within1_attribution")
+    )
+    under_rollback_count = sum(
+        1 for row in checkpoint_segments if row.get("under_rollback")
+    )
+    over_rollback_count = sum(
+        1 for row in checkpoint_segments if row.get("over_rollback")
+    )
+    over_rollback_steps = sum(
+        float(row.get("over_rollback_steps") or 0) for row in checkpoint_segments
+    )
+    predicted_rollback_depth = sum(
+        float(row.get("predicted_rollback_depth") or 0)
+        for row in checkpoint_segments
+    )
+    oracle_rollback_depth = sum(
+        float(row.get("oracle_rollback_depth") or 0)
+        for row in checkpoint_segments
+    )
+    kv_restore_success = sum(
+        1 for row in checkpoint_segments if row.get("kv_restore_success")
+    )
+    kv_restore_fallback = sum(
+        1 for row in checkpoint_segments if row.get("kv_restore_fallback")
+    )
+    kv_reused_tokens = sum(
+        int(row.get("kv_reused_tokens") or 0) for row in checkpoint_segments
+    )
+    kv_recomputed_tokens = sum(
+        int(row.get("kv_recomputed_tokens") or 0) for row in checkpoint_segments
+    )
+    message_replay_prefill_tokens = sum(
+        int(row.get("message_replay_prefill_tokens") or 0)
+        for row in checkpoint_segments
+    )
+    discarded_speculative_tokens = sum(
+        int(row.get("discarded_speculative_tokens") or 0)
+        for row in checkpoint_segments
+    )
+    committed_speculative_tokens = sum(
+        int(row.get("committed_speculative_tokens") or 0)
+        for row in checkpoint_segments
+    )
+    rollback_latency_sec = sum(
+        float(row.get("rollback_latency_sec") or 0.0)
+        for row in checkpoint_segments
+    )
+    restore_latency_sec = sum(
+        float(row.get("restore_latency_sec") or 0.0)
+        for row in checkpoint_segments
     )
     baseline_full_prompt_tokens = 0
     missing_reference_prompt_tokens = 0
@@ -446,6 +550,20 @@ def _summary_row(
                 else None
             )
         ),
+        "attribution": (
+            checkpoint_segments[0].get("attribution")
+            if checkpoint_segments
+            else (checkpoint_steps[0].get("attribution") if checkpoint_steps else None)
+        ),
+        "rollback_backend": (
+            checkpoint_segments[0].get("rollback_backend")
+            if checkpoint_segments
+            else (
+                checkpoint_steps[0].get("rollback_backend")
+                if checkpoint_steps
+                else None
+            )
+        ),
         "turn_joint_pass_rate": _rate(
             sum(1 for row in turn_rows if row.get("joint_pass")),
             turn_total,
@@ -471,10 +589,73 @@ def _summary_row(
             else 1.0
         ),
         "average_rollback_steps": (
+            sum(
+                float(row.get("rollback_steps") or 0)
+                for row in checkpoint_segments
+                if row.get("rollback_triggered")
+            )
+            / rollback_count
+            if checkpoint_segments and rollback_count
+            else (
+                1.0
+                if not checkpoint_segments
+                and rollback_count
+                and any(
+                    int(row.get("checkpoint_interval") or 1) == 1
+                    for row in checkpoint_steps
+                )
+                else 0.0
+            )
+        ),
+        "average_rollback_steps_all_segments": (
             sum(float(row.get("rollback_steps") or 0) for row in checkpoint_segments)
             / total_segments
-            if total_segments
+            if checkpoint_segments
+            else (
+                _rate(rollback_count, total_verify_units)
+                if rollback_count and total_verify_units
+                else 0.0
+            )
+        ),
+        "average_discarded_speculative_steps": (
+            sum(
+                float(row.get("discarded_speculative_steps") or 0)
+                for row in checkpoint_segments
+                if row.get("rollback_triggered")
+            )
+            / rollback_count
+            if checkpoint_segments and rollback_count
             else 0.0
+        ),
+        "exact_attribution_accuracy": _rate(exact_attr_count, rollback_count),
+        "within1_attribution_accuracy": _rate(within1_attr_count, rollback_count),
+        "under_rollback_rate": _rate(under_rollback_count, rollback_count),
+        "over_rollback_rate": _rate(over_rollback_count, rollback_count),
+        "average_over_rollback_steps": (
+            over_rollback_steps / rollback_count if rollback_count else 0.0
+        ),
+        "average_predicted_rollback_depth": (
+            predicted_rollback_depth / rollback_count if rollback_count else 0.0
+        ),
+        "average_oracle_rollback_depth": (
+            oracle_rollback_depth / rollback_count if rollback_count else 0.0
+        ),
+        "kv_restore_success_count": kv_restore_success,
+        "kv_restore_fallback_count": kv_restore_fallback,
+        "kv_restore_success_rate": _rate(kv_restore_success, rollback_count),
+        "kv_restore_fallback_rate": _rate(kv_restore_fallback, rollback_count),
+        "kv_reused_tokens": kv_reused_tokens,
+        "kv_recomputed_tokens": kv_recomputed_tokens,
+        "message_replay_prefill_tokens": message_replay_prefill_tokens,
+        "discarded_speculative_tokens": discarded_speculative_tokens,
+        "committed_speculative_tokens": committed_speculative_tokens,
+        "rollback_latency_sec": rollback_latency_sec,
+        "restore_latency_sec": restore_latency_sec,
+        "average_rollback_latency_sec": (
+            rollback_latency_sec / rollback_count if rollback_count else 0.0
+        ),
+        "average_restore_latency_sec": (
+            restore_latency_sec / rollback_count if rollback_count else 0.0
         ),
         "readout_available_rate": calibration.get("readout_available_rate"),
         "candidate_readout_reuse_rate": _rate(
@@ -557,12 +738,12 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
     lines = [
         "# BFCL History Checkpoint Recovery",
         "",
-        "| Method | BFCL Acc | Correct | Turn Joint | Candidate Action Drift | Executed Action Drift | State Drift | Serialization Mismatch | Interval | Verify Rate | Rollback Rate | Refresh Rate | Avg Segment | Avg Rollback Steps | Readout | Reuse Readout | KV AUROC | KL AUROC | Ent AUROC | Margin AUROC | Config F1 | Config Thr | Best F1 | Best Thr | Recovery Success | Avg Regen Steps | History KV Compression | Candidate Token Work | Verify Token Work | Recovery Token Work | E2E Token Work Ratio | E2E Source | Missing Ref Token Steps | Legacy Effective Compression | Avg Chat s |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |",
+        "| Method | BFCL Acc | Correct | Turn Joint | Candidate Action Drift | Executed Action Drift | State Drift | Serialization Mismatch | Interval | Attribution | Rollback Backend | Verify Rate | Rollback Rate | Refresh Rate | Avg Segment | Avg Rollback Steps / RB Seg | Avg Rollback Steps / All Seg | Avg Discarded Steps | Exact Attr | ±1 Attr | Under-RB | Over-RB | Avg Over-RB | Pred RB Depth | Oracle RB Depth | KV Restore Success | KV Restore Fallback | KV Reused Tokens | KV Recomputed Tokens | Message Replay Prefill | Discarded Spec Tokens | Committed Spec Tokens | Readout | Reuse Readout | KV AUROC | KL AUROC | Ent AUROC | Margin AUROC | Config F1 | Config Thr | Best F1 | Best Thr | Recovery Success | Avg Regen Steps | History KV Compression | Candidate Token Work | Verify Token Work | Recovery Token Work | E2E Token Work Ratio | E2E Source | Missing Ref Token Steps | Legacy Effective Compression | Avg Chat s |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {method} | {acc} | {correct} | {joint} | {cand} | {execd} | {state} | {serial} | {interval} | {verify} | {rollback} | {refresh} | {avg_segment} | {avg_rollback} | {readout} | {reuse} | {kv_auc} | {kl_auc} | {ent_auc} | {margin_auc} | {config_f1} | {config_threshold} | {best_f1} | {best_threshold} | {recovery} | {regen} | {hist_comp}x | {candidate_tokens} | {verify_tokens} | {recovery_tokens} | {e2e_ratio}x | {e2e_source} | {missing_ref} | {legacy_comp}x | {chat} |".format(
+            "| {method} | {acc} | {correct} | {joint} | {cand} | {execd} | {state} | {serial} | {interval} | {attribution} | {rollback_backend} | {verify} | {rollback} | {refresh} | {avg_segment} | {avg_rollback} | {avg_rollback_all} | {avg_discarded} | {exact_attr} | {within1_attr} | {under_rb} | {over_rb} | {avg_over_rb} | {pred_depth} | {oracle_depth} | {kv_success} | {kv_fallback} | {kv_reused} | {kv_recomputed} | {message_prefill} | {discarded_spec_tokens} | {committed_spec_tokens} | {readout} | {reuse} | {kv_auc} | {kl_auc} | {ent_auc} | {margin_auc} | {config_f1} | {config_threshold} | {best_f1} | {best_threshold} | {recovery} | {regen} | {hist_comp}x | {candidate_tokens} | {verify_tokens} | {recovery_tokens} | {e2e_ratio}x | {e2e_source} | {missing_ref} | {legacy_comp}x | {chat} |".format(
                 method=row["method"],
                 acc=_fmt(row.get("bfcl_accuracy")),
                 correct=_fmt(row.get("correct_count")),
@@ -572,11 +753,33 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
                 state=_fmt(row.get("state_drift_rate")),
                 serial=_fmt(row.get("serialization_mismatch_rate")),
                 interval=_fmt(row.get("checkpoint_interval")),
+                attribution=row.get("attribution") or "-",
+                rollback_backend=row.get("rollback_backend") or "-",
                 verify=_fmt(row.get("verify_rate")),
                 rollback=_fmt(row.get("rollback_rate")),
                 refresh=_fmt(row.get("refresh_rate")),
                 avg_segment=_fmt(row.get("average_segment_length")),
                 avg_rollback=_fmt(row.get("average_rollback_steps")),
+                avg_rollback_all=_fmt(
+                    row.get("average_rollback_steps_all_segments")
+                ),
+                avg_discarded=_fmt(
+                    row.get("average_discarded_speculative_steps")
+                ),
+                exact_attr=_fmt(row.get("exact_attribution_accuracy")),
+                within1_attr=_fmt(row.get("within1_attribution_accuracy")),
+                under_rb=_fmt(row.get("under_rollback_rate")),
+                over_rb=_fmt(row.get("over_rollback_rate")),
+                avg_over_rb=_fmt(row.get("average_over_rollback_steps")),
+                pred_depth=_fmt(row.get("average_predicted_rollback_depth")),
+                oracle_depth=_fmt(row.get("average_oracle_rollback_depth")),
+                kv_success=_fmt(row.get("kv_restore_success_rate")),
+                kv_fallback=_fmt(row.get("kv_restore_fallback_rate")),
+                kv_reused=_fmt(row.get("kv_reused_tokens")),
+                kv_recomputed=_fmt(row.get("kv_recomputed_tokens")),
+                message_prefill=_fmt(row.get("message_replay_prefill_tokens")),
+                discarded_spec_tokens=_fmt(row.get("discarded_speculative_tokens")),
+                committed_spec_tokens=_fmt(row.get("committed_speculative_tokens")),
                 readout=_fmt(row.get("readout_available_rate")),
                 reuse=_fmt(row.get("candidate_readout_reuse_rate")),
                 kv_auc=_fmt(row.get("kv_divergence_auroc")),
@@ -606,6 +809,11 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
             "Candidate Action Drift is measured before checkpoint recovery.",
             "Executed Action Drift and State Drift are measured after rollback/refresh/regeneration.",
             "Verify Rate and Rollback Rate use segment count as the denominator when `checkpoint_segments.jsonl` is present.",
+            "Avg Rollback Steps / RB Seg is averaged only over rollback-triggered segments.",
+            "Avg Rollback Steps / All Seg is averaged over all verified segments.",
+            "Avg Discarded Steps counts speculative suffix steps whose compute happened but whose trajectory was rolled back.",
+            "Exact/±1 Attribution, Under-RB, and Over-RB are computed over rollback-triggered segments using Oracle first_bad_index as ground truth.",
+            "KV Restore Success/Fallback are explicit backend outcomes; fallback means no raw KV restore was used.",
             "KV AUROC and threshold sweep use Candidate Action Drift as the label.",
             "The full sweep is written to each mode's `logs/kv_threshold_sweep.csv` when KV scores are available.",
             "History KV Compression = Full History Tokens / Effective History KV Tokens.",

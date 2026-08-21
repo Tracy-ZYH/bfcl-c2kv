@@ -57,12 +57,17 @@ from c2kv_eval.adapters.history_step_common import (
 
 CHECKPOINT_MODES = {
     "current_step",
+    "first_bad_suffix",
+    "oracle_first_bad",
     "recent2",
     "since_checkpoint",
+    "whole_segment",
     "full_history",
 }
 
 KV_VERIFIERS = {"instant_kv", "cumulative_kv", "kv_divergence"}
+ATTRIBUTION_MODES = {"oracle_first_bad", "whole_segment", "heuristic"}
+ROLLBACK_BACKENDS = {"message_replay", "kv_restore"}
 
 
 def _stable_hash(value: Any) -> str:
@@ -234,9 +239,323 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         self.verify_layers = args.verify_layers
         self.online_verify = bool(args.online_verify)
         self.reuse_candidate_readout = bool(args.reuse_candidate_readout)
+        self.attribution = args.attribution
+        if self.attribution == "auto":
+            if self.recovery_mode in {"whole_segment", "since_checkpoint", "full_history"}:
+                self.attribution = "whole_segment"
+            else:
+                self.attribution = "oracle_first_bad"
+        self.attribution_safety_margin = int(args.attribution_safety_margin)
+        self.rollback_backend = args.rollback_backend
         self._cumulative_divergence = 0.0
         if self.verifier in {"instant_kv", "cumulative_kv"}:
             self.verifier = "kv_divergence"
+
+    def _kv_checkpoint_metadata(
+        self,
+        *,
+        messages: Sequence[dict[str, Any]],
+        global_step: int,
+        checkpoint_id: int,
+    ) -> dict[str, Any]:
+        history_units = _history_units(messages)
+        return {
+            "available": False,
+            "checkpoint_id": checkpoint_id,
+            "global_step": global_step,
+            "message_count": len(messages),
+            "history_units": len(history_units),
+            "prompt_token_estimate": _token_count(self.tokenizer, messages),
+            "cache_handle": None,
+            "sequence_length": None,
+            "position_metadata": None,
+            "c2kv_cache_metadata": [
+                {
+                    "message_index": index,
+                    "c2kv_key_hash": message.get("c2kv_key_hash"),
+                }
+                for index, message in enumerate(messages)
+                if message.get("c2kv_key_hash")
+            ],
+            "limitation": (
+                "OpenAI-compatible SGLang HTTP API does not expose a raw "
+                "KV cache handle or restore endpoint for this runner."
+            ),
+        }
+
+    def _restore_with_backend(
+        self,
+        *,
+        test_entry_id: str,
+        snapshot: dict[str, Any],
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[str, Any],
+        list[str],
+        list[int],
+        list[int],
+        list[float],
+        dict[str, Any],
+        list[dict[str, Any]],
+        bool,
+        dict[str, Any],
+    ]:
+        start = time.perf_counter()
+        backend_info = {
+            "rollback_backend": self.rollback_backend,
+            "rollback_backend_requested": self.rollback_backend,
+            "kv_restore_success": False,
+            "kv_restore_fallback": False,
+            "kv_restore_fallback_reason": None,
+            "kv_reused_tokens": 0,
+            "kv_recomputed_tokens": 0,
+            "message_replay_prefill_tokens": 0,
+            "restore_latency_sec": 0.0,
+            "rollback_latency_sec": 0.0,
+            "kv_checkpoint_metadata": snapshot.get("kv_checkpoint_metadata"),
+        }
+        if self.rollback_backend == "kv_restore":
+            backend_info.update(
+                {
+                    "kv_restore_fallback": True,
+                    "kv_restore_fallback_reason": (
+                        "raw_kv_restore_not_supported_by_sglang_http_api"
+                    ),
+                }
+            )
+        (
+            messages,
+            instances,
+            current_turn_response,
+            current_turn_inputs,
+            current_turn_outputs,
+            current_turn_latency,
+            turn_log,
+            restored_state,
+            matches,
+        ) = self._restore_snapshot(test_entry_id=test_entry_id, snapshot=snapshot)
+        elapsed = time.perf_counter() - start
+        backend_info["restore_latency_sec"] = elapsed
+        backend_info["rollback_latency_sec"] = elapsed
+        backend_info["message_replay_prefill_tokens"] = _token_count(
+            self.tokenizer,
+            messages,
+        )
+        return (
+            messages,
+            instances,
+            current_turn_response,
+            current_turn_inputs,
+            current_turn_outputs,
+            current_turn_latency,
+            turn_log,
+            restored_state,
+            matches,
+            backend_info,
+        )
+
+    @staticmethod
+    def _action_text(action: list[str]) -> str:
+        return json.dumps(action or [], ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _parse_action_objects(action: list[str]) -> list[dict[str, Any]]:
+        out = []
+        for item in action or []:
+            value: Any = item
+            if isinstance(item, str):
+                try:
+                    value = json.loads(item)
+                except Exception:
+                    value = item
+            if isinstance(value, dict):
+                out.append(value)
+        return out
+
+    def _argument_grounding_score(
+        self,
+        *,
+        action: list[str],
+        messages: Sequence[dict[str, Any]],
+    ) -> float:
+        action_objects = self._parse_action_objects(action)
+        if not action_objects:
+            return 1.0 if is_empty_execute_response(action) else 0.0
+        recent_text = "\n".join(
+            str(message.get("content") or "")
+            for message in messages[-12:]
+            if message.get("role") in {"user", "tool", "assistant"}
+        ).lower()
+        values = []
+        for obj in action_objects:
+            args = obj.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {"value": args}
+            if isinstance(args, dict):
+                for value in args.values():
+                    if isinstance(value, (str, int, float)) and str(value).strip():
+                        text = str(value).strip().lower()
+                        if len(text) >= 3:
+                            values.append(text)
+        if not values:
+            return 1.0
+        hits = sum(1 for value in values if value in recent_text)
+        return hits / len(values)
+
+    def _repeat_action_score(
+        self,
+        *,
+        action: list[str],
+        segment_infos: Sequence[dict[str, Any]],
+    ) -> float:
+        current = self._action_text(action)
+        if current == "[]":
+            return 0.0
+        previous = [
+            self._action_text(info.get("candidate_action") or [])
+            for info in segment_infos
+        ]
+        return 1.0 if current in previous else 0.0
+
+    @staticmethod
+    def _observation_anomaly_score(
+        *,
+        execution_results: Sequence[Any],
+        execution_error: str | None,
+        candidate_status: str,
+        action: list[str],
+    ) -> float:
+        if candidate_status in {"decode_error", "invalid_format"}:
+            return 1.0
+        if execution_error:
+            return 1.0
+        if is_empty_execute_response(action):
+            return 0.5
+        if not execution_results:
+            return 0.5
+        text = "\n".join(str(item) for item in execution_results).lower()
+        bad_markers = [
+            "error",
+            "exception",
+            "failed",
+            "invalid",
+            "not found",
+            "no result",
+            "empty",
+        ]
+        return 1.0 if any(marker in text for marker in bad_markers) else 0.0
+
+    def _heuristic_attributes(
+        self,
+        *,
+        info: dict[str, Any],
+        segment_infos: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        action = info.get("candidate_action") or []
+        hard_error = bool(
+            info.get("candidate_status") in {"decode_error", "invalid_format"}
+            or info.get("execution_error")
+        )
+        grounding = self._argument_grounding_score(
+            action=action,
+            messages=info.get("micro_snapshot", {}).get("messages") or [],
+        )
+        repeat_score = self._repeat_action_score(
+            action=action,
+            segment_infos=segment_infos,
+        )
+        observation = self._observation_anomaly_score(
+            execution_results=info.get("execution_results") or [],
+            execution_error=info.get("execution_error"),
+            candidate_status=info.get("candidate_status") or "",
+            action=action,
+        )
+        tool_transition_anomaly = 1.0 if repeat_score >= 1.0 and observation > 0.0 else 0.0
+        representation_jump = None
+        risk_score = (
+            (1.0 if hard_error else 0.0) * 10.0
+            + (1.0 - grounding) * 4.0
+            + repeat_score * 2.0
+            + observation * 3.0
+            + tool_transition_anomaly * 2.0
+        )
+        return {
+            "hard_error": hard_error,
+            "argument_grounding_score": grounding,
+            "argument_grounding_failure": grounding < 0.34,
+            "repeat_action_score": repeat_score,
+            "tool_transition_anomaly": tool_transition_anomaly,
+            "observation_anomaly": observation,
+            "representation_jump": representation_jump,
+            "risk_score": risk_score,
+        }
+
+    def _predict_first_bad_index(
+        self,
+        *,
+        segment_infos: Sequence[dict[str, Any]],
+        oracle_first_bad_index: int,
+    ) -> tuple[int, dict[str, Any]]:
+        if self.attribution == "whole_segment":
+            predicted = 0
+            reason = "whole_segment"
+        elif self.attribution == "oracle_first_bad":
+            predicted = oracle_first_bad_index
+            reason = "oracle_first_bad"
+        elif self.attribution == "heuristic":
+            attrs = [info.get("heuristic_attributes") or {} for info in segment_infos]
+            hard = [
+                index for index, attr in enumerate(attrs) if attr.get("hard_error")
+            ]
+            grounding = [
+                index
+                for index, attr in enumerate(attrs)
+                if attr.get("argument_grounding_failure")
+            ]
+            observation = [
+                index
+                for index, attr in enumerate(attrs)
+                if float(attr.get("observation_anomaly") or 0.0) >= 1.0
+            ]
+            if hard:
+                predicted = hard[0]
+                reason = "hard_error"
+            elif grounding:
+                predicted = grounding[0]
+                reason = "argument_grounding_failure"
+            elif observation:
+                predicted = observation[0]
+                reason = "observation_anomaly"
+            else:
+                predicted = max(
+                    range(len(segment_infos)),
+                    key=lambda idx: float(
+                        attrs[idx].get("risk_score") or 0.0
+                    ),
+                )
+                reason = "max_risk_score"
+        else:
+            raise ValueError(f"Unknown attribution={self.attribution!r}")
+        raw_predicted = predicted
+        predicted = max(0, predicted - self.attribution_safety_margin)
+        return predicted, {
+            "attribution": self.attribution,
+            "oracle_first_bad_index": oracle_first_bad_index,
+            "predicted_first_bad_index": predicted,
+            "raw_predicted_first_bad_index": raw_predicted,
+            "attribution_reason": reason,
+            "attribution_safety_margin": self.attribution_safety_margin,
+            "exact_attribution": predicted == oracle_first_bad_index,
+            "within1_attribution": abs(predicted - oracle_first_bad_index) <= 1,
+            "under_rollback": predicted > oracle_first_bad_index,
+            "over_rollback": predicted < oracle_first_bad_index,
+            "over_rollback_steps": max(0, oracle_first_bad_index - predicted),
+            "predicted_rollback_depth": len(segment_infos) - predicted,
+            "oracle_rollback_depth": len(segment_infos) - oracle_first_bad_index,
+        }
 
     def _restore_instances(
         self,
@@ -366,7 +685,14 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         checkpoint_messages: list[dict[str, Any]],
         stats: DriftStats,
     ) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
-        if self.recovery_mode in {"current_step", "since_checkpoint", "full_history"}:
+        if self.recovery_mode in {
+            "current_step",
+            "first_bad_suffix",
+            "oracle_first_bad",
+            "since_checkpoint",
+            "whole_segment",
+            "full_history",
+        }:
             messages = deepcopy(checkpoint_messages)
             return (
                 messages,
@@ -455,7 +781,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                 _normalize_state(state_after_step)
                 == _normalize_state(ref_step.get("state"))
             )
-        harmful = not candidate_action_matches
+        harmful = (not candidate_action_matches) or (state_matches is False)
         return {
             "kv_divergence": None,
             "cumulative_divergence": None,
@@ -647,6 +973,11 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "messages": deepcopy(messages),
             "instances": deepcopy(involved_instances),
             "state": _state_log(involved_instances),
+            "kv_checkpoint_metadata": self._kv_checkpoint_metadata(
+                messages=messages,
+                global_step=global_step,
+                checkpoint_id=checkpoint_id,
+            ),
             "current_turn_response": deepcopy(current_turn_response),
             "current_turn_inputs": deepcopy(current_turn_inputs),
             "current_turn_outputs": deepcopy(current_turn_outputs),
@@ -719,12 +1050,13 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         candidate_action_matches: bool,
         state_matches: bool | None,
     ) -> dict[str, Any]:
+        harmful = (not candidate_action_matches) or (state_matches is False)
         return {
             "kv_divergence": None,
             "cumulative_divergence": None,
             "candidate_action_matches_reference": candidate_action_matches,
             "state_matches_reference": state_matches,
-            "verify_failed": not candidate_action_matches,
+            "verify_failed": harmful,
             "logit_kl": None,
             "entropy": None,
             "top1_top2_margin": None,
@@ -912,6 +1244,13 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         drift_steps: list[dict[str, Any]] = []
         verify_count = 0
         refresh_count = 0
+        kv_restore_success_count = 0
+        kv_restore_fallback_count = 0
+        kv_reused_tokens_total = 0
+        kv_recomputed_tokens_total = 0
+        message_replay_prefill_tokens_total = 0
+        rollback_latency_total = 0.0
+        restore_latency_total = 0.0
         regenerated_steps_total = 0
         full_regenerated_tokens_total = 0
         checkpoint_id = 0
@@ -1083,6 +1422,12 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         }
                     )
                     count += 1
+                    segment_infos[-1]["heuristic_attributes"] = (
+                        self._heuristic_attributes(
+                            info=segment_infos[-1],
+                            segment_infos=segment_infos[:-1],
+                        )
+                    )
                     if is_empty_execute_response(candidate_action):
                         terminal_after_segment = True
                         break
@@ -1111,12 +1456,29 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     bool(info["verify"]["verify_failed"]) for info in segment_infos
                 )
                 speculative_end_state = _state_log(involved_instances)
+                speculative_terminal_after_segment = terminal_after_segment
+                speculative_force_quit = force_quit
                 regenerated_infos: list[dict[str, Any]] = []
                 final_records: list[dict[str, Any]] = []
                 segment_recovery_tokens = 0
                 rollback_steps = 0
+                first_bad_index: int | None = None
+                predicted_first_bad_index: int | None = None
+                attribution_debug: dict[str, Any] = {}
                 restored_state: list[dict[str, Any]] | None = None
                 rollback_state_matches_checkpoint: bool | None = None
+                rollback_backend_info: dict[str, Any] = {
+                    "rollback_backend": self.rollback_backend,
+                    "rollback_backend_requested": self.rollback_backend,
+                    "kv_restore_success": False,
+                    "kv_restore_fallback": False,
+                    "kv_restore_fallback_reason": None,
+                    "kv_reused_tokens": 0,
+                    "kv_recomputed_tokens": 0,
+                    "message_replay_prefill_tokens": 0,
+                    "restore_latency_sec": 0.0,
+                    "rollback_latency_sec": 0.0,
+                }
 
                 if not segment_has_drift:
                     for info in segment_infos:
@@ -1142,13 +1504,25 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         final_records.append(step_record)
                 else:
                     refresh_count += 1
+                    terminal_after_segment = False
+                    force_quit = False
                     first_bad_index = next(
                         index
                         for index, info in enumerate(segment_infos)
                         if info["verify"]["verify_failed"]
                     )
-                    if self.recovery_mode == "current_step":
-                        kept_infos = segment_infos[:first_bad_index]
+                    predicted_first_bad_index, attribution_debug = (
+                        self._predict_first_bad_index(
+                            segment_infos=segment_infos,
+                            oracle_first_bad_index=first_bad_index,
+                        )
+                    )
+                    if self.recovery_mode in {
+                        "current_step",
+                        "first_bad_suffix",
+                        "oracle_first_bad",
+                    }:
+                        kept_infos = segment_infos[:predicted_first_bad_index]
                         for info in kept_infos:
                             step_record = self._make_final_step_record(
                                 spec_info=info,
@@ -1170,15 +1544,47 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                                 },
                             )
                             final_records.append(step_record)
-                        restore_target = segment_infos[first_bad_index][
+                        restore_target = segment_infos[predicted_first_bad_index][
                             "micro_snapshot"
                         ]
-                        rollback_steps = len(segment_infos) - first_bad_index
-                        target_infos = [segment_infos[first_bad_index]]
+                        rollback_steps = len(segment_infos) - predicted_first_bad_index
+                        if self.recovery_mode == "current_step":
+                            target_infos = [segment_infos[predicted_first_bad_index]]
+                        else:
+                            target_infos = segment_infos[predicted_first_bad_index:]
                     else:
-                        restore_target = segment_checkpoint
-                        rollback_steps = len(segment_infos)
-                        target_infos = segment_infos
+                        if self.attribution == "whole_segment":
+                            restore_target = segment_checkpoint
+                            rollback_steps = len(segment_infos)
+                            target_infos = segment_infos
+                        else:
+                            kept_infos = segment_infos[:predicted_first_bad_index]
+                            for info in kept_infos:
+                                step_record = self._make_final_step_record(
+                                    spec_info=info,
+                                    executed_text=info["candidate_text"],
+                                    executed_message=info["candidate_assistant"],
+                                    executed_action=info["candidate_action"],
+                                    execution_results=info["execution_results"],
+                                    state_after_step=info["state_after_candidate"],
+                                    execution_error=info["execution_error"],
+                                    global_step=len(drift_steps) + len(final_records),
+                                    oracle_corrected=False,
+                                    extra={
+                                        "checkpoint_id": checkpoint_id,
+                                        "segment_index": info["segment_index"],
+                                        "segment_committed": True,
+                                        "refresh_triggered": False,
+                                        "rollback_triggered": False,
+                                        "candidate_execution_error": info["execution_error"],
+                                    },
+                                )
+                                final_records.append(step_record)
+                            restore_target = segment_infos[predicted_first_bad_index][
+                                "micro_snapshot"
+                            ]
+                            rollback_steps = len(segment_infos) - predicted_first_bad_index
+                            target_infos = segment_infos[predicted_first_bad_index:]
 
                     (
                         messages,
@@ -1190,9 +1596,32 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         turn_log,
                         restored_state,
                         rollback_state_matches_checkpoint,
-                    ) = self._restore_snapshot(
+                        rollback_backend_info,
+                    ) = self._restore_with_backend(
                         test_entry_id=test_entry_id,
                         snapshot=restore_target,
+                    )
+                    kv_restore_success_count += int(
+                        bool(rollback_backend_info.get("kv_restore_success"))
+                    )
+                    kv_restore_fallback_count += int(
+                        bool(rollback_backend_info.get("kv_restore_fallback"))
+                    )
+                    kv_reused_tokens_total += int(
+                        rollback_backend_info.get("kv_reused_tokens") or 0
+                    )
+                    kv_recomputed_tokens_total += int(
+                        rollback_backend_info.get("kv_recomputed_tokens") or 0
+                    )
+                    message_replay_prefill_tokens_total += int(
+                        rollback_backend_info.get("message_replay_prefill_tokens")
+                        or 0
+                    )
+                    rollback_latency_total += float(
+                        rollback_backend_info.get("rollback_latency_sec") or 0.0
+                    )
+                    restore_latency_total += float(
+                        rollback_backend_info.get("restore_latency_sec") or 0.0
                     )
                     if not rollback_state_matches_checkpoint:
                         raise RuntimeError(
@@ -1202,10 +1631,9 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     count = int(target_infos[0]["step_idx"])
 
                     for info in target_infos:
-                        recovery_messages, recovery_prompt_tokens, recovery_debug = (
+                        recovery_messages, recovery_local_tokens, recovery_debug = (
                             self._build_recovery_messages(messages, stats)
                         )
-                        segment_recovery_tokens += recovery_prompt_tokens
                         (
                             recovery_text,
                             recovery_message,
@@ -1216,6 +1644,10 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             tools,
                             stats,
                         )
+                        recovery_prompt_tokens = int(
+                            recovery_usage.get("prompt_tokens") or recovery_local_tokens
+                        )
+                        segment_recovery_tokens += recovery_prompt_tokens
                         recovery_assistant = _assistant_history_message(
                             recovery_text,
                             recovery_message.get("tool_calls"),
@@ -1314,6 +1746,12 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                                 "rollback_triggered": True,
                                 "candidate_execution_error": info["execution_error"],
                                 "regenerated_status": recovery_candidate.status,
+                                "rollback_backend": rollback_backend_info.get(
+                                    "rollback_backend"
+                                ),
+                                "kv_restore_fallback": rollback_backend_info.get(
+                                    "kv_restore_fallback"
+                                ),
                             },
                         )
                         final_records.append(step_record)
@@ -1322,6 +1760,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                                 "info": info,
                                 "record": step_record,
                                 "recovery_prompt_tokens": recovery_prompt_tokens,
+                                "recovery_local_history_tokens": recovery_local_tokens,
                                 "recovery_debug": recovery_debug,
                                 "regenerated_same_as_candidate": action_matches(
                                     info["candidate_action"],
@@ -1415,8 +1854,64 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             full_history_tokens=spec_info["full_history_tokens"],
                         )
                     )
+                    checkpoint_steps[-1].update(
+                        {
+                            "rollback_backend": rollback_backend_info.get(
+                                "rollback_backend"
+                            ),
+                            "attribution": self.attribution,
+                            "attribution_safety_margin": self.attribution_safety_margin,
+                            "oracle_first_bad_index": first_bad_index,
+                            "predicted_first_bad_index": predicted_first_bad_index,
+                            "heuristic_attributes": spec_info.get(
+                                "heuristic_attributes"
+                            ),
+                            "hard_error": (
+                                spec_info.get("heuristic_attributes") or {}
+                            ).get("hard_error"),
+                            "argument_grounding_score": (
+                                spec_info.get("heuristic_attributes") or {}
+                            ).get("argument_grounding_score"),
+                            "repeat_action_score": (
+                                spec_info.get("heuristic_attributes") or {}
+                            ).get("repeat_action_score"),
+                            "tool_transition_anomaly": (
+                                spec_info.get("heuristic_attributes") or {}
+                            ).get("tool_transition_anomaly"),
+                            "observation_anomaly": (
+                                spec_info.get("heuristic_attributes") or {}
+                            ).get("observation_anomaly"),
+                            "representation_jump": (
+                                spec_info.get("heuristic_attributes") or {}
+                            ).get("representation_jump"),
+                            "risk_score": (
+                                spec_info.get("heuristic_attributes") or {}
+                            ).get("risk_score"),
+                        }
+                    )
 
                 regenerated_end_state = _state_log(involved_instances)
+                committed_speculative_tokens = sum(
+                    int(info["candidate_usage"].get("prompt_tokens") or 0)
+                    for info in segment_infos
+                    if not segment_has_drift
+                    or (
+                        predicted_first_bad_index is not None
+                        and int(info["segment_index"]) < predicted_first_bad_index
+                    )
+                )
+                discarded_speculative_tokens = (
+                    0
+                    if not segment_has_drift
+                    else sum(
+                        int(info["candidate_usage"].get("prompt_tokens") or 0)
+                        for info in segment_infos[
+                            predicted_first_bad_index
+                            if predicted_first_bad_index is not None
+                            else 0 :
+                        ]
+                    )
+                )
                 checkpoint_segments.append(
                     {
                         "schema_version": 2,
@@ -1442,11 +1937,39 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             )
                             for info in segment_infos
                         ],
+                        "candidate_action_drift_per_step": [
+                            not bool(
+                                info["verify"][
+                                    "candidate_action_matches_reference"
+                                ]
+                            )
+                            for info in segment_infos
+                        ],
+                        "candidate_state_drift_per_step": [
+                            info["verify"]["state_matches_reference"] is False
+                            for info in segment_infos
+                        ],
+                        "harmful_drift_per_step": [
+                            bool(info["verify"]["verify_failed"])
+                            for info in segment_infos
+                        ],
                         "candidate_drift_per_step": [
                             bool(info["verify"]["verify_failed"])
                             for info in segment_infos
                         ],
                         "segment_candidate_drift_count": sum(
+                            1
+                            for info in segment_infos
+                            if not info["verify"][
+                                "candidate_action_matches_reference"
+                            ]
+                        ),
+                        "segment_state_drift_count": sum(
+                            1
+                            for info in segment_infos
+                            if info["verify"]["state_matches_reference"] is False
+                        ),
+                        "segment_harmful_drift_count": sum(
                             1
                             for info in segment_infos
                             if info["verify"]["verify_failed"]
@@ -1467,9 +1990,118 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         "rollback_state_matches_checkpoint": (
                             rollback_state_matches_checkpoint
                         ),
+                        "first_bad_index": first_bad_index,
+                        "oracle_first_bad_index": first_bad_index,
+                        "predicted_first_bad_index": predicted_first_bad_index,
+                        "raw_predicted_first_bad_index": attribution_debug.get(
+                            "raw_predicted_first_bad_index"
+                        ),
+                        "attribution": self.attribution,
+                        "attribution_reason": attribution_debug.get(
+                            "attribution_reason"
+                        ),
+                        "attribution_safety_margin": self.attribution_safety_margin,
+                        "exact_attribution": attribution_debug.get(
+                            "exact_attribution"
+                        ),
+                        "within1_attribution": attribution_debug.get(
+                            "within1_attribution"
+                        ),
+                        "under_rollback": attribution_debug.get("under_rollback"),
+                        "over_rollback": attribution_debug.get("over_rollback"),
+                        "over_rollback_steps": attribution_debug.get(
+                            "over_rollback_steps"
+                        ),
+                        "predicted_rollback_depth": attribution_debug.get(
+                            "predicted_rollback_depth"
+                        ),
+                        "oracle_rollback_depth": attribution_debug.get(
+                            "oracle_rollback_depth"
+                        ),
+                        "rollback_depth": rollback_steps,
                         "rollback_steps": rollback_steps,
+                        "rollback_policy": (
+                            "none"
+                            if not segment_has_drift
+                            else (
+                                "first_bad_micro_checkpoint"
+                                if self.attribution != "whole_segment"
+                                else "segment_checkpoint"
+                            )
+                        ),
+                        "regen_policy": (
+                            "none"
+                            if not segment_has_drift
+                            else (
+                                "single_step"
+                                if self.recovery_mode == "current_step"
+                                else (
+                                    "first_bad_suffix"
+                                    if self.attribution != "whole_segment"
+                                    else "whole_segment"
+                                )
+                            )
+                        ),
                         "regenerated_steps": len(regenerated_infos),
                         "full_regenerated_tokens": segment_recovery_tokens,
+                        "rollback_backend": rollback_backend_info.get(
+                            "rollback_backend"
+                        ),
+                        "rollback_backend_requested": rollback_backend_info.get(
+                            "rollback_backend_requested"
+                        ),
+                        "kv_restore_success": rollback_backend_info.get(
+                            "kv_restore_success"
+                        ),
+                        "kv_restore_fallback": rollback_backend_info.get(
+                            "kv_restore_fallback"
+                        ),
+                        "kv_restore_fallback_reason": rollback_backend_info.get(
+                            "kv_restore_fallback_reason"
+                        ),
+                        "kv_reused_tokens": rollback_backend_info.get(
+                            "kv_reused_tokens"
+                        ),
+                        "kv_recomputed_tokens": rollback_backend_info.get(
+                            "kv_recomputed_tokens"
+                        ),
+                        "message_replay_prefill_tokens": rollback_backend_info.get(
+                            "message_replay_prefill_tokens"
+                        ),
+                        "restore_latency_sec": rollback_backend_info.get(
+                            "restore_latency_sec"
+                        ),
+                        "rollback_latency_sec": rollback_backend_info.get(
+                            "rollback_latency_sec"
+                        ),
+                        "speculative_candidate_prompt_tokens": sum(
+                            int(info["candidate_usage"].get("prompt_tokens") or 0)
+                            for info in segment_infos
+                        ),
+                        "speculative_candidate_tokens": sum(
+                            int(info["candidate_usage"].get("prompt_tokens") or 0)
+                            for info in segment_infos
+                        ),
+                        "discarded_speculative_tokens": discarded_speculative_tokens,
+                        "committed_speculative_tokens": committed_speculative_tokens,
+                        "speculative_request_history_tokens": sum(
+                            int(info.get("request_history_tokens") or 0)
+                            for info in segment_infos
+                        ),
+                        "discarded_speculative_steps": (
+                            0
+                            if not segment_has_drift
+                            else (
+                                len(segment_infos)
+                                - (predicted_first_bad_index or 0)
+                                if predicted_first_bad_index is not None
+                                and self.attribution != "whole_segment"
+                                else len(segment_infos)
+                            )
+                        ),
+                        "heuristic_attributes_per_step": [
+                            info.get("heuristic_attributes") for info in segment_infos
+                        ],
                         "final_executed_actions": [
                             record.get("executed_action") for record in final_records
                         ],
@@ -1481,6 +2113,10 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             bool(record.get("state_drift"))
                             for record in final_records
                         ),
+                        "speculative_terminal_after_segment": (
+                            speculative_terminal_after_segment
+                        ),
+                        "speculative_force_quit": speculative_force_quit,
                         "terminal_after_segment": terminal_after_segment,
                         "recovery_mode": self.recovery_mode,
                     }
@@ -1510,6 +2146,13 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "checkpoint_segments": checkpoint_segments,
             "verify_count": verify_count,
             "refresh_count": refresh_count,
+            "kv_restore_success": kv_restore_success_count,
+            "kv_restore_fallback": kv_restore_fallback_count,
+            "kv_reused_tokens": kv_reused_tokens_total,
+            "kv_recomputed_tokens": kv_recomputed_tokens_total,
+            "message_replay_prefill_tokens": message_replay_prefill_tokens_total,
+            "rollback_latency_sec": rollback_latency_total,
+            "restore_latency_sec": restore_latency_total,
             "regenerated_steps": regenerated_steps_total,
             "full_regenerated_tokens": full_regenerated_tokens_total,
         }
@@ -1529,6 +2172,9 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "checkpoint_interval": self.checkpoint_interval,
             "verifier": self.verifier,
             "requested_verifier": self.requested_verifier,
+            "attribution": self.attribution,
+            "attribution_safety_margin": self.attribution_safety_margin,
+            "rollback_backend": self.rollback_backend,
             "verify_threshold": self.verify_threshold,
             "verify_layers": self.verify_layers,
             "online_verify": self.online_verify,
@@ -1538,6 +2184,16 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "refresh_count": metadata.get("refresh_count", 0),
             "regenerated_steps": metadata.get("regenerated_steps", 0),
             "full_regenerated_tokens": metadata.get("full_regenerated_tokens", 0),
+            "kv_restore_success": metadata.get("kv_restore_success", 0),
+            "kv_restore_fallback": metadata.get("kv_restore_fallback", 0),
+            "kv_reused_tokens": metadata.get("kv_reused_tokens", 0),
+            "kv_recomputed_tokens": metadata.get("kv_recomputed_tokens", 0),
+            "message_replay_prefill_tokens": metadata.get(
+                "message_replay_prefill_tokens",
+                0,
+            ),
+            "rollback_latency_sec": metadata.get("rollback_latency_sec", 0.0),
+            "restore_latency_sec": metadata.get("restore_latency_sec", 0.0),
         }
         return {"id": test_case["id"], "result": result, **metadata}
 
@@ -1738,18 +2394,21 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
 
                     (
                         recovery_messages,
-                        recovery_prompt_tokens,
+                        recovery_local_tokens,
                         recovery_debug,
                     ) = self._build_recovery_messages(
                         messages,
                         stats,
                     )
-                    full_regenerated_tokens += recovery_prompt_tokens
                     text, response_message, elapsed, usage = self._query(
                         recovery_messages,
                         tools,
                         stats,
                     )
+                    recovery_prompt_tokens = int(
+                        usage.get("prompt_tokens") or recovery_local_tokens
+                    )
+                    full_regenerated_tokens += recovery_prompt_tokens
                     assistant_history = _assistant_history_message(
                         text,
                         response_message.get("tool_calls"),
@@ -1771,6 +2430,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         "regenerated_same_as_candidate": (
                             action_matches(candidate_action, executed_action)
                         ),
+                        "recovery_local_history_tokens": recovery_local_tokens,
                         **recovery_debug,
                     }
                 else:
@@ -2085,6 +2745,9 @@ def run(args: argparse.Namespace) -> None:
         "compression_ratio": args.compression_ratio,
         "checkpoint_interval": args.checkpoint_interval,
         "verifier": args.verifier,
+        "attribution": args.attribution,
+        "attribution_safety_margin": args.attribution_safety_margin,
+        "rollback_backend": args.rollback_backend,
         "verify_threshold": args.verify_threshold,
         "verify_layers": args.verify_layers,
         "online_verify": args.online_verify,
@@ -2094,6 +2757,11 @@ def run(args: argparse.Namespace) -> None:
         "refresh_count": sum(int(row.get("refresh_count") or 0) for row in metrics_rows),
         "regenerated_steps": sum(int(row.get("regenerated_steps") or 0) for row in metrics_rows),
         "full_regenerated_tokens": sum(int(row.get("full_regenerated_tokens") or 0) for row in metrics_rows),
+        "kv_restore_success": sum(int(row.get("kv_restore_success") or 0) for row in metrics_rows),
+        "kv_restore_fallback": sum(int(row.get("kv_restore_fallback") or 0) for row in metrics_rows),
+        "kv_reused_tokens": sum(int(row.get("kv_reused_tokens") or 0) for row in metrics_rows),
+        "kv_recomputed_tokens": sum(int(row.get("kv_recomputed_tokens") or 0) for row in metrics_rows),
+        "message_replay_prefill_tokens": sum(int(row.get("message_replay_prefill_tokens") or 0) for row in metrics_rows),
         "segment_count": len(segment_rows),
     }
     Path(args.summary_path).parent.mkdir(parents=True, exist_ok=True)
@@ -2152,10 +2820,21 @@ def parse_args() -> argparse.Namespace:
         choices=sorted(CHECKPOINT_MODES),
         default="current_step",
     )
+    parser.add_argument(
+        "--attribution",
+        choices=["auto", *sorted(ATTRIBUTION_MODES)],
+        default="auto",
+    )
+    parser.add_argument("--attribution-safety-margin", type=int, choices=[0, 1], default=0)
+    parser.add_argument(
+        "--rollback-backend",
+        choices=sorted(ROLLBACK_BACKENDS),
+        default="message_replay",
+    )
     parser.add_argument("--recent-full-units", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=72000)
     parser.add_argument("--max-completion-tokens", type=int, default=4096)
-    parser.add_argument("--temperature", type=float, default=0.001)
+    parser.add_argument("--temperature", type=float, default=0.0)
     args = parser.parse_args()
     args.ratio = args.compression_ratio
     return args

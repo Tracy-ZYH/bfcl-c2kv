@@ -685,7 +685,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recent-full-units", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=72000)
     parser.add_argument("--max-completion-tokens", type=int, default=4096)
-    parser.add_argument("--temperature", type=float, default=0.001)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--natural-result-dir", required=True)
     parser.add_argument("--corrected-result-dir", required=True)
     parser.add_argument("--natural-details-path", required=True)

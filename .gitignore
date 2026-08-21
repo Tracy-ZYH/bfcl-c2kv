@@ -22,3 +22,4 @@ checkpoints/
 # IDE
 .vscode/
 .idea/
+.file_locks/

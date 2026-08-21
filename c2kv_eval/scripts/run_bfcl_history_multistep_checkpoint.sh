@@ -17,6 +17,9 @@ COMPRESSION_RATIO="${COMPRESSION_RATIO:-4}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-1}"
 VERIFIER="${VERIFIER:-oracle}"
 RECOVERY_MODE="${RECOVERY_MODE:-since_checkpoint}"
+ATTRIBUTION="${ATTRIBUTION:-auto}"
+ATTRIBUTION_SAFETY_MARGIN="${ATTRIBUTION_SAFETY_MARGIN:-0}"
+ROLLBACK_BACKEND="${ROLLBACK_BACKEND:-message_replay}"
 VERIFY_THRESHOLD="${VERIFY_THRESHOLD:-0}"
 DEVICE="${DEVICE:-3}"
 PORT="${PORT:-33400}"
@@ -25,6 +28,18 @@ REFERENCE_DETAILS="${REFERENCE_DETAILS:-/home/zhuyuhan/project/gorilla/bfcl_runs
 RUN_ROOT="${RUN_ROOT:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_multistep_checkpoint_full_success_54}"
 CLEAN_OUTPUT="${CLEAN_OUTPUT:-1}"
 MODE="${MODE:-multistep_i${CHECKPOINT_INTERVAL}_${VERIFIER}_${RECOVERY_MODE}}"
+RUN_COMPARE="${RUN_COMPARE:-1}"
+
+if [[ "${MODE}" == *first_bad_suffix* && "${RECOVERY_MODE}" != "first_bad_suffix" && "${ATTRIBUTION}" != "heuristic" ]]; then
+  echo "MODE=${MODE} implies RECOVERY_MODE=first_bad_suffix, but RECOVERY_MODE=${RECOVERY_MODE}."
+  echo "Set RECOVERY_MODE=first_bad_suffix or choose a matching MODE name."
+  exit 1
+fi
+if [[ "${MODE}" == *whole_segment* && "${RECOVERY_MODE}" != "whole_segment" ]]; then
+  echo "MODE=${MODE} implies RECOVERY_MODE=whole_segment, but RECOVERY_MODE=${RECOVERY_MODE}."
+  echo "Set RECOVERY_MODE=whole_segment or choose a matching MODE name."
+  exit 1
+fi
 
 SERVER_PID=""
 
@@ -158,7 +173,10 @@ run_eval() {
       --checkpoint-interval "${CHECKPOINT_INTERVAL}" \
       --verifier "${VERIFIER}" \
       --verify-threshold "${VERIFY_THRESHOLD}" \
-      --recovery-mode "${RECOVERY_MODE}"
+      --recovery-mode "${RECOVERY_MODE}" \
+      --attribution "${ATTRIBUTION}" \
+      --attribution-safety-margin "${ATTRIBUTION_SAFETY_MARGIN}" \
+      --rollback-backend "${ROLLBACK_BACKEND}"
   ) > "${RUN_ROOT}/${MODE}/logs/run.log" 2>&1
   log_info "[runner:${MODE}] done"
 }
@@ -194,7 +212,10 @@ log_info "RUN_ROOT=${RUN_ROOT}"
 log_info "MODE=${MODE}"
 log_info "CATEGORY=${CATEGORY} MAX_EXAMPLES=${MAX_EXAMPLES}"
 log_info "INTERVAL=${CHECKPOINT_INTERVAL} VERIFIER=${VERIFIER} RECOVERY=${RECOVERY_MODE}"
+log_info "ATTRIBUTION=${ATTRIBUTION} ATTRIBUTION_SAFETY_MARGIN=${ATTRIBUTION_SAFETY_MARGIN}"
+log_info "ROLLBACK_BACKEND=${ROLLBACK_BACKEND}"
 log_info "DEVICE=${DEVICE} PORT=${PORT}"
+log_info "RUN_COMPARE=${RUN_COMPARE}"
 log_info "IDS_PATH=${IDS_PATH}"
 log_info "REFERENCE_DETAILS=${REFERENCE_DETAILS}"
 
@@ -211,7 +232,11 @@ start_server
 wait_health
 run_eval
 evaluate_mode
-compare
+if [ "${RUN_COMPARE}" = "1" ]; then
+  compare
+else
+  log_info "[compare:${MODE}] skipped; run a final merged compare after parallel jobs finish"
+fi
 
 log_info "History multi-step checkpoint run complete"
 log_info "Report: ${RUN_ROOT}/report.md"

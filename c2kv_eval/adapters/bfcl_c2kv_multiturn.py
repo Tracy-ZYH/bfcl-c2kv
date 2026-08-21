@@ -747,7 +747,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tool-document-mode", choices=["per_tool", "full"], default="per_tool")
     parser.add_argument("--timeout", type=int, default=72000)
     parser.add_argument("--max-completion-tokens", type=int, default=4096)
-    parser.add_argument("--temperature", type=float, default=0.001)
+    parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--include-input-log", action="store_true")
     parser.add_argument("--exclude-state-log", action="store_true")
     return parser.parse_args()
