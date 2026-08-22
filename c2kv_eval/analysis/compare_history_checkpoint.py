@@ -476,6 +476,18 @@ def _summary_row(
     kv_recomputed_tokens = sum(
         int(row.get("kv_recomputed_tokens") or 0) for row in checkpoint_segments
     )
+    expected_kv_reused_tokens = sum(
+        int(row.get("expected_kv_reused_tokens") or 0)
+        for row in checkpoint_segments
+    )
+    expected_kv_recomputed_tokens = sum(
+        int(row.get("expected_kv_recomputed_tokens") or 0)
+        for row in checkpoint_segments
+    )
+    actual_cache_report_missing = sum(
+        int(row.get("actual_cache_report_missing") or 0)
+        for row in checkpoint_segments
+    )
     message_replay_prefill_tokens = sum(
         int(row.get("message_replay_prefill_tokens") or 0)
         for row in checkpoint_segments
@@ -486,6 +498,14 @@ def _summary_row(
     )
     checkpoint_maintenance_recomputed_tokens = sum(
         int(row.get("checkpoint_maintenance_recomputed_tokens") or 0)
+        for row in checkpoint_segments
+    )
+    checkpoint_maintenance_reused_tokens = sum(
+        int(row.get("checkpoint_maintenance_reused_tokens") or 0)
+        for row in checkpoint_segments
+    )
+    checkpoint_maintenance_cache_report_missing = sum(
+        int(row.get("checkpoint_maintenance_cache_report_missing") or 0)
         for row in checkpoint_segments
     )
     checkpoint_maintenance_logical_prompt_tokens = sum(
@@ -718,10 +738,17 @@ def _summary_row(
         "kv_restore_fallback_rate": _rate(kv_restore_fallback, rollback_count),
         "kv_reused_tokens": kv_reused_tokens,
         "kv_recomputed_tokens": kv_recomputed_tokens,
+        "expected_kv_reused_tokens": expected_kv_reused_tokens,
+        "expected_kv_recomputed_tokens": expected_kv_recomputed_tokens,
+        "actual_cache_report_missing": actual_cache_report_missing,
         "message_replay_prefill_tokens": message_replay_prefill_tokens,
         "recovery_logical_prompt_tokens": recovery_logical_prompt_tokens,
         "checkpoint_maintenance_recomputed_tokens": (
             checkpoint_maintenance_recomputed_tokens
+        ),
+        "checkpoint_maintenance_reused_tokens": checkpoint_maintenance_reused_tokens,
+        "checkpoint_maintenance_cache_report_missing": (
+            checkpoint_maintenance_cache_report_missing
         ),
         "checkpoint_maintenance_logical_prompt_tokens": (
             checkpoint_maintenance_logical_prompt_tokens
@@ -834,12 +861,12 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
     lines = [
         "# BFCL History Checkpoint Recovery",
         "",
-        "| Method | BFCL Acc | Correct | Turn Joint | Candidate Action Drift | Executed Action Drift | State Drift | Serialization Mismatch | Interval | Attribution | Recovery Horizon | Rollback Backend | Verify Rate | Verify Density | Rollback Rate | Refresh Rate | Avg Segment | Avg Rollback Steps / RB Seg | Avg Rollback Steps / All Seg | Avg Discarded Steps | First Bad Hist | Exact Attr | ±1 Attr | Under-RB | Over-RB | Avg Over-RB | Pred RB Depth | Oracle RB Depth | KV Restore Success | KV Restore Fallback | KV Reused Tokens | KV Recomputed Tokens | Message Replay Prefill | Recovery Logical Prompt | Checkpoint Maint Work | Discarded Spec Tokens | Committed Spec Tokens | Readout | Reuse Readout | KV AUROC | KL AUROC | Ent AUROC | Margin AUROC | Config F1 | Config Thr | Best F1 | Best Thr | Refreshed Episode Success | Segment Recovery Success | Avg Regen Steps | Avg Regen Steps / RB Seg | History KV Compression | Candidate Token Work | Verify Token Work | Recovery Token Work | E2E Token Work Ratio | E2E Source | Missing Ref Token Steps | No Ref Step Tokens | Legacy Effective Compression | Avg Chat s |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |",
+        "| Method | BFCL Acc | Correct | Turn Joint | Candidate Action Drift | Executed Action Drift | State Drift | Serialization Mismatch | Interval | Attribution | Recovery Horizon | Rollback Backend | Verify Rate | Verify Density | Rollback Rate | Refresh Rate | Avg Segment | Avg Rollback Steps / RB Seg | Avg Rollback Steps / All Seg | Avg Discarded Steps | First Bad Hist | Exact Attr | ±1 Attr | Under-RB | Over-RB | Avg Over-RB | Pred RB Depth | Oracle RB Depth | KV Restore Success | KV Restore Fallback | Actual KV Reused | Actual KV Recomputed | Expected KV Reused | Expected KV Recomputed | Missing Cache Reports | Message Replay Prefill | Recovery Logical Prompt | Checkpoint Maint Reused | Checkpoint Maint Recomputed | Checkpoint Maint Missing | Discarded Spec Tokens | Committed Spec Tokens | Readout | Reuse Readout | KV AUROC | KL AUROC | Ent AUROC | Margin AUROC | Config F1 | Config Thr | Best F1 | Best Thr | Refreshed Episode Success | Segment Recovery Success | Avg Regen Steps | Avg Regen Steps / RB Seg | History KV Compression | Candidate Token Work | Verify Token Work | Recovery Token Work | E2E Token Work Ratio | E2E Source | Missing Ref Token Steps | No Ref Step Tokens | Legacy Effective Compression | Avg Chat s |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {method} | {acc} | {correct} | {joint} | {cand} | {execd} | {state} | {serial} | {interval} | {attribution} | {recovery_horizon} | {rollback_backend} | {verify} | {verify_density} | {rollback} | {refresh} | {avg_segment} | {avg_rollback} | {avg_rollback_all} | {avg_discarded} | {first_bad_hist} | {exact_attr} | {within1_attr} | {under_rb} | {over_rb} | {avg_over_rb} | {pred_depth} | {oracle_depth} | {kv_success} | {kv_fallback} | {kv_reused} | {kv_recomputed} | {message_prefill} | {recovery_logical} | {checkpoint_maint} | {discarded_spec_tokens} | {committed_spec_tokens} | {readout} | {reuse} | {kv_auc} | {kl_auc} | {ent_auc} | {margin_auc} | {config_f1} | {config_threshold} | {best_f1} | {best_threshold} | {refreshed_episode_success} | {segment_recovery_success} | {regen} | {regen_rb} | {hist_comp}x | {candidate_tokens} | {verify_tokens} | {recovery_tokens} | {e2e_ratio}x | {e2e_source} | {missing_ref} | {no_ref} | {legacy_comp}x | {chat} |".format(
+            "| {method} | {acc} | {correct} | {joint} | {cand} | {execd} | {state} | {serial} | {interval} | {attribution} | {recovery_horizon} | {rollback_backend} | {verify} | {verify_density} | {rollback} | {refresh} | {avg_segment} | {avg_rollback} | {avg_rollback_all} | {avg_discarded} | {first_bad_hist} | {exact_attr} | {within1_attr} | {under_rb} | {over_rb} | {avg_over_rb} | {pred_depth} | {oracle_depth} | {kv_success} | {kv_fallback} | {kv_reused} | {kv_recomputed} | {expected_kv_reused} | {expected_kv_recomputed} | {missing_cache_reports} | {message_prefill} | {recovery_logical} | {checkpoint_maint_reused} | {checkpoint_maint} | {checkpoint_maint_missing} | {discarded_spec_tokens} | {committed_spec_tokens} | {readout} | {reuse} | {kv_auc} | {kl_auc} | {ent_auc} | {margin_auc} | {config_f1} | {config_threshold} | {best_f1} | {best_threshold} | {refreshed_episode_success} | {segment_recovery_success} | {regen} | {regen_rb} | {hist_comp}x | {candidate_tokens} | {verify_tokens} | {recovery_tokens} | {e2e_ratio}x | {e2e_source} | {missing_ref} | {no_ref} | {legacy_comp}x | {chat} |".format(
                 method=row["method"],
                 acc=_fmt(row.get("bfcl_accuracy")),
                 correct=_fmt(row.get("correct_count")),
@@ -878,10 +905,19 @@ def write_report(run_root: Path, rows: list[dict[str, Any]]) -> None:
                 kv_fallback=_fmt(row.get("kv_restore_fallback_rate")),
                 kv_reused=_fmt(row.get("kv_reused_tokens")),
                 kv_recomputed=_fmt(row.get("kv_recomputed_tokens")),
+                expected_kv_reused=_fmt(row.get("expected_kv_reused_tokens")),
+                expected_kv_recomputed=_fmt(row.get("expected_kv_recomputed_tokens")),
+                missing_cache_reports=_fmt(row.get("actual_cache_report_missing")),
                 message_prefill=_fmt(row.get("message_replay_prefill_tokens")),
                 recovery_logical=_fmt(row.get("recovery_logical_prompt_tokens")),
+                checkpoint_maint_reused=_fmt(
+                    row.get("checkpoint_maintenance_reused_tokens")
+                ),
                 checkpoint_maint=_fmt(
                     row.get("checkpoint_maintenance_recomputed_tokens")
+                ),
+                checkpoint_maint_missing=_fmt(
+                    row.get("checkpoint_maintenance_cache_report_missing")
                 ),
                 discarded_spec_tokens=_fmt(row.get("discarded_speculative_tokens")),
                 committed_spec_tokens=_fmt(row.get("committed_speculative_tokens")),

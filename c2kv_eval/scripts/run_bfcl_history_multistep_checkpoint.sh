@@ -23,7 +23,6 @@ ATTRIBUTION_SAFETY_MARGIN="${ATTRIBUTION_SAFETY_MARGIN:-0}"
 ROLLBACK_BACKEND="${ROLLBACK_BACKEND:-message_replay}"
 ENABLE_HICACHE="${ENABLE_HICACHE:-auto}"
 HICACHE_RATIO="${HICACHE_RATIO:-2}"
-RECOVERY_CHECKPOINT_PAGE_SIZE="${RECOVERY_CHECKPOINT_PAGE_SIZE:-128}"
 VERIFY_THRESHOLD="${VERIFY_THRESHOLD:-0}"
 DEVICE="${DEVICE:-3}"
 PORT="${PORT:-33400}"
@@ -132,6 +131,7 @@ start_server() {
       --enable-c2kv \
       --dtype bfloat16 \
       --mem-fraction-static 0.55 \
+      --enable-cache-report \
       "${hicache_args[@]}" \
       --host 127.0.0.1 \
       --port "${PORT}"
@@ -188,8 +188,7 @@ run_eval() {
       --recovery-horizon "${RECOVERY_HORIZON}" \
       --attribution "${ATTRIBUTION}" \
       --attribution-safety-margin "${ATTRIBUTION_SAFETY_MARGIN}" \
-      --rollback-backend "${ROLLBACK_BACKEND}" \
-      --recovery-checkpoint-page-size "${RECOVERY_CHECKPOINT_PAGE_SIZE}"
+      --rollback-backend "${ROLLBACK_BACKEND}"
   ) > "${RUN_ROOT}/${MODE}/logs/run.log" 2>&1
   log_info "[runner:${MODE}] done"
 }
@@ -229,7 +228,6 @@ log_info "RECOVERY_HORIZON=${RECOVERY_HORIZON}"
 log_info "ATTRIBUTION=${ATTRIBUTION} ATTRIBUTION_SAFETY_MARGIN=${ATTRIBUTION_SAFETY_MARGIN}"
 log_info "ROLLBACK_BACKEND=${ROLLBACK_BACKEND}"
 log_info "ENABLE_HICACHE=${ENABLE_HICACHE} HICACHE_RATIO=${HICACHE_RATIO}"
-log_info "RECOVERY_CHECKPOINT_PAGE_SIZE=${RECOVERY_CHECKPOINT_PAGE_SIZE}"
 log_info "DEVICE=${DEVICE} PORT=${PORT}"
 log_info "RUN_COMPARE=${RUN_COMPARE}"
 log_info "IDS_PATH=${IDS_PATH}"

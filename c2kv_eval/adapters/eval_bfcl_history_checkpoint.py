@@ -258,7 +258,6 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                 self.attribution = "oracle_first_bad"
         self.attribution_safety_margin = int(args.attribution_safety_margin)
         self.rollback_backend = args.rollback_backend
-        self.recovery_checkpoint_page_size = int(args.recovery_checkpoint_page_size)
         self.enable_recovery_kv_checkpoint = self.rollback_backend == "kv_restore"
         self._cumulative_divergence = 0.0
         if self.verifier in {"instant_kv", "cumulative_kv"}:
@@ -280,25 +279,39 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                 )
             )
         except TypeError:
-            return list(
-                self.tokenizer.apply_chat_template(
-                    list(messages),
-                    tools=list(tools),
-                    tokenize=True,
-                    add_generation_prompt=True,
+            try:
+                return list(
+                    self.tokenizer.apply_chat_template(
+                        list(messages),
+                        tools=list(tools),
+                        tokenize=True,
+                        add_generation_prompt=True,
+                    )
                 )
-            )
-        except Exception:
+            except Exception as exc:
+                if self.enable_recovery_kv_checkpoint:
+                    raise RuntimeError(
+                        "KV checkpoint requires exact server-equivalent prompt "
+                        "tokenization; tokenizer.apply_chat_template failed."
+                    ) from exc
+                rendered = json.dumps(
+                    {"messages": list(messages), "tools": list(tools)},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                return list(self.tokenizer.encode(rendered, add_special_tokens=False))
+        except Exception as exc:
+            if self.enable_recovery_kv_checkpoint:
+                raise RuntimeError(
+                    "KV checkpoint requires exact server-equivalent prompt "
+                    "tokenization; tokenizer.apply_chat_template failed."
+                ) from exc
             rendered = json.dumps(
                 {"messages": list(messages), "tools": list(tools)},
                 ensure_ascii=False,
                 sort_keys=True,
             )
             return list(self.tokenizer.encode(rendered, add_special_tokens=False))
-
-    def _page_align_len(self, token_count: int) -> int:
-        page_size = max(1, self.recovery_checkpoint_page_size)
-        return (int(token_count) // page_size) * page_size
 
     @staticmethod
     def _rank_status_items(response: dict[str, Any]) -> list[dict[str, Any]]:
@@ -345,6 +358,41 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     return value
         return int(fallback)
 
+    @staticmethod
+    def _actual_cached_tokens_from_response(response: dict[str, Any]) -> int | None:
+        if isinstance(response, list):
+            response = response[0] if response else {}
+        usage = response.get("usage") or {}
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        if isinstance(prompt_details, dict) and "cached_tokens" in prompt_details:
+            try:
+                return int(prompt_details.get("cached_tokens") or 0)
+            except Exception:
+                return 0
+
+        sglext = response.get("sglext") or {}
+        cached_details = sglext.get("cached_tokens_details") or {}
+        if isinstance(cached_details, dict) and cached_details:
+            total = 0
+            seen = False
+            for key in ("device", "host", "storage"):
+                if key in cached_details:
+                    seen = True
+                    try:
+                        total += int(cached_details.get(key) or 0)
+                    except Exception:
+                        pass
+            if seen:
+                return total
+
+        meta_info = response.get("meta_info") or {}
+        if isinstance(meta_info, dict) and "cached_tokens" in meta_info:
+            try:
+                return int(meta_info.get("cached_tokens") or 0)
+            except Exception:
+                return 0
+        return None
+
     def _kv_checkpoint_metadata(
         self,
         *,
@@ -358,7 +406,6 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         history_units = _history_units(messages)
         prompt_input_ids = self._full_prompt_input_ids(messages, tools)
         prompt_tokens = len(prompt_input_ids)
-        aligned_tokens = self._page_align_len(prompt_tokens)
         sglang_checkpoint_id = (
             f"{test_entry_id}_fullkv_ckpt{checkpoint_id}_step{global_step}_"
             f"{_stable_hash(prompt_input_ids)[:12]}"
@@ -372,11 +419,12 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "history_units": len(history_units),
             "prompt_token_estimate": _token_count(self.tokenizer, messages),
             "full_prompt_tokens": prompt_tokens,
-            "aligned_checkpoint_tokens": aligned_tokens,
+            "requested_checkpoint_tokens": prompt_tokens,
+            "aligned_checkpoint_tokens": 0,
             "cache_handle": None,
-            "sequence_length": aligned_tokens,
+            "sequence_length": 0,
             "position_metadata": None,
-            "page_size": self.recovery_checkpoint_page_size,
+            "page_size": None,
             "c2kv_cache_metadata": [
                 {
                     "message_index": index,
@@ -389,8 +437,8 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         if not self.enable_recovery_kv_checkpoint:
             metadata["limitation"] = "rollback_backend_is_message_replay"
             return metadata
-        if aligned_tokens <= 0:
-            metadata["limitation"] = "aligned_prefix_is_empty"
+        if prompt_tokens <= 0:
+            metadata["limitation"] = "empty_full_prompt"
             return metadata
 
         started = time.perf_counter()
@@ -408,12 +456,30 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                 self.timeout,
             )
             maintenance_latency = time.perf_counter() - started
+            maintenance_prompt_tokens = self._generate_prompt_tokens(
+                generate_response,
+                prompt_tokens,
+            )
+            maintenance_cached_tokens = self._actual_cached_tokens_from_response(
+                generate_response
+            )
+            maintenance_cache_report_missing = maintenance_cached_tokens is None
+            if maintenance_cached_tokens is None:
+                maintenance_cached_tokens = 0
+            maintenance_cached_tokens = min(
+                maintenance_prompt_tokens,
+                max(0, int(maintenance_cached_tokens)),
+            )
+            maintenance_recomputed_tokens = max(
+                maintenance_prompt_tokens - maintenance_cached_tokens,
+                0,
+            )
             create_response = _post_json(
                 self.base_url,
                 "/recovery_checkpoint/create",
                 {
                     "checkpoint_id": sglang_checkpoint_id,
-                    "input_ids": prompt_input_ids[:aligned_tokens],
+                    "input_ids": prompt_input_ids,
                     "session_id": test_entry_id,
                     "segment_id": checkpoint_id,
                     "global_step": global_step,
@@ -425,19 +491,39 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                 self.timeout,
             )
             create_latency = time.perf_counter() - started - maintenance_latency
+            checkpoint_tokens = self._max_status_int(
+                create_response,
+                "checkpoint_tokens",
+            )
+            if not checkpoint_tokens:
+                checkpoint_tokens = self._max_status_int(
+                    create_response,
+                    "token_count",
+                )
+            page_size = self._max_status_int(create_response, "page_size") or None
+            requested_tokens = (
+                self._max_status_int(create_response, "requested_tokens")
+                or prompt_tokens
+            )
             metadata.update(
                 {
                     "available": bool(create_response.get("success")),
                     "cache_handle": sglang_checkpoint_id,
+                    "requested_checkpoint_tokens": requested_tokens,
+                    "aligned_checkpoint_tokens": checkpoint_tokens,
+                    "sequence_length": checkpoint_tokens,
+                    "page_size": page_size,
                     "generate_response": make_json_serializable(generate_response),
                     "create_response": make_json_serializable(create_response),
                     "checkpoint_maintenance_logical_prompt_tokens": prompt_tokens,
-                    "checkpoint_maintenance_prompt_tokens": self._generate_prompt_tokens(
-                        generate_response,
-                        prompt_tokens,
+                    "checkpoint_maintenance_prompt_tokens": maintenance_prompt_tokens,
+                    "checkpoint_maintenance_reused_tokens": maintenance_cached_tokens,
+                    "checkpoint_maintenance_recomputed_tokens": (
+                        maintenance_recomputed_tokens
                     ),
-                    "checkpoint_maintenance_reused_tokens": 0,
-                    "checkpoint_maintenance_recomputed_tokens": prompt_tokens,
+                    "checkpoint_maintenance_cache_report_missing": (
+                        maintenance_cache_report_missing
+                    ),
                     "checkpoint_create_backup_tokens": self._max_status_int(
                         create_response,
                         "backup_tokens",
@@ -472,10 +558,65 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             )
         return metadata
 
-    def _release_kv_checkpoint(self, snapshot: dict[str, Any] | None) -> None:
-        if not snapshot:
+    @staticmethod
+    def _empty_checkpoint_maintenance() -> dict[str, int]:
+        return {
+            "checkpoint_maintenance_reused_tokens": 0,
+            "checkpoint_maintenance_recomputed_tokens": 0,
+            "checkpoint_maintenance_logical_prompt_tokens": 0,
+            "checkpoint_maintenance_cache_report_missing": 0,
+        }
+
+    @classmethod
+    def _add_checkpoint_maintenance(
+        cls,
+        totals: dict[str, int],
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        if not metadata:
             return
-        metadata = snapshot.get("kv_checkpoint_metadata") or {}
+        for key in cls._empty_checkpoint_maintenance():
+            totals[key] = int(totals.get(key) or 0) + int(metadata.get(key) or 0)
+
+    def _restore_kv_checkpoint_metadata(
+        self,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        metadata = metadata or {}
+        sglang_checkpoint_id = metadata.get("sglang_checkpoint_id")
+        if not metadata.get("available") or not sglang_checkpoint_id:
+            return {
+                "success": False,
+                "fallback_reason": (
+                    metadata.get("limitation")
+                    or metadata.get("error")
+                    or "KV_CHECKPOINT_NOT_AVAILABLE"
+                ),
+            }
+        try:
+            response = _post_json(
+                self.base_url,
+                "/recovery_checkpoint/restore",
+                {
+                    "checkpoint_id": sglang_checkpoint_id,
+                    "sync": True,
+                    "pin_device": True,
+                },
+                self.timeout,
+            )
+            return make_json_serializable(response)
+        except Exception as exc:
+            return {
+                "success": False,
+                "fallback_reason": f"restore_exception:{exc}",
+            }
+
+    def _release_kv_checkpoint_metadata(
+        self,
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        if not metadata:
+            return
         checkpoint_id = metadata.get("sglang_checkpoint_id")
         if not checkpoint_id or metadata.get("released"):
             return
@@ -491,6 +632,13 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         except Exception as exc:
             metadata["release_error"] = str(exc)
 
+    def _release_kv_checkpoint(self, snapshot: dict[str, Any] | None) -> None:
+        if not snapshot:
+            return
+        self._release_kv_checkpoint_metadata(
+            snapshot.get("kv_checkpoint_metadata")
+        )
+
     def _release_kv_snapshots(self, snapshots: Sequence[dict[str, Any] | None]) -> None:
         seen = set()
         for snapshot in snapshots:
@@ -505,6 +653,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         self,
         backend_info: dict[str, Any],
         prompt_tokens: int,
+        actual_cached_tokens: int | None,
     ) -> None:
         prompt_tokens = int(prompt_tokens or 0)
         backend_info["recovery_logical_prompt_tokens"] = int(
@@ -516,15 +665,28 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             and not backend_info.get("kv_restore_fallback")
         ):
             cached_prefix = int(backend_info.get("_cached_prefix_tokens") or 0)
-            reused = min(prompt_tokens, cached_prefix)
-            recomputed = max(prompt_tokens - cached_prefix, 0)
+            expected_reused = min(prompt_tokens, cached_prefix)
+            expected_recomputed = max(prompt_tokens - expected_reused, 0)
+            backend_info["expected_kv_reused_tokens"] = int(
+                backend_info.get("expected_kv_reused_tokens") or 0
+            ) + expected_reused
+            backend_info["expected_kv_recomputed_tokens"] = int(
+                backend_info.get("expected_kv_recomputed_tokens") or 0
+            ) + expected_recomputed
+            if actual_cached_tokens is None:
+                backend_info["actual_cache_report_missing"] = int(
+                    backend_info.get("actual_cache_report_missing") or 0
+                ) + 1
+                actual_cached_tokens = 0
+            reused = min(prompt_tokens, max(0, int(actual_cached_tokens)))
+            recomputed = max(prompt_tokens - reused, 0)
             backend_info["kv_reused_tokens"] = int(
                 backend_info.get("kv_reused_tokens") or 0
             ) + reused
             backend_info["kv_recomputed_tokens"] = int(
                 backend_info.get("kv_recomputed_tokens") or 0
             ) + recomputed
-            backend_info["_cached_prefix_tokens"] = self._page_align_len(prompt_tokens)
+            backend_info["_cached_prefix_tokens"] = prompt_tokens
         else:
             backend_info["message_replay_prefill_tokens"] = int(
                 backend_info.get("message_replay_prefill_tokens") or 0
@@ -535,6 +697,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         *,
         test_entry_id: str,
         snapshot: dict[str, Any],
+        tools: Sequence[dict[str, Any]],
     ) -> tuple[
         list[dict[str, Any]],
         dict[str, Any],
@@ -556,75 +719,72 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "kv_restore_fallback_reason": None,
             "kv_reused_tokens": 0,
             "kv_recomputed_tokens": 0,
+            "expected_kv_reused_tokens": 0,
+            "expected_kv_recomputed_tokens": 0,
+            "actual_cache_report_missing": 0,
             "message_replay_prefill_tokens": 0,
             "recovery_logical_prompt_tokens": 0,
             "restored_checkpoint_tokens": 0,
             "restore_loaded_from_host_tokens": 0,
             "restore_already_device_tokens": 0,
+            "safe_delta_prefill_tokens": 0,
+            "safe_delta_reused_tokens": 0,
+            "safe_delta_logical_prompt_tokens": 0,
             "_cached_prefix_tokens": 0,
             "restore_latency_sec": 0.0,
             "rollback_latency_sec": 0.0,
-            "kv_checkpoint_metadata": snapshot.get("kv_checkpoint_metadata"),
+            "kv_checkpoint_metadata": snapshot.get("kv_checkpoint_metadata")
+            or snapshot.get("kv_anchor_checkpoint_metadata"),
+            "logical_snapshot_has_kv_checkpoint": bool(
+                snapshot.get("kv_checkpoint_metadata")
+            ),
         }
         if self.rollback_backend == "kv_restore":
-            metadata = snapshot.get("kv_checkpoint_metadata") or {}
+            metadata = (
+                snapshot.get("kv_checkpoint_metadata")
+                or snapshot.get("kv_anchor_checkpoint_metadata")
+                or {}
+            )
             sglang_checkpoint_id = metadata.get("sglang_checkpoint_id")
             if metadata.get("available") and sglang_checkpoint_id:
-                try:
-                    restore_started = time.perf_counter()
-                    restore_response = _post_json(
-                        self.base_url,
-                        "/recovery_checkpoint/restore",
+                restore_started = time.perf_counter()
+                restore_response = self._restore_kv_checkpoint_metadata(metadata)
+                backend_info["restore_latency_sec"] = (
+                    time.perf_counter() - restore_started
+                )
+                if restore_response.get("success"):
+                    restored_tokens = int(metadata.get("aligned_checkpoint_tokens") or 0)
+                    backend_info.update(
                         {
-                            "checkpoint_id": sglang_checkpoint_id,
-                            "sync": True,
-                            "pin_device": True,
-                        },
-                        self.timeout,
+                            "kv_restore_success": True,
+                            "restore_response": make_json_serializable(
+                                restore_response
+                            ),
+                            "restored_checkpoint_tokens": restored_tokens,
+                            "restore_loaded_from_host_tokens": self._max_status_int(
+                                restore_response,
+                                "loaded_from_host_tokens",
+                            ),
+                            "restore_already_device_tokens": self._max_status_int(
+                                restore_response,
+                                "already_device_tokens",
+                            ),
+                            "_cached_prefix_tokens": restored_tokens,
+                        }
                     )
-                    backend_info["restore_latency_sec"] = (
-                        time.perf_counter() - restore_started
-                    )
-                    if restore_response.get("success"):
-                        restored_tokens = int(
-                            metadata.get("aligned_checkpoint_tokens") or 0
-                        )
-                        backend_info.update(
-                            {
-                                "kv_restore_success": True,
-                                "restore_response": make_json_serializable(
-                                    restore_response
-                                ),
-                                "restored_checkpoint_tokens": restored_tokens,
-                                "restore_loaded_from_host_tokens": self._max_status_int(
-                                    restore_response,
-                                    "loaded_from_host_tokens",
-                                ),
-                                "restore_already_device_tokens": self._max_status_int(
-                                    restore_response,
-                                    "already_device_tokens",
-                                ),
-                                "_cached_prefix_tokens": restored_tokens,
-                            }
-                        )
-                    else:
-                        backend_info.update(
-                            {
-                                "kv_restore_fallback": True,
-                                "kv_restore_fallback_reason": (
-                                    restore_response.get("fallback_reason")
-                                    or "RESTORE_FAILED"
-                                ),
-                                "restore_response": make_json_serializable(
-                                    restore_response
-                                ),
-                            }
-                        )
-                except Exception as exc:
+                else:
                     backend_info.update(
                         {
                             "kv_restore_fallback": True,
-                            "kv_restore_fallback_reason": f"restore_exception:{exc}",
+                            "kv_restore_fallback_reason": (
+                                restore_response.get("fallback_reason")
+                                or restore_response.get("message")
+                                or restore_response.get("error")
+                                or "RESTORE_FAILED"
+                            ),
+                            "restore_response": make_json_serializable(
+                                restore_response
+                            ),
                         }
                     )
             else:
@@ -649,6 +809,81 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             restored_state,
             matches,
         ) = self._restore_snapshot(test_entry_id=test_entry_id, snapshot=snapshot)
+        if (
+            self.rollback_backend == "kv_restore"
+            and backend_info.get("kv_restore_success")
+            and not backend_info.get("kv_restore_fallback")
+        ):
+            prompt_input_ids = self._full_prompt_input_ids(messages, tools)
+            prompt_tokens = len(prompt_input_ids)
+            restored_tokens = int(backend_info.get("restored_checkpoint_tokens") or 0)
+            if prompt_tokens > restored_tokens:
+                try:
+                    warmup_started = time.perf_counter()
+                    warmup_response = _post_json(
+                        self.base_url,
+                        "/generate",
+                        {
+                            "input_ids": prompt_input_ids,
+                            "sampling_params": {
+                                "max_new_tokens": 0,
+                                "temperature": 0,
+                            },
+                        },
+                        self.timeout,
+                    )
+                    warmup_elapsed = time.perf_counter() - warmup_started
+                    expected_reused = min(prompt_tokens, restored_tokens)
+                    expected_recomputed = max(prompt_tokens - expected_reused, 0)
+                    actual_cached = self._actual_cached_tokens_from_response(
+                        warmup_response
+                    )
+                    if actual_cached is None:
+                        backend_info["actual_cache_report_missing"] = int(
+                            backend_info.get("actual_cache_report_missing") or 0
+                        ) + 1
+                        actual_cached = 0
+                    reused = min(prompt_tokens, max(0, int(actual_cached)))
+                    recomputed = max(prompt_tokens - reused, 0)
+                    backend_info["safe_delta_logical_prompt_tokens"] = prompt_tokens
+                    backend_info["safe_delta_reused_tokens"] = reused
+                    backend_info["safe_delta_prefill_tokens"] = recomputed
+                    backend_info["safe_delta_expected_reused_tokens"] = (
+                        expected_reused
+                    )
+                    backend_info["safe_delta_expected_prefill_tokens"] = (
+                        expected_recomputed
+                    )
+                    backend_info["expected_kv_reused_tokens"] = int(
+                        backend_info.get("expected_kv_reused_tokens") or 0
+                    ) + expected_reused
+                    backend_info["expected_kv_recomputed_tokens"] = int(
+                        backend_info.get("expected_kv_recomputed_tokens") or 0
+                    ) + expected_recomputed
+                    backend_info["kv_reused_tokens"] = int(
+                        backend_info.get("kv_reused_tokens") or 0
+                    ) + reused
+                    backend_info["kv_recomputed_tokens"] = int(
+                        backend_info.get("kv_recomputed_tokens") or 0
+                    ) + recomputed
+                    backend_info["_cached_prefix_tokens"] = prompt_tokens
+                    backend_info["safe_delta_warmup_latency_sec"] = warmup_elapsed
+                    backend_info["safe_delta_warmup_response"] = (
+                        make_json_serializable(warmup_response)
+                    )
+                except Exception as exc:
+                    backend_info.update(
+                        {
+                            "kv_restore_success": False,
+                            "kv_restore_fallback": True,
+                            "kv_restore_fallback_reason": (
+                                f"safe_delta_warmup_exception:{exc}"
+                            ),
+                            "_cached_prefix_tokens": 0,
+                        }
+                    )
+            else:
+                backend_info["_cached_prefix_tokens"] = prompt_tokens
         elapsed = time.perf_counter() - start
         if not backend_info.get("restore_latency_sec"):
             backend_info["restore_latency_sec"] = elapsed
@@ -1120,6 +1355,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "temperature": self.temperature,
             "max_completion_tokens": max_tokens,
             "chat_template_kwargs": {"enable_thinking": False},
+            "return_cached_tokens_details": True,
         }
         if readout_probe:
             payload.update(
@@ -1141,11 +1377,19 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         usage = data.get("usage") or {}
         stats.chat_calls += 1
         stats.chat_seconds += elapsed
+        cached_tokens = self._actual_cached_tokens_from_response(data)
+        prompt_token_count = int(usage.get("prompt_tokens") or prompt_tokens)
         parsed_usage = {
-            "prompt_tokens": int(usage.get("prompt_tokens") or prompt_tokens),
+            "prompt_tokens": prompt_token_count,
             "completion_tokens": int(
                 usage.get("completion_tokens")
                 or len(self.tokenizer.encode(text, add_special_tokens=False))
+            ),
+            "cached_tokens": cached_tokens,
+            "recomputed_tokens": (
+                max(prompt_token_count - int(cached_tokens), 0)
+                if cached_tokens is not None
+                else None
             ),
         }
         return text, message, elapsed, parsed_usage, data
@@ -1281,21 +1525,27 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         current_turn_latency: list[float],
         turn_log: dict[str, Any],
         parent_kv_checkpoint_id: str | None = None,
+        create_kv_checkpoint: bool = False,
+        kv_anchor_checkpoint_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return {
-            "checkpoint_id": checkpoint_id,
-            "global_step": global_step,
-            "messages": deepcopy(messages),
-            "instances": deepcopy(involved_instances),
-            "state": _state_log(involved_instances),
-            "kv_checkpoint_metadata": self._kv_checkpoint_metadata(
+        kv_checkpoint_metadata = None
+        if create_kv_checkpoint:
+            kv_checkpoint_metadata = self._kv_checkpoint_metadata(
                 test_entry_id=test_entry_id,
                 messages=messages,
                 tools=tools,
                 global_step=global_step,
                 checkpoint_id=checkpoint_id,
                 parent_checkpoint_id=parent_kv_checkpoint_id,
-            ),
+            )
+        return {
+            "checkpoint_id": checkpoint_id,
+            "global_step": global_step,
+            "messages": deepcopy(messages),
+            "instances": deepcopy(involved_instances),
+            "state": _state_log(involved_instances),
+            "kv_checkpoint_metadata": kv_checkpoint_metadata,
+            "kv_anchor_checkpoint_metadata": deepcopy(kv_anchor_checkpoint_metadata),
             "current_turn_response": deepcopy(current_turn_response),
             "current_turn_inputs": deepcopy(current_turn_inputs),
             "current_turn_outputs": deepcopy(current_turn_outputs),
@@ -1567,12 +1817,17 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         kv_restore_fallback_count = 0
         kv_reused_tokens_total = 0
         kv_recomputed_tokens_total = 0
+        expected_kv_reused_tokens_total = 0
+        expected_kv_recomputed_tokens_total = 0
+        actual_cache_report_missing_total = 0
         message_replay_prefill_tokens_total = 0
         rollback_latency_total = 0.0
         restore_latency_total = 0.0
         regenerated_steps_total = 0
         full_regenerated_tokens_total = 0
         checkpoint_id = 0
+        physical_checkpoint_id = 0
+        active_full_checkpoint_metadata: dict[str, Any] | None = None
         force_quit = False
 
         for turn_idx, current_turn_message in enumerate(test_case["question"]):
@@ -1588,6 +1843,38 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                 checkpoint_id += 1
                 segment_start_step = len(drift_steps)
                 segment_start_turn_step = count
+                segment_checkpoint_maintenance = (
+                    self._empty_checkpoint_maintenance()
+                )
+                segment_initial_full_checkpoint_metadata = None
+                segment_active_full_checkpoint_before = (
+                    active_full_checkpoint_metadata.get("sglang_checkpoint_id")
+                    if active_full_checkpoint_metadata
+                    else None
+                )
+                if (
+                    self.enable_recovery_kv_checkpoint
+                    and active_full_checkpoint_metadata is None
+                ):
+                    physical_checkpoint_id += 1
+                    active_full_checkpoint_metadata = self._kv_checkpoint_metadata(
+                        test_entry_id=test_entry_id,
+                        messages=messages,
+                        tools=tools,
+                        global_step=segment_start_step,
+                        checkpoint_id=physical_checkpoint_id,
+                        parent_checkpoint_id=None,
+                    )
+                    segment_initial_full_checkpoint_metadata = (
+                        active_full_checkpoint_metadata
+                    )
+                    self._add_checkpoint_maintenance(
+                        segment_checkpoint_maintenance,
+                        segment_initial_full_checkpoint_metadata,
+                    )
+                    segment_active_full_checkpoint_before = (
+                        active_full_checkpoint_metadata.get("sglang_checkpoint_id")
+                    )
                 segment_checkpoint = self._snapshot(
                     test_entry_id=test_entry_id,
                     checkpoint_id=checkpoint_id,
@@ -1600,6 +1887,8 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     current_turn_outputs=current_turn_outputs,
                     current_turn_latency=current_turn_latency,
                     turn_log=turn_log,
+                    create_kv_checkpoint=False,
+                    kv_anchor_checkpoint_metadata=active_full_checkpoint_metadata,
                 )
                 segment_infos: list[dict[str, Any]] = []
                 terminal_after_segment = False
@@ -1617,6 +1906,8 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         current_turn_outputs=current_turn_outputs,
                         current_turn_latency=current_turn_latency,
                         turn_log=turn_log,
+                        create_kv_checkpoint=False,
+                        kv_anchor_checkpoint_metadata=active_full_checkpoint_metadata,
                     )
                     request_messages = self._build_request_messages(messages, stats)
                     (
@@ -1800,9 +2091,21 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     "kv_restore_fallback_reason": None,
                     "kv_reused_tokens": 0,
                     "kv_recomputed_tokens": 0,
+                    "expected_kv_reused_tokens": 0,
+                    "expected_kv_recomputed_tokens": 0,
+                    "actual_cache_report_missing": 0,
                     "message_replay_prefill_tokens": 0,
+                    "recovery_logical_prompt_tokens": 0,
+                    "restored_checkpoint_tokens": 0,
+                    "restore_loaded_from_host_tokens": 0,
+                    "restore_already_device_tokens": 0,
+                    "safe_delta_prefill_tokens": 0,
+                    "safe_delta_reused_tokens": 0,
+                    "safe_delta_logical_prompt_tokens": 0,
                     "restore_latency_sec": 0.0,
                     "rollback_latency_sec": 0.0,
+                    "logical_snapshot_has_kv_checkpoint": False,
+                    "kv_checkpoint_metadata": active_full_checkpoint_metadata,
                 }
 
                 if not segment_has_drift:
@@ -1899,6 +2202,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     ) = self._restore_with_backend(
                         test_entry_id=test_entry_id,
                         snapshot=restore_target,
+                        tools=tools,
                     )
                     if not rollback_state_matches_checkpoint:
                         raise RuntimeError(
@@ -1916,10 +2220,12 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             recovery_message,
                             recovery_elapsed,
                             recovery_usage,
-                        ) = self._query(
+                            recovery_raw,
+                        ) = self._query_with_raw(
                             recovery_messages,
                             tools,
                             stats,
+                            readout_probe=False,
                         )
                         recovery_prompt_tokens = int(
                             recovery_usage.get("prompt_tokens") or recovery_local_tokens
@@ -1927,6 +2233,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         self._account_recovery_prompt_work(
                             rollback_backend_info,
                             recovery_prompt_tokens,
+                            recovery_usage.get("cached_tokens"),
                         )
                         segment_recovery_tokens += recovery_prompt_tokens
                         recovery_assistant = _assistant_history_message(
@@ -2085,6 +2392,16 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     kv_recomputed_tokens_total += int(
                         rollback_backend_info.get("kv_recomputed_tokens") or 0
                     )
+                    expected_kv_reused_tokens_total += int(
+                        rollback_backend_info.get("expected_kv_reused_tokens") or 0
+                    )
+                    expected_kv_recomputed_tokens_total += int(
+                        rollback_backend_info.get("expected_kv_recomputed_tokens")
+                        or 0
+                    )
+                    actual_cache_report_missing_total += int(
+                        rollback_backend_info.get("actual_cache_report_missing") or 0
+                    )
                     message_replay_prefill_tokens_total += int(
                         rollback_backend_info.get("message_replay_prefill_tokens")
                         or 0
@@ -2193,6 +2510,56 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             ).get("risk_score"),
                         }
                     )
+
+                chain_advance_metadata = None
+                chain_restore_response = None
+                chain_restore_success = None
+                chain_release_previous = False
+                chain_advance_error = None
+                previous_active_checkpoint_metadata = active_full_checkpoint_metadata
+                if self.enable_recovery_kv_checkpoint:
+                    parent_checkpoint_id = (
+                        previous_active_checkpoint_metadata.get(
+                            "sglang_checkpoint_id"
+                        )
+                        if previous_active_checkpoint_metadata
+                        and previous_active_checkpoint_metadata.get("available")
+                        else None
+                    )
+                    if previous_active_checkpoint_metadata:
+                        restore_started = time.perf_counter()
+                        chain_restore_response = self._restore_kv_checkpoint_metadata(
+                            previous_active_checkpoint_metadata
+                        )
+                        chain_restore_success = bool(
+                            chain_restore_response.get("success")
+                        )
+                        chain_restore_response["elapsed_sec"] = (
+                            time.perf_counter() - restore_started
+                        )
+                    try:
+                        physical_checkpoint_id += 1
+                        chain_advance_metadata = self._kv_checkpoint_metadata(
+                            test_entry_id=test_entry_id,
+                            messages=messages,
+                            tools=tools,
+                            global_step=len(drift_steps),
+                            checkpoint_id=physical_checkpoint_id,
+                            parent_checkpoint_id=parent_checkpoint_id,
+                        )
+                        self._add_checkpoint_maintenance(
+                            segment_checkpoint_maintenance,
+                            chain_advance_metadata,
+                        )
+                        if chain_advance_metadata.get("available"):
+                            active_full_checkpoint_metadata = chain_advance_metadata
+                            if previous_active_checkpoint_metadata:
+                                self._release_kv_checkpoint_metadata(
+                                    previous_active_checkpoint_metadata
+                                )
+                                chain_release_previous = True
+                    except Exception as exc:
+                        chain_advance_error = str(exc)
 
                 regenerated_end_state = _state_log(involved_instances)
                 if segment_has_drift:
@@ -2358,6 +2725,15 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         "kv_recomputed_tokens": rollback_backend_info.get(
                             "kv_recomputed_tokens"
                         ),
+                        "expected_kv_reused_tokens": rollback_backend_info.get(
+                            "expected_kv_reused_tokens"
+                        ),
+                        "expected_kv_recomputed_tokens": rollback_backend_info.get(
+                            "expected_kv_recomputed_tokens"
+                        ),
+                        "actual_cache_report_missing": rollback_backend_info.get(
+                            "actual_cache_report_missing"
+                        ),
                         "message_replay_prefill_tokens": rollback_backend_info.get(
                             "message_replay_prefill_tokens"
                         ),
@@ -2373,15 +2749,87 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         "restore_already_device_tokens": rollback_backend_info.get(
                             "restore_already_device_tokens"
                         ),
+                        "safe_delta_prefill_tokens": rollback_backend_info.get(
+                            "safe_delta_prefill_tokens"
+                        ),
+                        "safe_delta_reused_tokens": rollback_backend_info.get(
+                            "safe_delta_reused_tokens"
+                        ),
+                        "safe_delta_logical_prompt_tokens": rollback_backend_info.get(
+                            "safe_delta_logical_prompt_tokens"
+                        ),
+                        "safe_delta_expected_reused_tokens": (
+                            rollback_backend_info.get(
+                                "safe_delta_expected_reused_tokens"
+                            )
+                        ),
+                        "safe_delta_expected_prefill_tokens": (
+                            rollback_backend_info.get(
+                                "safe_delta_expected_prefill_tokens"
+                            )
+                        ),
+                        "logical_snapshot_has_kv_checkpoint": (
+                            rollback_backend_info.get(
+                                "logical_snapshot_has_kv_checkpoint"
+                            )
+                        ),
                         "kv_checkpoint_metadata": rollback_backend_info.get(
                             "kv_checkpoint_metadata"
                         ),
+                        "active_full_checkpoint_before": (
+                            segment_active_full_checkpoint_before
+                        ),
+                        "active_full_checkpoint_after": (
+                            active_full_checkpoint_metadata.get(
+                                "sglang_checkpoint_id"
+                            )
+                            if active_full_checkpoint_metadata
+                            else None
+                        ),
+                        "initial_full_checkpoint_metadata": (
+                            make_json_serializable(
+                                segment_initial_full_checkpoint_metadata
+                            )
+                            if segment_initial_full_checkpoint_metadata
+                            else None
+                        ),
+                        "full_checkpoint_chain_advanced": bool(
+                            chain_advance_metadata
+                            and chain_advance_metadata.get("available")
+                        ),
+                        "full_checkpoint_chain_restore_success": (
+                            chain_restore_success
+                        ),
+                        "full_checkpoint_chain_restore_response": (
+                            make_json_serializable(chain_restore_response)
+                        ),
+                        "full_checkpoint_chain_release_previous": (
+                            chain_release_previous
+                        ),
+                        "full_checkpoint_chain_error": chain_advance_error,
+                        "full_checkpoint_chain_metadata": (
+                            make_json_serializable(chain_advance_metadata)
+                        ),
                         "checkpoint_maintenance_recomputed_tokens": (
-                            rollback_backend_info.get("kv_checkpoint_metadata") or {}
-                        ).get("checkpoint_maintenance_recomputed_tokens"),
+                            segment_checkpoint_maintenance.get(
+                                "checkpoint_maintenance_recomputed_tokens"
+                            )
+                        ),
+                        "checkpoint_maintenance_reused_tokens": (
+                            segment_checkpoint_maintenance.get(
+                                "checkpoint_maintenance_reused_tokens"
+                            )
+                        ),
                         "checkpoint_maintenance_logical_prompt_tokens": (
-                            rollback_backend_info.get("kv_checkpoint_metadata") or {}
-                        ).get("checkpoint_maintenance_logical_prompt_tokens"),
+                            segment_checkpoint_maintenance.get(
+                                "checkpoint_maintenance_logical_prompt_tokens"
+                            )
+                        ),
+                        "checkpoint_maintenance_cache_report_missing": (
+                            segment_checkpoint_maintenance.get(
+                                "checkpoint_maintenance_cache_report_missing"
+                            )
+                        ),
                         "restore_latency_sec": rollback_backend_info.get(
                             "restore_latency_sec"
                         ),
@@ -2430,10 +2878,6 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         "recovery_horizon": self.recovery_horizon,
                     }
                 )
-                self._release_kv_snapshots(
-                    [segment_checkpoint]
-                    + [info.get("micro_snapshot") for info in segment_infos]
-                )
 
                 if terminal_after_segment or force_quit:
                     break
@@ -2449,6 +2893,25 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             if force_quit:
                 break
 
+        self._release_kv_checkpoint_metadata(active_full_checkpoint_metadata)
+
+        checkpoint_maintenance_reused_tokens_total = sum(
+            int(row.get("checkpoint_maintenance_reused_tokens") or 0)
+            for row in checkpoint_segments
+        )
+        checkpoint_maintenance_recomputed_tokens_total = sum(
+            int(row.get("checkpoint_maintenance_recomputed_tokens") or 0)
+            for row in checkpoint_segments
+        )
+        checkpoint_maintenance_logical_prompt_tokens_total = sum(
+            int(row.get("checkpoint_maintenance_logical_prompt_tokens") or 0)
+            for row in checkpoint_segments
+        )
+        checkpoint_maintenance_cache_report_missing_total = sum(
+            int(row.get("checkpoint_maintenance_cache_report_missing") or 0)
+            for row in checkpoint_segments
+        )
+
         metadata = {
             "input_token_count": input_token_count,
             "output_token_count": output_token_count,
@@ -2463,7 +2926,22 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "kv_restore_fallback": kv_restore_fallback_count,
             "kv_reused_tokens": kv_reused_tokens_total,
             "kv_recomputed_tokens": kv_recomputed_tokens_total,
+            "expected_kv_reused_tokens": expected_kv_reused_tokens_total,
+            "expected_kv_recomputed_tokens": expected_kv_recomputed_tokens_total,
+            "actual_cache_report_missing": actual_cache_report_missing_total,
             "message_replay_prefill_tokens": message_replay_prefill_tokens_total,
+            "checkpoint_maintenance_reused_tokens": (
+                checkpoint_maintenance_reused_tokens_total
+            ),
+            "checkpoint_maintenance_recomputed_tokens": (
+                checkpoint_maintenance_recomputed_tokens_total
+            ),
+            "checkpoint_maintenance_logical_prompt_tokens": (
+                checkpoint_maintenance_logical_prompt_tokens_total
+            ),
+            "checkpoint_maintenance_cache_report_missing": (
+                checkpoint_maintenance_cache_report_missing_total
+            ),
             "rollback_latency_sec": rollback_latency_total,
             "restore_latency_sec": restore_latency_total,
             "regenerated_steps": regenerated_steps_total,
@@ -2502,8 +2980,36 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "kv_restore_fallback": metadata.get("kv_restore_fallback", 0),
             "kv_reused_tokens": metadata.get("kv_reused_tokens", 0),
             "kv_recomputed_tokens": metadata.get("kv_recomputed_tokens", 0),
+            "expected_kv_reused_tokens": metadata.get(
+                "expected_kv_reused_tokens",
+                0,
+            ),
+            "expected_kv_recomputed_tokens": metadata.get(
+                "expected_kv_recomputed_tokens",
+                0,
+            ),
+            "actual_cache_report_missing": metadata.get(
+                "actual_cache_report_missing",
+                0,
+            ),
             "message_replay_prefill_tokens": metadata.get(
                 "message_replay_prefill_tokens",
+                0,
+            ),
+            "checkpoint_maintenance_reused_tokens": metadata.get(
+                "checkpoint_maintenance_reused_tokens",
+                0,
+            ),
+            "checkpoint_maintenance_recomputed_tokens": metadata.get(
+                "checkpoint_maintenance_recomputed_tokens",
+                0,
+            ),
+            "checkpoint_maintenance_logical_prompt_tokens": metadata.get(
+                "checkpoint_maintenance_logical_prompt_tokens",
+                0,
+            ),
+            "checkpoint_maintenance_cache_report_missing": metadata.get(
+                "checkpoint_maintenance_cache_report_missing",
                 0,
             ),
             "rollback_latency_sec": metadata.get("rollback_latency_sec", 0.0),
@@ -3078,7 +3584,26 @@ def run(args: argparse.Namespace) -> None:
         "kv_restore_fallback": sum(int(row.get("kv_restore_fallback") or 0) for row in metrics_rows),
         "kv_reused_tokens": sum(int(row.get("kv_reused_tokens") or 0) for row in metrics_rows),
         "kv_recomputed_tokens": sum(int(row.get("kv_recomputed_tokens") or 0) for row in metrics_rows),
+        "expected_kv_reused_tokens": sum(int(row.get("expected_kv_reused_tokens") or 0) for row in metrics_rows),
+        "expected_kv_recomputed_tokens": sum(int(row.get("expected_kv_recomputed_tokens") or 0) for row in metrics_rows),
+        "actual_cache_report_missing": sum(int(row.get("actual_cache_report_missing") or 0) for row in metrics_rows),
         "message_replay_prefill_tokens": sum(int(row.get("message_replay_prefill_tokens") or 0) for row in metrics_rows),
+        "checkpoint_maintenance_reused_tokens": sum(
+            int(row.get("checkpoint_maintenance_reused_tokens") or 0)
+            for row in metrics_rows
+        ),
+        "checkpoint_maintenance_recomputed_tokens": sum(
+            int(row.get("checkpoint_maintenance_recomputed_tokens") or 0)
+            for row in metrics_rows
+        ),
+        "checkpoint_maintenance_logical_prompt_tokens": sum(
+            int(row.get("checkpoint_maintenance_logical_prompt_tokens") or 0)
+            for row in metrics_rows
+        ),
+        "checkpoint_maintenance_cache_report_missing": sum(
+            int(row.get("checkpoint_maintenance_cache_report_missing") or 0)
+            for row in metrics_rows
+        ),
         "segment_count": len(segment_rows),
     }
     Path(args.summary_path).parent.mkdir(parents=True, exist_ok=True)
@@ -3157,7 +3682,15 @@ def parse_args() -> argparse.Namespace:
         choices=sorted(ROLLBACK_BACKENDS),
         default="message_replay",
     )
-    parser.add_argument("--recovery-checkpoint-page-size", type=int, default=128)
+    parser.add_argument(
+        "--recovery-checkpoint-page-size",
+        type=int,
+        default=0,
+        help=(
+            "Deprecated no-op. Recovery checkpoint page alignment is decided "
+            "by the SGLang cache owner."
+        ),
+    )
     parser.add_argument("--recent-full-units", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=72000)
     parser.add_argument("--max-completion-tokens", type=int, default=4096)
