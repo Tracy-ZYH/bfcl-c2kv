@@ -8,7 +8,7 @@ MODEL_ID="${MODEL_ID:-Qwen/Qwen3-4B-Instruct-2507-FC}"
 CATEGORY="${CATEGORY:-multi_turn_base}"
 RUN_ROOT="${RUN_ROOT:?RUN_ROOT is required}"
 REFERENCE_DETAILS="${REFERENCE_DETAILS:?REFERENCE_DETAILS is required}"
-MODES="${MODES:-multistep_i2_oracle_whole_segment,multistep_i2_oracle_first_bad,multistep_i2_oracle_first_bad_suffix,multistep_i4_oracle_whole_segment,multistep_i4_oracle_first_bad,multistep_i4_oracle_first_bad_suffix}"
+MODES="${MODES:-phase34_k2_whole_message,phase34_k2_oracle_first_bad_suffix_message,phase34_k2_oracle_first_bad_one_step_message,phase34_k2_oracle_first_bad_suffix_kv,phase34_k2_heuristic_suffix_message,phase34_k2_heuristic_suffix_kv,phase34_k4_whole_message,phase34_k4_oracle_first_bad_suffix_message,phase34_k4_oracle_first_bad_one_step_message,phase34_k4_oracle_first_bad_suffix_kv,phase34_k4_heuristic_suffix_message,phase34_k4_heuristic_suffix_kv}"
 
 cd "${ROOT}"
 exec "${BFCL_PYTHON}" c2kv_eval/analysis/compare_history_checkpoint.py \

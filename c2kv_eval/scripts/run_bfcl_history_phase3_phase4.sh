@@ -54,7 +54,8 @@ launch_one() {
   local attribution="$2"
   local backend="$3"
   local recovery_mode="$4"
-  local mode="$5"
+  local recovery_horizon="$5"
+  local mode="$6"
   local slot=$((NEXT_SLOT % ${#DEVICES[@]}))
   local device="${DEVICES[$slot]}"
   local port="${PORTS[$slot]}"
@@ -64,6 +65,7 @@ launch_one() {
   (
     CHECKPOINT_INTERVAL="${interval}" \
     RECOVERY_MODE="${recovery_mode}" \
+    RECOVERY_HORIZON="${recovery_horizon}" \
     ATTRIBUTION="${attribution}" \
     ATTRIBUTION_SAFETY_MARGIN="${ATTRIBUTION_SAFETY_MARGIN}" \
     ROLLBACK_BACKEND="${backend}" \
@@ -89,22 +91,24 @@ launch_one() {
 
 for interval in 2 4; do
   launch_one "${interval}" whole_segment message_replay whole_segment \
-    "phase34_k${interval}_whole_message"
+    whole_segment "phase34_k${interval}_whole_message"
   launch_one "${interval}" oracle_first_bad message_replay first_bad_suffix \
-    "phase34_k${interval}_oracle_first_bad_message"
+    suffix "phase34_k${interval}_oracle_first_bad_suffix_message"
+  launch_one "${interval}" oracle_first_bad message_replay first_bad_suffix \
+    one_step "phase34_k${interval}_oracle_first_bad_one_step_message"
   launch_one "${interval}" oracle_first_bad kv_restore first_bad_suffix \
-    "phase34_k${interval}_oracle_first_bad_kv"
+    suffix "phase34_k${interval}_oracle_first_bad_suffix_kv"
   launch_one "${interval}" heuristic message_replay first_bad_suffix \
-    "phase34_k${interval}_heuristic_message"
+    suffix "phase34_k${interval}_heuristic_suffix_message"
   launch_one "${interval}" heuristic kv_restore first_bad_suffix \
-    "phase34_k${interval}_heuristic_kv"
+    suffix "phase34_k${interval}_heuristic_suffix_kv"
 done
 
 while [ "${#PIDS[@]}" -gt 0 ]; do
   wait_one
 done
 
-MODES=phase34_k2_whole_message,phase34_k2_oracle_first_bad_message,phase34_k2_oracle_first_bad_kv,phase34_k2_heuristic_message,phase34_k2_heuristic_kv,phase34_k4_whole_message,phase34_k4_oracle_first_bad_message,phase34_k4_oracle_first_bad_kv,phase34_k4_heuristic_message,phase34_k4_heuristic_kv \
+MODES=phase34_k2_whole_message,phase34_k2_oracle_first_bad_suffix_message,phase34_k2_oracle_first_bad_one_step_message,phase34_k2_oracle_first_bad_suffix_kv,phase34_k2_heuristic_suffix_message,phase34_k2_heuristic_suffix_kv,phase34_k4_whole_message,phase34_k4_oracle_first_bad_suffix_message,phase34_k4_oracle_first_bad_one_step_message,phase34_k4_oracle_first_bad_suffix_kv,phase34_k4_heuristic_suffix_message,phase34_k4_heuristic_suffix_kv \
 RUN_ROOT="${RUN_ROOT}" \
 REFERENCE_DETAILS="${REFERENCE_DETAILS}" \
 bash c2kv_eval/scripts/merge_bfcl_history_multistep_checkpoint.sh

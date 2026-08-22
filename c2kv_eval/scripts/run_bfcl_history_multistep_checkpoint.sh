@@ -17,9 +17,13 @@ COMPRESSION_RATIO="${COMPRESSION_RATIO:-4}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-1}"
 VERIFIER="${VERIFIER:-oracle}"
 RECOVERY_MODE="${RECOVERY_MODE:-since_checkpoint}"
+RECOVERY_HORIZON="${RECOVERY_HORIZON:-auto}"
 ATTRIBUTION="${ATTRIBUTION:-auto}"
 ATTRIBUTION_SAFETY_MARGIN="${ATTRIBUTION_SAFETY_MARGIN:-0}"
 ROLLBACK_BACKEND="${ROLLBACK_BACKEND:-message_replay}"
+ENABLE_HICACHE="${ENABLE_HICACHE:-auto}"
+HICACHE_RATIO="${HICACHE_RATIO:-2}"
+RECOVERY_CHECKPOINT_PAGE_SIZE="${RECOVERY_CHECKPOINT_PAGE_SIZE:-128}"
 VERIFY_THRESHOLD="${VERIFY_THRESHOLD:-0}"
 DEVICE="${DEVICE:-3}"
 PORT="${PORT:-33400}"
@@ -30,14 +34,16 @@ CLEAN_OUTPUT="${CLEAN_OUTPUT:-1}"
 MODE="${MODE:-multistep_i${CHECKPOINT_INTERVAL}_${VERIFIER}_${RECOVERY_MODE}}"
 RUN_COMPARE="${RUN_COMPARE:-1}"
 
-if [[ "${MODE}" == *first_bad_suffix* && "${RECOVERY_MODE}" != "first_bad_suffix" && "${ATTRIBUTION}" != "heuristic" ]]; then
-  echo "MODE=${MODE} implies RECOVERY_MODE=first_bad_suffix, but RECOVERY_MODE=${RECOVERY_MODE}."
-  echo "Set RECOVERY_MODE=first_bad_suffix or choose a matching MODE name."
+if [[ "${RECOVERY_HORIZON}" != "auto" && "${MODE}" == *one_step* && "${RECOVERY_HORIZON}" != "one_step" ]]; then
+  echo "MODE=${MODE} implies RECOVERY_HORIZON=one_step, but RECOVERY_HORIZON=${RECOVERY_HORIZON}."
   exit 1
 fi
-if [[ "${MODE}" == *whole_segment* && "${RECOVERY_MODE}" != "whole_segment" ]]; then
-  echo "MODE=${MODE} implies RECOVERY_MODE=whole_segment, but RECOVERY_MODE=${RECOVERY_MODE}."
-  echo "Set RECOVERY_MODE=whole_segment or choose a matching MODE name."
+if [[ "${RECOVERY_HORIZON}" != "auto" && "${MODE}" == *suffix* && "${RECOVERY_HORIZON}" != "suffix" ]]; then
+  echo "MODE=${MODE} implies RECOVERY_HORIZON=suffix, but RECOVERY_HORIZON=${RECOVERY_HORIZON}."
+  exit 1
+fi
+if [[ "${RECOVERY_HORIZON}" != "auto" && "${MODE}" == *whole_segment* && "${RECOVERY_HORIZON}" != "whole_segment" ]]; then
+  echo "MODE=${MODE} implies RECOVERY_HORIZON=whole_segment, but RECOVERY_HORIZON=${RECOVERY_HORIZON}."
   exit 1
 fi
 
@@ -98,6 +104,10 @@ PY
 
 start_server() {
   local log="${RUN_ROOT}/${MODE}/logs/server_${DEVICE}_${PORT}.log"
+  local hicache_args=()
+  if [[ "${ENABLE_HICACHE}" == "1" || "${ENABLE_HICACHE}" == "true" || ( "${ENABLE_HICACHE}" == "auto" && "${ROLLBACK_BACKEND}" == "kv_restore" ) ]]; then
+    hicache_args+=(--enable-hierarchical-cache --hicache-ratio "${HICACHE_RATIO}")
+  fi
   (
     cd "${SGLANG_ROOT}"
     SGLANG_DEBUG_MEMORY_POOL=1 \
@@ -122,6 +132,7 @@ start_server() {
       --enable-c2kv \
       --dtype bfloat16 \
       --mem-fraction-static 0.55 \
+      "${hicache_args[@]}" \
       --host 127.0.0.1 \
       --port "${PORT}"
   ) > "${log}" 2>&1 &
@@ -174,9 +185,11 @@ run_eval() {
       --verifier "${VERIFIER}" \
       --verify-threshold "${VERIFY_THRESHOLD}" \
       --recovery-mode "${RECOVERY_MODE}" \
+      --recovery-horizon "${RECOVERY_HORIZON}" \
       --attribution "${ATTRIBUTION}" \
       --attribution-safety-margin "${ATTRIBUTION_SAFETY_MARGIN}" \
-      --rollback-backend "${ROLLBACK_BACKEND}"
+      --rollback-backend "${ROLLBACK_BACKEND}" \
+      --recovery-checkpoint-page-size "${RECOVERY_CHECKPOINT_PAGE_SIZE}"
   ) > "${RUN_ROOT}/${MODE}/logs/run.log" 2>&1
   log_info "[runner:${MODE}] done"
 }
@@ -211,9 +224,12 @@ log_info "BFCL history multi-step checkpoint run starting"
 log_info "RUN_ROOT=${RUN_ROOT}"
 log_info "MODE=${MODE}"
 log_info "CATEGORY=${CATEGORY} MAX_EXAMPLES=${MAX_EXAMPLES}"
-log_info "INTERVAL=${CHECKPOINT_INTERVAL} VERIFIER=${VERIFIER} RECOVERY=${RECOVERY_MODE}"
+log_info "INTERVAL=${CHECKPOINT_INTERVAL} VERIFIER=${VERIFIER} RECOVERY_MODE=${RECOVERY_MODE}"
+log_info "RECOVERY_HORIZON=${RECOVERY_HORIZON}"
 log_info "ATTRIBUTION=${ATTRIBUTION} ATTRIBUTION_SAFETY_MARGIN=${ATTRIBUTION_SAFETY_MARGIN}"
 log_info "ROLLBACK_BACKEND=${ROLLBACK_BACKEND}"
+log_info "ENABLE_HICACHE=${ENABLE_HICACHE} HICACHE_RATIO=${HICACHE_RATIO}"
+log_info "RECOVERY_CHECKPOINT_PAGE_SIZE=${RECOVERY_CHECKPOINT_PAGE_SIZE}"
 log_info "DEVICE=${DEVICE} PORT=${PORT}"
 log_info "RUN_COMPARE=${RUN_COMPARE}"
 log_info "IDS_PATH=${IDS_PATH}"
