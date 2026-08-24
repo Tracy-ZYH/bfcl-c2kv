@@ -104,7 +104,7 @@ PY
 start_server() {
   local log="${RUN_ROOT}/${MODE}/logs/server_${DEVICE}_${PORT}.log"
   local hicache_args=()
-  if [[ "${ENABLE_HICACHE}" == "1" || "${ENABLE_HICACHE}" == "true" || ( "${ENABLE_HICACHE}" == "auto" && "${ROLLBACK_BACKEND}" == "kv_restore" ) ]]; then
+  if [[ "${ENABLE_HICACHE}" == "1" || "${ENABLE_HICACHE}" == "true" || ( "${ENABLE_HICACHE}" == "auto" && ( "${ROLLBACK_BACKEND}" == "kv_restore" || "${ROLLBACK_BACKEND}" == "kv_restore_strict" ) ) ]]; then
     hicache_args+=(--enable-hierarchical-cache --hicache-ratio "${HICACHE_RATIO}")
   fi
   (

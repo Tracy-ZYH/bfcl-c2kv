@@ -68,7 +68,7 @@ CHECKPOINT_MODES = {
 KV_VERIFIERS = {"instant_kv", "cumulative_kv", "kv_divergence"}
 ATTRIBUTION_MODES = {"oracle_first_bad", "whole_segment", "heuristic"}
 RECOVERY_HORIZONS = {"one_step", "suffix", "whole_segment"}
-ROLLBACK_BACKENDS = {"message_replay", "kv_restore"}
+ROLLBACK_BACKENDS = {"message_replay", "kv_restore", "kv_restore_strict"}
 
 
 def _stable_hash(value: Any) -> str:
@@ -258,7 +258,11 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                 self.attribution = "oracle_first_bad"
         self.attribution_safety_margin = int(args.attribution_safety_margin)
         self.rollback_backend = args.rollback_backend
-        self.enable_recovery_kv_checkpoint = self.rollback_backend == "kv_restore"
+        self.enable_recovery_kv_checkpoint = self.rollback_backend in {
+            "kv_restore",
+            "kv_restore_strict",
+        }
+        self.kv_restore_strict = self.rollback_backend == "kv_restore_strict"
         self._cumulative_divergence = 0.0
         if self.verifier in {"instant_kv", "cumulative_kv"}:
             self.verifier = "kv_divergence"
@@ -268,8 +272,34 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         messages: Sequence[dict[str, Any]],
         tools: Sequence[dict[str, Any]],
     ) -> list[int]:
+        def coerce_input_ids(encoded: Any) -> list[int]:
+            if isinstance(encoded, dict):
+                encoded = encoded.get("input_ids")
+            elif hasattr(encoded, "keys") and "input_ids" in encoded.keys():
+                encoded = encoded["input_ids"]
+            if hasattr(encoded, "tolist"):
+                encoded = encoded.tolist()
+            if (
+                isinstance(encoded, list)
+                and encoded
+                and isinstance(encoded[0], list)
+            ):
+                if len(encoded) != 1:
+                    raise ValueError(
+                        "Expected a single rendered chat prompt, got batched input_ids."
+                    )
+                encoded = encoded[0]
+            if not isinstance(encoded, list) or not all(
+                isinstance(token_id, int) for token_id in encoded
+            ):
+                raise TypeError(
+                    "tokenizer.apply_chat_template did not return a list[int] "
+                    "or an object containing input_ids."
+                )
+            return list(encoded)
+
         try:
-            return list(
+            return coerce_input_ids(
                 self.tokenizer.apply_chat_template(
                     list(messages),
                     tools=list(tools),
@@ -280,7 +310,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             )
         except TypeError:
             try:
-                return list(
+                return coerce_input_ids(
                     self.tokenizer.apply_chat_template(
                         list(messages),
                         tools=list(tools),
@@ -639,6 +669,37 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             snapshot.get("kv_checkpoint_metadata")
         )
 
+    def _assert_kv_checkpoint_available(
+        self,
+        metadata: dict[str, Any] | None,
+        *,
+        context: str,
+    ) -> None:
+        if not self.kv_restore_strict:
+            return
+        metadata = metadata or {}
+        if metadata.get("available") and metadata.get("sglang_checkpoint_id"):
+            return
+        reason_parts = []
+        for key in (
+            "error",
+            "limitation",
+            "fallback_reason",
+            "create_response",
+            "generate_response",
+        ):
+            value = metadata.get(key)
+            if value is not None:
+                if not isinstance(value, str):
+                    value = json.dumps(
+                        make_json_serializable(value),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                reason_parts.append(f"{key}={value[:1200]}")
+        reason = "; ".join(reason_parts) or "KV_CHECKPOINT_CREATE_FAILED"
+        raise RuntimeError(f"kv_restore_strict {context} failed: {reason}")
+
     def _release_kv_snapshots(self, snapshots: Sequence[dict[str, Any] | None]) -> None:
         seen = set()
         for snapshot in snapshots:
@@ -660,7 +721,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             backend_info.get("recovery_logical_prompt_tokens") or 0
         ) + prompt_tokens
         if (
-            backend_info.get("rollback_backend") == "kv_restore"
+            backend_info.get("rollback_backend") in {"kv_restore", "kv_restore_strict"}
             and backend_info.get("kv_restore_success")
             and not backend_info.get("kv_restore_fallback")
         ):
@@ -739,7 +800,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                 snapshot.get("kv_checkpoint_metadata")
             ),
         }
-        if self.rollback_backend == "kv_restore":
+        if self.enable_recovery_kv_checkpoint:
             metadata = (
                 snapshot.get("kv_checkpoint_metadata")
                 or snapshot.get("kv_anchor_checkpoint_metadata")
@@ -773,29 +834,41 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         }
                     )
                 else:
+                    reason = (
+                        restore_response.get("fallback_reason")
+                        or restore_response.get("message")
+                        or restore_response.get("error")
+                        or "RESTORE_FAILED"
+                    )
+                    if self.kv_restore_strict:
+                        raise RuntimeError(
+                            "kv_restore_strict restore failed: "
+                            f"{reason}; checkpoint={sglang_checkpoint_id}"
+                        )
                     backend_info.update(
                         {
                             "kv_restore_fallback": True,
-                            "kv_restore_fallback_reason": (
-                                restore_response.get("fallback_reason")
-                                or restore_response.get("message")
-                                or restore_response.get("error")
-                                or "RESTORE_FAILED"
-                            ),
+                            "kv_restore_fallback_reason": reason,
                             "restore_response": make_json_serializable(
                                 restore_response
                             ),
                         }
-                    )
+                )
             else:
+                reason = (
+                    metadata.get("limitation")
+                    or metadata.get("error")
+                    or "KV_CHECKPOINT_NOT_AVAILABLE"
+                )
+                if self.kv_restore_strict:
+                    raise RuntimeError(
+                        "kv_restore_strict restore failed: "
+                        f"{reason}; checkpoint={sglang_checkpoint_id or '<missing>'}"
+                    )
                 backend_info.update(
                     {
                         "kv_restore_fallback": True,
-                        "kv_restore_fallback_reason": (
-                            metadata.get("limitation")
-                            or metadata.get("error")
-                            or "KV_CHECKPOINT_NOT_AVAILABLE"
-                        ),
+                        "kv_restore_fallback_reason": reason,
                     }
                 )
         (
@@ -810,7 +883,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             matches,
         ) = self._restore_snapshot(test_entry_id=test_entry_id, snapshot=snapshot)
         if (
-            self.rollback_backend == "kv_restore"
+            self.enable_recovery_kv_checkpoint
             and backend_info.get("kv_restore_success")
             and not backend_info.get("kv_restore_fallback")
         ):
@@ -846,6 +919,9 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     reused = min(prompt_tokens, max(0, int(actual_cached)))
                     recomputed = max(prompt_tokens - reused, 0)
                     backend_info["safe_delta_logical_prompt_tokens"] = prompt_tokens
+                    backend_info["recovery_logical_prompt_tokens"] = int(
+                        backend_info.get("recovery_logical_prompt_tokens") or 0
+                    ) + prompt_tokens
                     backend_info["safe_delta_reused_tokens"] = reused
                     backend_info["safe_delta_prefill_tokens"] = recomputed
                     backend_info["safe_delta_expected_reused_tokens"] = (
@@ -872,6 +948,11 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         make_json_serializable(warmup_response)
                     )
                 except Exception as exc:
+                    if self.kv_restore_strict:
+                        raise RuntimeError(
+                            "kv_restore_strict safe-delta warmup failed: "
+                            f"{exc}"
+                        ) from exc
                     backend_info.update(
                         {
                             "kv_restore_success": False,
@@ -1039,6 +1120,26 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "representation_jump": representation_jump,
             "risk_score": risk_score,
         }
+
+    def _heuristic_detector_failed(
+        self,
+        attrs: dict[str, Any],
+    ) -> tuple[bool, str]:
+        risk_score = float(attrs.get("risk_score") or 0.0)
+        if self.verify_threshold > 0:
+            return (
+                risk_score >= self.verify_threshold,
+                f"risk_score>={self.verify_threshold:g}",
+            )
+        if attrs.get("hard_error"):
+            return True, "hard_error"
+        if attrs.get("argument_grounding_failure"):
+            return True, "argument_grounding_failure"
+        if float(attrs.get("observation_anomaly") or 0.0) >= 1.0:
+            return True, "observation_anomaly"
+        if float(attrs.get("tool_transition_anomaly") or 0.0) >= 1.0:
+            return True, "tool_transition_anomaly"
+        return False, "rule_safe"
 
     def _predict_first_bad_index(
         self,
@@ -1857,7 +1958,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     and active_full_checkpoint_metadata is None
                 ):
                     physical_checkpoint_id += 1
-                    active_full_checkpoint_metadata = self._kv_checkpoint_metadata(
+                    initial_metadata = self._kv_checkpoint_metadata(
                         test_entry_id=test_entry_id,
                         messages=messages,
                         tools=tools,
@@ -1865,16 +1966,23 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         checkpoint_id=physical_checkpoint_id,
                         parent_checkpoint_id=None,
                     )
-                    segment_initial_full_checkpoint_metadata = (
-                        active_full_checkpoint_metadata
+                    self._assert_kv_checkpoint_available(
+                        initial_metadata,
+                        context="initial checkpoint create",
                     )
+                    segment_initial_full_checkpoint_metadata = initial_metadata
                     self._add_checkpoint_maintenance(
                         segment_checkpoint_maintenance,
                         segment_initial_full_checkpoint_metadata,
                     )
-                    segment_active_full_checkpoint_before = (
-                        active_full_checkpoint_metadata.get("sglang_checkpoint_id")
-                    )
+                    if initial_metadata.get("available"):
+                        active_full_checkpoint_metadata = initial_metadata
+                        segment_active_full_checkpoint_before = (
+                            active_full_checkpoint_metadata.get("sglang_checkpoint_id")
+                        )
+                    else:
+                        active_full_checkpoint_metadata = None
+                        segment_active_full_checkpoint_before = None
                 segment_checkpoint = self._snapshot(
                     test_entry_id=test_entry_id,
                     checkpoint_id=checkpoint_id,
@@ -2042,6 +2150,24 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             segment_infos=segment_infos[:-1],
                         )
                     )
+                    if self.verifier == "heuristic":
+                        detector_failed, detector_reason = (
+                            self._heuristic_detector_failed(
+                                segment_infos[-1]["heuristic_attributes"]
+                            )
+                        )
+                        segment_infos[-1]["verify"]["verify_failed"] = (
+                            detector_failed
+                        )
+                        segment_infos[-1]["verify"]["detector"] = "heuristic"
+                        segment_infos[-1]["verify"]["detector_reason"] = (
+                            detector_reason
+                        )
+                        segment_infos[-1]["verify"]["detector_risk_score"] = (
+                            segment_infos[-1]["heuristic_attributes"].get(
+                                "risk_score"
+                            )
+                        )
                     if is_empty_execute_response(candidate_action):
                         terminal_after_segment = True
                         break
@@ -2134,10 +2260,23 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     refresh_count += 1
                     terminal_after_segment = False
                     force_quit = False
-                    first_bad_index = next(
+                    detector_first_bad_index = next(
                         index
                         for index, info in enumerate(segment_infos)
                         if info["verify"]["verify_failed"]
+                    )
+                    first_bad_index = next(
+                        (
+                            index
+                            for index, info in enumerate(segment_infos)
+                            if (
+                                not info["verify"][
+                                    "candidate_action_matches_reference"
+                                ]
+                                or info["verify"]["state_matches_reference"] is False
+                            )
+                        ),
+                        detector_first_bad_index,
                     )
                     predicted_first_bad_index, attribution_debug = (
                         self._predict_first_bad_index(
@@ -2514,6 +2653,8 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                 chain_advance_metadata = None
                 chain_restore_response = None
                 chain_restore_success = None
+                chain_restore_fallback = False
+                chain_restore_fallback_reason = None
                 chain_release_previous = False
                 chain_advance_error = None
                 previous_active_checkpoint_metadata = active_full_checkpoint_metadata
@@ -2537,6 +2678,20 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         chain_restore_response["elapsed_sec"] = (
                             time.perf_counter() - restore_started
                         )
+                        if not chain_restore_success:
+                            chain_restore_fallback = True
+                            chain_restore_fallback_reason = (
+                                chain_restore_response.get("fallback_reason")
+                                or chain_restore_response.get("message")
+                                or chain_restore_response.get("error")
+                                or "CHAIN_RESTORE_FAILED"
+                            )
+                            if self.kv_restore_strict:
+                                raise RuntimeError(
+                                    "kv_restore_strict chain advance restore failed: "
+                                    f"{chain_restore_fallback_reason}; "
+                                    "refusing hidden full recompute"
+                                )
                     try:
                         physical_checkpoint_id += 1
                         chain_advance_metadata = self._kv_checkpoint_metadata(
@@ -2551,6 +2706,10 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             segment_checkpoint_maintenance,
                             chain_advance_metadata,
                         )
+                        self._assert_kv_checkpoint_available(
+                            chain_advance_metadata,
+                            context="chain advance checkpoint create",
+                        )
                         if chain_advance_metadata.get("available"):
                             active_full_checkpoint_metadata = chain_advance_metadata
                             if previous_active_checkpoint_metadata:
@@ -2560,6 +2719,8 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                                 chain_release_previous = True
                     except Exception as exc:
                         chain_advance_error = str(exc)
+                        if self.kv_restore_strict:
+                            raise
 
                 regenerated_end_state = _state_log(involved_instances)
                 if segment_has_drift:
@@ -2659,6 +2820,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         ),
                         "first_bad_index": first_bad_index,
                         "oracle_first_bad_index": first_bad_index,
+                        "detector_first_bad_index": detector_first_bad_index,
                         "predicted_first_bad_index": predicted_first_bad_index,
                         "raw_predicted_first_bad_index": attribution_debug.get(
                             "raw_predicted_first_bad_index"
@@ -2799,6 +2961,12 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         ),
                         "full_checkpoint_chain_restore_success": (
                             chain_restore_success
+                        ),
+                        "full_checkpoint_chain_restore_fallback": (
+                            chain_restore_fallback
+                        ),
+                        "full_checkpoint_chain_restore_fallback_reason": (
+                            chain_restore_fallback_reason
                         ),
                         "full_checkpoint_chain_restore_response": (
                             make_json_serializable(chain_restore_response)
@@ -3022,7 +3190,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         test_case: dict[str, Any],
         stats: DriftStats,
     ) -> tuple[list[list[str]], dict[str, Any]]:
-        if self.verifier == "oracle":
+        if self.verifier in {"oracle", "heuristic"}:
             return self._run_sample_checkpoint_impl_oracle_multistep(
                 test_case,
                 stats,
@@ -3030,7 +3198,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         if self.checkpoint_interval != 1:
             raise NotImplementedError(
                 "KV/readout checkpoint verification currently supports "
-                "checkpoint_interval=1 only. Run verifier=oracle for true "
+                "checkpoint_interval=1 only. Run verifier=oracle/heuristic for true "
                 "multi-step rollback with interval=1/2/4."
             )
         initial_config = test_case.get("initial_config", {})
@@ -3636,10 +3804,21 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
     )
-    parser.add_argument("--checkpoint-interval", type=int, choices=[1, 2, 4], default=1)
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        choices=[1, 2, 3, 4],
+        default=1,
+    )
     parser.add_argument(
         "--verifier",
-        choices=["instant_kv", "cumulative_kv", "kv_divergence", "oracle"],
+        choices=[
+            "instant_kv",
+            "cumulative_kv",
+            "kv_divergence",
+            "oracle",
+            "heuristic",
+        ],
         default="oracle",
     )
     parser.add_argument("--verify-threshold", type=float, default=0.0)

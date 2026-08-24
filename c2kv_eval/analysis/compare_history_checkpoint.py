@@ -470,6 +470,16 @@ def _summary_row(
     kv_restore_fallback = sum(
         1 for row in checkpoint_segments if row.get("kv_restore_fallback")
     )
+    full_checkpoint_chain_restore_fallback = sum(
+        1
+        for row in checkpoint_segments
+        if row.get("full_checkpoint_chain_restore_fallback")
+    )
+    full_checkpoint_chain_advance_error = sum(
+        1
+        for row in checkpoint_segments
+        if row.get("full_checkpoint_chain_error")
+    )
     kv_reused_tokens = sum(
         int(row.get("kv_reused_tokens") or 0) for row in checkpoint_segments
     )
@@ -492,10 +502,22 @@ def _summary_row(
         int(row.get("message_replay_prefill_tokens") or 0)
         for row in checkpoint_segments
     )
-    recovery_logical_prompt_tokens = sum(
-        int(row.get("recovery_logical_prompt_tokens") or 0)
-        for row in checkpoint_segments
-    )
+    recovery_logical_prompt_tokens = 0
+    for row in checkpoint_segments:
+        logged_recovery = int(row.get("recovery_logical_prompt_tokens") or 0)
+        actual_recovery = int(row.get("kv_reused_tokens") or 0) + int(
+            row.get("kv_recomputed_tokens") or 0
+        )
+        expected_recovery = int(row.get("expected_kv_reused_tokens") or 0) + int(
+            row.get("expected_kv_recomputed_tokens") or 0
+        )
+        message_replay_recovery = int(row.get("message_replay_prefill_tokens") or 0)
+        recovery_logical_prompt_tokens += max(
+            logged_recovery,
+            actual_recovery,
+            expected_recovery,
+            message_replay_recovery,
+        )
     checkpoint_maintenance_recomputed_tokens = sum(
         int(row.get("checkpoint_maintenance_recomputed_tokens") or 0)
         for row in checkpoint_segments
@@ -736,6 +758,12 @@ def _summary_row(
         "kv_restore_fallback_count": kv_restore_fallback,
         "kv_restore_success_rate": _rate(kv_restore_success, rollback_count),
         "kv_restore_fallback_rate": _rate(kv_restore_fallback, rollback_count),
+        "full_checkpoint_chain_restore_fallback_count": (
+            full_checkpoint_chain_restore_fallback
+        ),
+        "full_checkpoint_chain_advance_error_count": (
+            full_checkpoint_chain_advance_error
+        ),
         "kv_reused_tokens": kv_reused_tokens,
         "kv_recomputed_tokens": kv_recomputed_tokens,
         "expected_kv_reused_tokens": expected_kv_reused_tokens,
