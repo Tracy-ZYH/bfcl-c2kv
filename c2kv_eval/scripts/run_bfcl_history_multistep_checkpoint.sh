@@ -24,6 +24,15 @@ ROLLBACK_BACKEND="${ROLLBACK_BACKEND:-message_replay}"
 ENABLE_HICACHE="${ENABLE_HICACHE:-auto}"
 HICACHE_RATIO="${HICACHE_RATIO:-2}"
 VERIFY_THRESHOLD="${VERIFY_THRESHOLD:-0}"
+RULE_DETECTOR_THRESHOLD="${RULE_DETECTOR_THRESHOLD:-5}"
+LOGISTIC_DETECTOR_FEATURES_CSV="${LOGISTIC_DETECTOR_FEATURES_CSV:-}"
+LOGISTIC_DETECTOR_THRESHOLD="${LOGISTIC_DETECTOR_THRESHOLD:--1}"
+ROLLBACK_POLICY="${ROLLBACK_POLICY:-attribution}"
+ROLLBACK_DEPTH="${ROLLBACK_DEPTH:-1}"
+COLLECT_CANDIDATE_DETECTOR_SIGNALS="${COLLECT_CANDIDATE_DETECTOR_SIGNALS:-0}"
+CANDIDATE_LOGPROBS_TOP_K="${CANDIDATE_LOGPROBS_TOP_K:-20}"
+CANDIDATE_HIDDEN_READOUT="${CANDIDATE_HIDDEN_READOUT:-0}"
+CANDIDATE_ATTENTION_SUMMARY="${CANDIDATE_ATTENTION_SUMMARY:-0}"
 DEVICE="${DEVICE:-3}"
 PORT="${PORT:-33400}"
 IDS_PATH="${IDS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_closed_loop_multi_turn_base_200/correct_ids.txt}"
@@ -163,6 +172,16 @@ wait_health() {
 }
 
 run_eval() {
+  local detector_signal_args=()
+  if [[ "${COLLECT_CANDIDATE_DETECTOR_SIGNALS}" == "1" || "${COLLECT_CANDIDATE_DETECTOR_SIGNALS}" == "true" ]]; then
+    detector_signal_args+=(--collect-candidate-detector-signals)
+  fi
+  if [[ "${CANDIDATE_HIDDEN_READOUT}" == "1" || "${CANDIDATE_HIDDEN_READOUT}" == "true" ]]; then
+    detector_signal_args+=(--candidate-hidden-readout)
+  fi
+  if [[ "${CANDIDATE_ATTENTION_SUMMARY}" == "1" || "${CANDIDATE_ATTENTION_SUMMARY}" == "true" ]]; then
+    detector_signal_args+=(--candidate-attention-summary)
+  fi
   (
     cd "${ROOT}"
     exec "${BFCL_PYTHON}" -m c2kv_eval.adapters.eval_bfcl_history_checkpoint \
@@ -184,11 +203,18 @@ run_eval() {
       --checkpoint-interval "${CHECKPOINT_INTERVAL}" \
       --verifier "${VERIFIER}" \
       --verify-threshold "${VERIFY_THRESHOLD}" \
+      --rule-detector-threshold "${RULE_DETECTOR_THRESHOLD}" \
+      --logistic-detector-features-csv "${LOGISTIC_DETECTOR_FEATURES_CSV}" \
+      --logistic-detector-threshold "${LOGISTIC_DETECTOR_THRESHOLD}" \
       --recovery-mode "${RECOVERY_MODE}" \
       --recovery-horizon "${RECOVERY_HORIZON}" \
       --attribution "${ATTRIBUTION}" \
       --attribution-safety-margin "${ATTRIBUTION_SAFETY_MARGIN}" \
-      --rollback-backend "${ROLLBACK_BACKEND}"
+      --rollback-policy "${ROLLBACK_POLICY}" \
+      --rollback-depth "${ROLLBACK_DEPTH}" \
+      --rollback-backend "${ROLLBACK_BACKEND}" \
+      --candidate-logprobs-top-k "${CANDIDATE_LOGPROBS_TOP_K}" \
+      "${detector_signal_args[@]}"
   ) > "${RUN_ROOT}/${MODE}/logs/run.log" 2>&1
   log_info "[runner:${MODE}] done"
 }
@@ -226,7 +252,10 @@ log_info "CATEGORY=${CATEGORY} MAX_EXAMPLES=${MAX_EXAMPLES}"
 log_info "INTERVAL=${CHECKPOINT_INTERVAL} VERIFIER=${VERIFIER} RECOVERY_MODE=${RECOVERY_MODE}"
 log_info "RECOVERY_HORIZON=${RECOVERY_HORIZON}"
 log_info "ATTRIBUTION=${ATTRIBUTION} ATTRIBUTION_SAFETY_MARGIN=${ATTRIBUTION_SAFETY_MARGIN}"
+log_info "ROLLBACK_POLICY=${ROLLBACK_POLICY} ROLLBACK_DEPTH=${ROLLBACK_DEPTH}"
+log_info "RULE_DETECTOR_THRESHOLD=${RULE_DETECTOR_THRESHOLD}"
 log_info "ROLLBACK_BACKEND=${ROLLBACK_BACKEND}"
+log_info "COLLECT_CANDIDATE_DETECTOR_SIGNALS=${COLLECT_CANDIDATE_DETECTOR_SIGNALS} CANDIDATE_LOGPROBS_TOP_K=${CANDIDATE_LOGPROBS_TOP_K}"
 log_info "ENABLE_HICACHE=${ENABLE_HICACHE} HICACHE_RATIO=${HICACHE_RATIO}"
 log_info "DEVICE=${DEVICE} PORT=${PORT}"
 log_info "RUN_COMPARE=${RUN_COMPARE}"

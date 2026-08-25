@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import math
@@ -69,6 +70,7 @@ KV_VERIFIERS = {"instant_kv", "cumulative_kv", "kv_divergence"}
 ATTRIBUTION_MODES = {"oracle_first_bad", "whole_segment", "heuristic"}
 RECOVERY_HORIZONS = {"one_step", "suffix", "whole_segment"}
 ROLLBACK_BACKENDS = {"message_replay", "kv_restore", "kv_restore_strict"}
+ROLLBACK_POLICIES = {"attribution", "whole_segment", "fixed_depth", "rule_depth"}
 
 
 def _stable_hash(value: Any) -> str:
@@ -193,6 +195,66 @@ def _top1_top2_margin(log_probs: dict[str, float]) -> float | None:
     return values[0] - values[1]
 
 
+def _iter_token_logprobs(logprobs: Any) -> list[dict[str, Any]]:
+    if not logprobs:
+        return []
+    if isinstance(logprobs, dict):
+        for key in ("content", "tokens", "output_tokens"):
+            value = logprobs.get(key)
+            if isinstance(value, list):
+                return [
+                    item for item in value if isinstance(item, dict)
+                ]
+        value = logprobs.get("top_logprobs")
+        if isinstance(value, list):
+            return _iter_token_logprobs(value)
+    if isinstance(logprobs, list):
+        return [item for item in logprobs if isinstance(item, dict)]
+    return []
+
+
+def _token_top_logprobs(item: dict[str, Any]) -> dict[str, float]:
+    top = item.get("top_logprobs")
+    if isinstance(top, list):
+        out: dict[str, float] = {}
+        for entry in top:
+            if not isinstance(entry, dict):
+                continue
+            token = entry.get("token")
+            value = entry.get("logprob")
+            if token is not None and isinstance(value, (int, float)):
+                out[str(token)] = float(value)
+        return out
+    if isinstance(top, dict):
+        return {
+            str(token): float(value)
+            for token, value in top.items()
+            if isinstance(value, (int, float))
+        }
+    return {}
+
+
+def _mean(values: list[float]) -> float | None:
+    finite = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite:
+        return None
+    return sum(finite) / len(finite)
+
+
+def _as_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            parsed = float(value)
+        except ValueError:
+            return None
+        return parsed if math.isfinite(parsed) else None
+    return None
+
+
 def _kl_from_log_probs(
     full_log_probs: dict[str, float],
     c2kv_log_probs: dict[str, float],
@@ -257,7 +319,19 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             else:
                 self.attribution = "oracle_first_bad"
         self.attribution_safety_margin = int(args.attribution_safety_margin)
+        self.rollback_policy = args.rollback_policy
+        self.rollback_depth = int(args.rollback_depth)
+        self.rule_detector_threshold = float(args.rule_detector_threshold)
+        self.logistic_detector_features_csv = args.logistic_detector_features_csv
+        self.logistic_detector_threshold = float(args.logistic_detector_threshold)
+        self.logistic_detector_model = None
         self.rollback_backend = args.rollback_backend
+        self.collect_candidate_detector_signals = bool(
+            args.collect_candidate_detector_signals
+        ) or self.verifier == "logistic"
+        self.candidate_logprobs_top_k = int(args.candidate_logprobs_top_k)
+        self.candidate_hidden_readout = bool(args.candidate_hidden_readout)
+        self.candidate_attention_summary = bool(args.candidate_attention_summary)
         self.enable_recovery_kv_checkpoint = self.rollback_backend in {
             "kv_restore",
             "kv_restore_strict",
@@ -266,6 +340,10 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         self._cumulative_divergence = 0.0
         if self.verifier in {"instant_kv", "cumulative_kv"}:
             self.verifier = "kv_divergence"
+        if self.verifier == "logistic":
+            self.logistic_detector_model = self._train_logistic_detector(
+                self.logistic_detector_features_csv
+            )
 
     def _full_prompt_input_ids(
         self,
@@ -1141,17 +1219,465 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             return True, "tool_transition_anomaly"
         return False, "rule_safe"
 
+    def _rule_detector(
+        self,
+        segment_infos: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        attrs = [info.get("heuristic_attributes") or {} for info in segment_infos]
+        hard_trigger = any(bool(attr.get("hard_error")) for attr in attrs)
+        grounding_trigger = any(
+            bool(attr.get("argument_grounding_failure")) for attr in attrs
+        )
+        observation_trigger = any(
+            float(attr.get("observation_anomaly") or 0.0) >= 1.0
+            for attr in attrs
+        )
+        max_risk = max(
+            (float(attr.get("risk_score") or 0.0) for attr in attrs),
+            default=0.0,
+        )
+        risk_trigger = max_risk >= self.rule_detector_threshold
+        if hard_trigger:
+            reason = "hard_error"
+        elif grounding_trigger:
+            reason = "argument_grounding"
+        elif observation_trigger:
+            reason = "observation_anomaly"
+        elif risk_trigger:
+            reason = "risk_threshold"
+        else:
+            reason = "none"
+        triggered = (
+            hard_trigger
+            or grounding_trigger
+            or observation_trigger
+            or risk_trigger
+        )
+        return {
+            "detector": "rule",
+            "detector_trigger": triggered,
+            "detector_reason": reason,
+            "rule_detector_trigger": triggered,
+            "rule_detector_max_risk": max_risk,
+            "rule_detector_reason": reason,
+            "rule_detector_threshold": self.rule_detector_threshold,
+        }
+
+    @staticmethod
+    def _detector_low_is_bad(name: str) -> bool:
+        return any(
+            pattern in name
+            for pattern in (
+                "confidence",
+                "probability",
+                "logprob",
+                "margin",
+                "grounding_score",
+            )
+        )
+
+    @classmethod
+    def _detector_score_for_feature(cls, name: str, value: Any) -> float | None:
+        numeric = _as_float(value)
+        if numeric is None:
+            return None
+        return -numeric if cls._detector_low_is_bad(name) else numeric
+
+    @staticmethod
+    def _detector_aggregate_features(
+        step_features: Sequence[dict[str, Any]],
+    ) -> dict[str, float]:
+        values: dict[str, list[float]] = {}
+        for features in step_features:
+            if not isinstance(features, dict):
+                continue
+            for key, value in features.items():
+                numeric = _as_float(value)
+                if numeric is not None:
+                    values.setdefault(key, []).append(numeric)
+        out: dict[str, float] = {}
+        for key, vals in values.items():
+            if not vals:
+                continue
+            out[f"mean_{key}"] = sum(vals) / len(vals)
+            out[f"max_{key}"] = max(vals)
+            out[f"min_{key}"] = min(vals)
+        return out
+
+    def _segment_detector_feature_row(
+        self,
+        segment_infos: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        merged_steps: list[dict[str, Any]] = []
+        for info in segment_infos:
+            merged: dict[str, Any] = {}
+            for source in (
+                info.get("candidate_detector_features") or {},
+                info.get("heuristic_attributes") or {},
+            ):
+                if not isinstance(source, dict):
+                    continue
+                for key, value in source.items():
+                    numeric = _as_float(value)
+                    if numeric is not None:
+                        merged[key] = numeric
+            merged_steps.append(merged)
+        features: dict[str, Any] = self._detector_aggregate_features(merged_steps)
+        rule = self._rule_detector(segment_infos)
+        features.update(
+            {
+                "rule_detector_trigger": int(
+                    bool(rule.get("rule_detector_trigger"))
+                ),
+                "rule_detector_binary_score": float(
+                    bool(rule.get("rule_detector_trigger"))
+                ),
+                "rule_detector_max_risk": rule.get("rule_detector_max_risk"),
+                "rule_detector_threshold": self.rule_detector_threshold,
+            }
+        )
+        return features
+
+    @staticmethod
+    def _sigmoid(value: float) -> float:
+        if value >= 0:
+            z = math.exp(-value)
+            return 1.0 / (1.0 + z)
+        z = math.exp(value)
+        return z / (1.0 + z)
+
+    @staticmethod
+    def _best_f1_threshold(labels: Sequence[int], scores: Sequence[float]) -> float:
+        best_threshold = 0.5
+        best_f1 = -1.0
+        for threshold in sorted(set(scores), reverse=True):
+            tp = fp = fn = 0
+            for label, score in zip(labels, scores):
+                pred = score >= threshold
+                if pred and label:
+                    tp += 1
+                elif pred and not label:
+                    fp += 1
+                elif not pred and label:
+                    fn += 1
+            precision = tp / (tp + fp) if tp + fp else 0.0
+            recall = tp / (tp + fn) if tp + fn else 0.0
+            f1 = (
+                2 * precision * recall / (precision + recall)
+                if precision + recall
+                else 0.0
+            )
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = float(threshold)
+        return best_threshold
+
+    def _train_logistic_detector(self, features_csv: str) -> dict[str, Any]:
+        if not features_csv:
+            raise ValueError(
+                "verifier=logistic requires --logistic-detector-features-csv"
+            )
+        with open(features_csv, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        train = [row for row in rows if row.get("split") == "calibration"]
+        if not train:
+            raise ValueError(
+                "logistic detector feature CSV has no calibration split rows: "
+                f"{features_csv}"
+            )
+        excluded = {
+            "id",
+            "checkpoint_id",
+            "turn",
+            "segment_start_step",
+            "segment_length",
+            "segment_harmful",
+            "split",
+            "rule_detector_reason",
+        }
+        feature_names = [
+            key
+            for key in rows[0].keys()
+            if key not in excluded
+        ]
+        usable: list[str] = []
+        for name in feature_names:
+            vals = [
+                self._detector_score_for_feature(name, row.get(name))
+                for row in train
+            ]
+            vals = [value for value in vals if value is not None]
+            if len(vals) >= max(4, len(train) // 2):
+                usable.append(name)
+        if not usable:
+            raise ValueError("logistic detector has no usable numeric features")
+
+        means: dict[str, float] = {}
+        stds: dict[str, float] = {}
+        for name in usable:
+            vals = [
+                self._detector_score_for_feature(name, row.get(name))
+                for row in train
+            ]
+            vals = [value for value in vals if value is not None]
+            mean = sum(vals) / len(vals)
+            var = sum((value - mean) ** 2 for value in vals) / max(len(vals), 1)
+            means[name] = mean
+            stds[name] = math.sqrt(var) or 1.0
+
+        def vector(row: dict[str, Any]) -> list[float]:
+            out = [1.0]
+            for name in usable:
+                value = self._detector_score_for_feature(name, row.get(name))
+                if value is None:
+                    value = means[name]
+                out.append((value - means[name]) / stds[name])
+            return out
+
+        weights = [0.0] * (len(usable) + 1)
+        lr = 0.08
+        l2 = 0.001
+        for _ in range(500):
+            grad = [0.0] * len(weights)
+            for row in train:
+                x = vector(row)
+                y = int(float(row["segment_harmful"]))
+                p = self._sigmoid(sum(w * xi for w, xi in zip(weights, x)))
+                for i, xi in enumerate(x):
+                    grad[i] += (p - y) * xi
+            for i in range(len(weights)):
+                grad[i] /= len(train)
+                if i:
+                    grad[i] += l2 * weights[i]
+                weights[i] -= lr * grad[i]
+
+        train_scores = [
+            self._sigmoid(sum(w * xi for w, xi in zip(weights, vector(row))))
+            for row in train
+        ]
+        train_labels = [int(float(row["segment_harmful"])) for row in train]
+        threshold = (
+            self._best_f1_threshold(train_labels, train_scores)
+            if self.logistic_detector_threshold < 0.0
+            else self.logistic_detector_threshold
+        )
+        return {
+            "features_csv": features_csv,
+            "features": usable,
+            "means": means,
+            "stds": stds,
+            "weights": weights,
+            "threshold": threshold,
+            "train_rows": len(train),
+            "train_episodes": len({row.get("id") for row in train}),
+        }
+
+    def _logistic_detector(
+        self,
+        segment_infos: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if self.logistic_detector_model is None:
+            raise RuntimeError("logistic detector model is not initialized")
+        model = self.logistic_detector_model
+        row = self._segment_detector_feature_row(segment_infos)
+        x = [1.0]
+        for name in model["features"]:
+            value = self._detector_score_for_feature(name, row.get(name))
+            if value is None:
+                value = model["means"][name]
+            x.append((value - model["means"][name]) / model["stds"][name])
+        score = self._sigmoid(
+            sum(w * xi for w, xi in zip(model["weights"], x))
+        )
+        triggered = score >= float(model["threshold"])
+        return {
+            "detector": "logistic",
+            "detector_trigger": triggered,
+            "detector_reason": (
+                "logistic_score_threshold" if triggered else "logistic_safe"
+            ),
+            "logistic_detector_score": score,
+            "logistic_detector_threshold": model["threshold"],
+            "logistic_detector_feature_count": len(model["features"]),
+            "logistic_detector_train_rows": model["train_rows"],
+            "logistic_detector_train_episodes": model["train_episodes"],
+            "rule_detector_trigger": row.get("rule_detector_trigger"),
+            "rule_detector_max_risk": row.get("rule_detector_max_risk"),
+            "rule_detector_reason": None,
+        }
+
+    @staticmethod
+    def _oracle_harmful(info: dict[str, Any]) -> bool:
+        verify = info.get("verify") or {}
+        return (
+            not bool(verify.get("candidate_action_matches_reference"))
+            or verify.get("state_matches_reference") is False
+        )
+
+    @staticmethod
+    def _detector_confusion(
+        *,
+        oracle_segment_unsafe: bool,
+        detector_segment_trigger: bool,
+    ) -> dict[str, bool]:
+        return {
+            "detector_tp": detector_segment_trigger and oracle_segment_unsafe,
+            "detector_fp": detector_segment_trigger and not oracle_segment_unsafe,
+            "detector_tn": (not detector_segment_trigger)
+            and (not oracle_segment_unsafe),
+            "detector_fn": (not detector_segment_trigger) and oracle_segment_unsafe,
+        }
+
+    def _rollback_debug(
+        self,
+        *,
+        segment_infos: Sequence[dict[str, Any]],
+        rollback_start_index: int,
+        oracle_first_bad_index: int | None,
+        reason: str,
+        raw_predicted_first_bad_index: int | None = None,
+    ) -> dict[str, Any]:
+        has_oracle_gt = oracle_first_bad_index is not None
+        return {
+            "attribution": self.attribution,
+            "rollback_policy": self.rollback_policy,
+            "oracle_first_bad_index": oracle_first_bad_index,
+            "predicted_first_bad_index": rollback_start_index,
+            "raw_predicted_first_bad_index": raw_predicted_first_bad_index,
+            "attribution_reason": reason,
+            "attribution_safety_margin": self.attribution_safety_margin,
+            "has_oracle_first_bad": has_oracle_gt,
+            "detector_false_positive": not has_oracle_gt,
+            "exact_attribution": (
+                rollback_start_index == oracle_first_bad_index
+                if has_oracle_gt
+                else None
+            ),
+            "within1_attribution": (
+                abs(rollback_start_index - oracle_first_bad_index) <= 1
+                if has_oracle_gt
+                else None
+            ),
+            "rollback_coverage": (
+                rollback_start_index <= oracle_first_bad_index
+                if has_oracle_gt
+                else None
+            ),
+            "under_rollback": (
+                rollback_start_index > oracle_first_bad_index
+                if has_oracle_gt
+                else None
+            ),
+            "over_rollback": (
+                rollback_start_index < oracle_first_bad_index
+                if has_oracle_gt
+                else None
+            ),
+            "over_rollback_steps": (
+                max(0, oracle_first_bad_index - rollback_start_index)
+                if has_oracle_gt
+                else None
+            ),
+            "predicted_rollback_depth": len(segment_infos) - rollback_start_index,
+            "oracle_rollback_depth": (
+                len(segment_infos) - oracle_first_bad_index if has_oracle_gt else None
+            ),
+        }
+
+    @staticmethod
+    def _quantize_rollback_depth(required_depth: int) -> int:
+        if required_depth <= 1:
+            return 1
+        if required_depth <= 2:
+            return 2
+        return 4
+
+    @staticmethod
+    def _strong_suspicious_reason(attrs: dict[str, Any]) -> str | None:
+        if attrs.get("hard_error"):
+            return "hard_error"
+        if attrs.get("argument_grounding_failure"):
+            return "argument_grounding_failure"
+        if float(attrs.get("observation_anomaly") or 0.0) >= 1.0:
+            return "observation_anomaly"
+        if float(attrs.get("tool_transition_anomaly") or 0.0) >= 1.0:
+            return "tool_transition_anomaly"
+        return None
+
+    def _rule_depth_decision(
+        self,
+        segment_infos: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        segment_len = len(segment_infos)
+        attrs = [info.get("heuristic_attributes") or {} for info in segment_infos]
+        strong_indices = [
+            index
+            for index, attr in enumerate(attrs)
+            if self._strong_suspicious_reason(attr) is not None
+        ]
+        hard_front_indices = [
+            index
+            for index, attr in enumerate(attrs)
+            if attr.get("hard_error") and index < (segment_len / 2.0)
+        ]
+        max_risk_index = max(
+            range(segment_len),
+            key=lambda idx: float(attrs[idx].get("risk_score") or 0.0),
+        )
+
+        earliest_suspicious_index: int | None = None
+        if hard_front_indices:
+            earliest_suspicious_index = min(hard_front_indices)
+            predicted_depth = 4
+            reason = "hard_error_front_half"
+        elif strong_indices:
+            earliest_suspicious_index = min(strong_indices)
+            required_depth = segment_len - earliest_suspicious_index
+            predicted_depth = self._quantize_rollback_depth(required_depth)
+            reason = (
+                "strong_signal:"
+                + (
+                    self._strong_suspicious_reason(
+                        attrs[earliest_suspicious_index]
+                    )
+                    or "unknown"
+                )
+            )
+        else:
+            required_depth = segment_len - max_risk_index
+            predicted_depth = self._quantize_rollback_depth(required_depth)
+            reason = "max_risk_score"
+
+        if len(strong_indices) >= 2:
+            predicted_depth = max(predicted_depth, 2)
+            reason = reason + "+multi_strong_signal"
+
+        actual_depth = min(predicted_depth, segment_len)
+        rollback_start_index = segment_len - actual_depth
+        return {
+            "predicted_rollback_depth": predicted_depth,
+            "actual_rollback_depth": actual_depth,
+            "rollback_start_index": rollback_start_index,
+            "rule_depth_reason": reason,
+            "earliest_suspicious_index": earliest_suspicious_index,
+            "max_risk_index": max_risk_index,
+            "strong_suspicious_count": len(strong_indices),
+            "strong_suspicious_indices": strong_indices,
+        }
+
     def _predict_first_bad_index(
         self,
         *,
         segment_infos: Sequence[dict[str, Any]],
-        oracle_first_bad_index: int,
+        oracle_first_bad_index: int | None,
     ) -> tuple[int, dict[str, Any]]:
         if self.attribution == "whole_segment":
             predicted = 0
             reason = "whole_segment"
         elif self.attribution == "oracle_first_bad":
             predicted = oracle_first_bad_index
+            if predicted is None:
+                predicted = 0
             reason = "oracle_first_bad"
         elif self.attribution == "heuristic":
             attrs = [info.get("heuristic_attributes") or {} for info in segment_infos]
@@ -1189,6 +1715,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             raise ValueError(f"Unknown attribution={self.attribution!r}")
         raw_predicted = predicted
         predicted = max(0, predicted - self.attribution_safety_margin)
+        has_oracle_gt = oracle_first_bad_index is not None
         return predicted, {
             "attribution": self.attribution,
             "oracle_first_bad_index": oracle_first_bad_index,
@@ -1196,13 +1723,32 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "raw_predicted_first_bad_index": raw_predicted,
             "attribution_reason": reason,
             "attribution_safety_margin": self.attribution_safety_margin,
-            "exact_attribution": predicted == oracle_first_bad_index,
-            "within1_attribution": abs(predicted - oracle_first_bad_index) <= 1,
-            "under_rollback": predicted > oracle_first_bad_index,
-            "over_rollback": predicted < oracle_first_bad_index,
-            "over_rollback_steps": max(0, oracle_first_bad_index - predicted),
+            "has_oracle_first_bad": has_oracle_gt,
+            "detector_false_positive": not has_oracle_gt,
+            "exact_attribution": (
+                predicted == oracle_first_bad_index if has_oracle_gt else None
+            ),
+            "within1_attribution": (
+                abs(predicted - oracle_first_bad_index) <= 1
+                if has_oracle_gt
+                else None
+            ),
+            "under_rollback": (
+                predicted > oracle_first_bad_index if has_oracle_gt else None
+            ),
+            "over_rollback": (
+                predicted < oracle_first_bad_index if has_oracle_gt else None
+            ),
+            "rollback_coverage": (
+                predicted <= oracle_first_bad_index if has_oracle_gt else None
+            ),
+            "over_rollback_steps": (
+                max(0, oracle_first_bad_index - predicted) if has_oracle_gt else None
+            ),
             "predicted_rollback_depth": len(segment_infos) - predicted,
-            "oracle_rollback_depth": len(segment_infos) - oracle_first_bad_index,
+            "oracle_rollback_depth": (
+                len(segment_infos) - oracle_first_bad_index if has_oracle_gt else None
+            ),
         }
 
     def _restore_instances(
@@ -1446,6 +1992,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         *,
         max_completion_tokens: int | None = None,
         readout_probe: bool = False,
+        collect_detector_signals: bool = False,
     ) -> tuple[str, dict[str, Any], float, dict[str, Any], dict[str, Any]]:
         prompt_tokens = _token_count(self.tokenizer, messages)
         max_tokens = max(1, max_completion_tokens or self.max_completion_tokens)
@@ -1458,14 +2005,23 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "chat_template_kwargs": {"enable_thinking": False},
             "return_cached_tokens_details": True,
         }
-        if readout_probe:
+        if readout_probe or collect_detector_signals:
             payload.update(
                 {
                     "logprobs": True,
-                    "top_logprobs": 20,
-                    "return_hidden_states": True,
+                    "top_logprobs": self.candidate_logprobs_top_k,
                 }
             )
+            # Native SGLang endpoints use return_logprob/top_logprobs_num.
+            # The OpenAI chat endpoint ignores unknown fields in newer forks but
+            # this keeps older local forks from silently dropping the request.
+            payload["return_logprob"] = True
+            payload["top_logprobs_num"] = self.candidate_logprobs_top_k
+            payload["return_text_in_logprobs"] = True
+        if readout_probe or (
+            collect_detector_signals and self.candidate_hidden_readout
+        ):
+            payload["return_hidden_states"] = True
         start = time.perf_counter()
         data = _post_json(self.base_url, "/v1/chat/completions", payload, self.timeout)
         elapsed = time.perf_counter() - start
@@ -1522,6 +2078,119 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "entropy": _entropy_from_log_probs(log_probs),
             "top1_top2_margin": _top1_top2_margin(log_probs),
         }
+
+    def _candidate_detector_features(
+        self,
+        raw: dict[str, Any],
+        previous_readout_vector: list[float] | None,
+    ) -> tuple[dict[str, Any], list[float] | None]:
+        choice = (raw.get("choices") or [{}])[0] or {}
+        token_items = _iter_token_logprobs(choice.get("logprobs"))
+        logprobs_source = "choice.logprobs"
+        if not token_items:
+            meta_info = raw.get("meta_info") or choice.get("meta_info") or {}
+            output_token_logprobs = meta_info.get("output_token_logprobs")
+            output_top_logprobs = meta_info.get("output_top_logprobs")
+            if output_token_logprobs:
+                token_items = []
+                for index, item in enumerate(output_token_logprobs):
+                    entry: dict[str, Any] = {}
+                    if isinstance(item, (list, tuple)):
+                        if len(item) >= 1:
+                            entry["logprob"] = item[0]
+                        if len(item) >= 3:
+                            entry["token"] = item[2]
+                    elif isinstance(item, dict):
+                        entry.update(item)
+                    if output_top_logprobs and index < len(output_top_logprobs):
+                        entry["top_logprobs"] = output_top_logprobs[index]
+                    token_items.append(entry)
+                logprobs_source = "meta_info.output_token_logprobs"
+
+        token_logprobs: list[float] = []
+        top1_probs: list[float] = []
+        entropies: list[float] = []
+        margins: list[float] = []
+        tool_name_logprobs: list[float] = []
+        argument_logprobs: list[float] = []
+        rendered = ""
+        argument_region = False
+
+        for item in token_items:
+            value = item.get("logprob")
+            token = str(item.get("token") or "")
+            rendered += token
+            if "arguments" in rendered or '"arguments"' in rendered:
+                argument_region = True
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                logprob = float(value)
+                token_logprobs.append(logprob)
+                if argument_region:
+                    argument_logprobs.append(logprob)
+                elif "name" in rendered or '"name"' in rendered:
+                    tool_name_logprobs.append(logprob)
+
+            top = _token_top_logprobs(item)
+            if top:
+                top_values = sorted(top.values(), reverse=True)
+                if top_values:
+                    top1_probs.append(math.exp(top_values[0]))
+                entropy = _entropy_from_log_probs(top)
+                if entropy is not None:
+                    entropies.append(float(entropy))
+                margin = _top1_top2_margin(top)
+                if margin is not None:
+                    margins.append(float(margin))
+
+        nll = None
+        if token_logprobs:
+            nll = -sum(token_logprobs) / len(token_logprobs)
+        ppl = math.exp(min(nll, 50.0)) if nll is not None else None
+
+        readout = self._readout_payload(raw)
+        readout_vector = readout.get("vector")
+        readout_norm = None
+        readout_prev_cosine_distance = None
+        if readout_vector:
+            readout_norm = math.sqrt(
+                sum(float(value) * float(value) for value in readout_vector)
+            )
+            readout_prev_cosine_distance = _cosine_distance(
+                previous_readout_vector,
+                readout_vector,
+            )
+
+        features = {
+            "detector_signal_requested": True,
+            "detector_signal_available": bool(token_logprobs),
+            "logprobs_source": logprobs_source if token_items else None,
+            "generation_token_count": len(token_logprobs),
+            "generation_nll": nll,
+            "generation_ppl": ppl,
+            "mean_top1_probability": _mean(top1_probs),
+            "min_top1_probability": min(top1_probs) if top1_probs else None,
+            "mean_logprob": _mean(token_logprobs),
+            "min_logprob": min(token_logprobs) if token_logprobs else None,
+            "mean_entropy": _mean(entropies),
+            "max_entropy": max(entropies) if entropies else None,
+            "mean_top1_top2_margin": _mean(margins),
+            "min_top1_top2_margin": min(margins) if margins else None,
+            "tool_name_generation_nll": (
+                -_mean(tool_name_logprobs) if tool_name_logprobs else None
+            ),
+            "argument_generation_nll": (
+                -_mean(argument_logprobs) if argument_logprobs else None
+            ),
+            "readout_available": bool(readout_vector),
+            "readout_norm": readout_norm,
+            "readout_prev_cosine_distance": readout_prev_cosine_distance,
+            "attention_available": False,
+            "attention_entropy": None,
+            "current_query_attention_mass": None,
+            "recent_observation_attention_mass": None,
+            "older_history_attention_mass": None,
+        }
+        return features, readout_vector if readout_vector else previous_readout_vector
 
     def _verify_kv_divergence(
         self,
@@ -1725,6 +2394,10 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "cumulative_divergence": None,
             "candidate_action_matches_reference": candidate_action_matches,
             "state_matches_reference": state_matches,
+            "oracle_harmful": harmful,
+            "detector_trigger": harmful,
+            "detector": "oracle",
+            "detector_reason": "oracle_harmful" if harmful else "oracle_safe",
             "verify_failed": harmful,
             "logit_kl": None,
             "entropy": None,
@@ -2000,6 +2673,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                 )
                 segment_infos: list[dict[str, Any]] = []
                 terminal_after_segment = False
+                previous_candidate_readout_vector: list[float] | None = None
 
                 for segment_index in range(self.checkpoint_interval):
                     micro_snapshot = self._snapshot(
@@ -2029,7 +2703,19 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         tools,
                         stats,
                         readout_probe=False,
+                        collect_detector_signals=(
+                            self.collect_candidate_detector_signals
+                        ),
                     )
+                    candidate_detector_features = {}
+                    if self.collect_candidate_detector_signals:
+                        (
+                            candidate_detector_features,
+                            previous_candidate_readout_vector,
+                        ) = self._candidate_detector_features(
+                            candidate_raw,
+                            previous_candidate_readout_vector,
+                        )
                     candidate_assistant = _assistant_history_message(
                         candidate_text,
                         candidate_message.get("tool_calls"),
@@ -2123,6 +2809,9 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             "candidate_usage": candidate_usage,
                             "candidate_elapsed": candidate_elapsed,
                             "candidate_raw": candidate_raw,
+                            "candidate_detector_features": (
+                                candidate_detector_features
+                            ),
                             "execution_results": execution_results,
                             "execution_error": execution_error,
                             "state_after_candidate": state_after_candidate,
@@ -2150,24 +2839,29 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             segment_infos=segment_infos[:-1],
                         )
                     )
-                    if self.verifier == "heuristic":
-                        detector_failed, detector_reason = (
-                            self._heuristic_detector_failed(
-                                segment_infos[-1]["heuristic_attributes"]
-                            )
+                    per_step_detector_failed, per_step_detector_reason = (
+                        self._heuristic_detector_failed(
+                            segment_infos[-1]["heuristic_attributes"]
                         )
-                        segment_infos[-1]["verify"]["verify_failed"] = (
-                            detector_failed
-                        )
-                        segment_infos[-1]["verify"]["detector"] = "heuristic"
-                        segment_infos[-1]["verify"]["detector_reason"] = (
-                            detector_reason
-                        )
-                        segment_infos[-1]["verify"]["detector_risk_score"] = (
-                            segment_infos[-1]["heuristic_attributes"].get(
-                                "risk_score"
-                            )
-                        )
+                    )
+                    segment_infos[-1]["per_step_detector_trigger"] = (
+                        per_step_detector_failed
+                    )
+                    segment_infos[-1]["per_step_detector_reason"] = (
+                        per_step_detector_reason
+                    )
+                    segment_infos[-1]["verify"]["oracle_harmful"] = (
+                        self._oracle_harmful(segment_infos[-1])
+                    )
+                    segment_infos[-1]["verify"]["per_step_detector_trigger"] = (
+                        per_step_detector_failed
+                    )
+                    segment_infos[-1]["verify"]["per_step_detector_reason"] = (
+                        per_step_detector_reason
+                    )
+                    segment_infos[-1]["verify"]["detector_risk_score"] = (
+                        segment_infos[-1]["heuristic_attributes"].get("risk_score")
+                    )
                     if is_empty_execute_response(candidate_action):
                         terminal_after_segment = True
                         break
@@ -2192,9 +2886,57 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     break
 
                 verify_count += 1
-                segment_has_drift = any(
-                    bool(info["verify"]["verify_failed"]) for info in segment_infos
+                oracle_harmful_per_step = [
+                    self._oracle_harmful(info) for info in segment_infos
+                ]
+                oracle_segment_unsafe = any(oracle_harmful_per_step)
+                if self.verifier == "oracle":
+                    detector_debug = {
+                        "detector": "oracle",
+                        "detector_trigger": oracle_segment_unsafe,
+                        "detector_reason": (
+                            "oracle_segment_unsafe"
+                            if oracle_segment_unsafe
+                            else "oracle_segment_safe"
+                        ),
+                        "rule_detector_trigger": None,
+                        "rule_detector_max_risk": None,
+                        "rule_detector_reason": None,
+                    }
+                elif self.verifier in {"rule", "heuristic"}:
+                    detector_debug = self._rule_detector(segment_infos)
+                elif self.verifier == "logistic":
+                    detector_debug = self._logistic_detector(segment_infos)
+                else:
+                    detector_debug = {
+                        "detector": self.verifier,
+                        "detector_trigger": any(
+                            bool(info["verify"].get("detector_trigger"))
+                            for info in segment_infos
+                        ),
+                        "detector_reason": self.verifier,
+                        "rule_detector_trigger": None,
+                        "rule_detector_max_risk": None,
+                        "rule_detector_reason": None,
+                    }
+                segment_has_drift = bool(detector_debug.get("detector_trigger"))
+                if self.verifier == "oracle":
+                    detector_trigger_per_step = list(oracle_harmful_per_step)
+                else:
+                    detector_trigger_per_step = [
+                        bool(info.get("per_step_detector_trigger"))
+                        for info in segment_infos
+                    ]
+                detector_confusion = self._detector_confusion(
+                    oracle_segment_unsafe=oracle_segment_unsafe,
+                    detector_segment_trigger=segment_has_drift,
                 )
+                for info in segment_infos:
+                    info["verify"]["detector"] = detector_debug.get("detector")
+                    info["verify"]["detector_trigger"] = segment_has_drift
+                    info["verify"]["detector_reason"] = detector_debug.get(
+                        "detector_reason"
+                    ) or detector_debug.get("rule_detector_reason")
                 speculative_end_state = _state_log(involved_instances)
                 speculative_terminal_after_segment = terminal_after_segment
                 speculative_force_quit = force_quit
@@ -2202,9 +2944,15 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                 final_records: list[dict[str, Any]] = []
                 segment_recovery_tokens = 0
                 rollback_steps = 0
+                configured_rollback_depth = (
+                    self.rollback_depth if self.rollback_policy == "fixed_depth" else None
+                )
+                actual_rollback_depth = 0
+                rule_depth_debug: dict[str, Any] = {}
                 rollback_start_index: int | None = None
                 rollback_restore_policy = "none"
                 first_bad_index: int | None = None
+                detector_first_bad_index: int | None = None
                 predicted_first_bad_index: int | None = None
                 attribution_debug: dict[str, Any] = {}
                 restored_state: list[dict[str, Any]] | None = None
@@ -2261,40 +3009,86 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     terminal_after_segment = False
                     force_quit = False
                     detector_first_bad_index = next(
-                        index
-                        for index, info in enumerate(segment_infos)
-                        if info["verify"]["verify_failed"]
+                        (
+                            index
+                            for index, triggered in enumerate(
+                                detector_trigger_per_step
+                            )
+                            if triggered
+                        ),
+                        None,
                     )
                     first_bad_index = next(
                         (
                             index
-                            for index, info in enumerate(segment_infos)
-                            if (
-                                not info["verify"][
-                                    "candidate_action_matches_reference"
-                                ]
-                                or info["verify"]["state_matches_reference"] is False
-                            )
+                            for index, harmful in enumerate(oracle_harmful_per_step)
+                            if harmful
                         ),
-                        detector_first_bad_index,
+                        None,
                     )
-                    predicted_first_bad_index, attribution_debug = (
-                        self._predict_first_bad_index(
-                            segment_infos=segment_infos,
-                            oracle_first_bad_index=first_bad_index,
+                    if self.rollback_policy == "fixed_depth":
+                        actual_depth = min(
+                            max(self.rollback_depth, 1),
+                            len(segment_infos),
                         )
-                    )
-                    if (
-                        self.attribution == "whole_segment"
+                        rollback_start_index = len(segment_infos) - actual_depth
+                        actual_rollback_depth = actual_depth
+                        predicted_first_bad_index = rollback_start_index
+                        attribution_debug = self._rollback_debug(
+                            segment_infos=segment_infos,
+                            rollback_start_index=rollback_start_index,
+                            oracle_first_bad_index=first_bad_index,
+                            reason=f"fixed_depth:{actual_depth}",
+                            raw_predicted_first_bad_index=None,
+                        )
+                    elif self.rollback_policy == "rule_depth":
+                        rule_depth_debug = self._rule_depth_decision(segment_infos)
+                        rollback_start_index = int(
+                            rule_depth_debug["rollback_start_index"]
+                        )
+                        actual_rollback_depth = int(
+                            rule_depth_debug["actual_rollback_depth"]
+                        )
+                        predicted_first_bad_index = rollback_start_index
+                        attribution_debug = self._rollback_debug(
+                            segment_infos=segment_infos,
+                            rollback_start_index=rollback_start_index,
+                            oracle_first_bad_index=first_bad_index,
+                            reason=rule_depth_debug["rule_depth_reason"],
+                            raw_predicted_first_bad_index=rollback_start_index,
+                        )
+                        attribution_debug.update(rule_depth_debug)
+                    elif (
+                        self.rollback_policy == "whole_segment"
+                        or self.attribution == "whole_segment"
                         or self.recovery_horizon == "whole_segment"
                     ):
                         rollback_start_index = 0
+                        actual_rollback_depth = len(segment_infos)
+                        predicted_first_bad_index = 0
+                        attribution_debug = self._rollback_debug(
+                            segment_infos=segment_infos,
+                            rollback_start_index=rollback_start_index,
+                            oracle_first_bad_index=first_bad_index,
+                            reason="whole_segment",
+                            raw_predicted_first_bad_index=0,
+                        )
+                    else:
+                        predicted_first_bad_index, attribution_debug = (
+                            self._predict_first_bad_index(
+                                segment_infos=segment_infos,
+                                oracle_first_bad_index=first_bad_index,
+                            )
+                        )
+                        rollback_start_index = predicted_first_bad_index
+                        actual_rollback_depth = len(segment_infos) - rollback_start_index
+
+                    if rollback_start_index == 0:
                         restore_target = segment_checkpoint
                         rollback_restore_policy = "segment_checkpoint"
                         rollback_steps = len(segment_infos)
                         target_infos = segment_infos
                     else:
-                        rollback_start_index = predicted_first_bad_index
                         kept_infos = segment_infos[:rollback_start_index]
                         for info in kept_infos:
                             step_record = self._make_final_step_record(
@@ -2322,10 +3116,14 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         ]
                         rollback_restore_policy = "first_bad_micro_checkpoint"
                         rollback_steps = len(segment_infos) - rollback_start_index
-                        if self.recovery_horizon == "one_step":
+                        if (
+                            self.rollback_policy != "fixed_depth"
+                            and self.recovery_horizon == "one_step"
+                        ):
                             target_infos = [segment_infos[rollback_start_index]]
                         else:
                             target_infos = segment_infos[rollback_start_index:]
+                    actual_rollback_depth = rollback_steps
 
                     (
                         messages,
@@ -2619,8 +3417,43 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             "rollback_backend": rollback_backend_info.get(
                                 "rollback_backend"
                             ),
+                            "rollback_policy": self.rollback_policy,
+                            "configured_rollback_depth": configured_rollback_depth,
+                            "actual_rollback_depth": actual_rollback_depth,
+                            "rollback_start_index": rollback_start_index,
+                            "rule_depth_reason": attribution_debug.get(
+                                "rule_depth_reason"
+                            ),
+                            "earliest_suspicious_index": attribution_debug.get(
+                                "earliest_suspicious_index"
+                            ),
+                            "max_risk_index": attribution_debug.get(
+                                "max_risk_index"
+                            ),
                             "attribution": self.attribution,
                             "attribution_safety_margin": self.attribution_safety_margin,
+                            "oracle_harmful": self._oracle_harmful(spec_info),
+                            "detector": detector_debug.get("detector"),
+                            "detector_trigger": segment_has_drift,
+                            "detector_reason": (
+                                detector_debug.get("detector_reason")
+                                or detector_debug.get("rule_detector_reason")
+                            ),
+                            "logistic_detector_score": detector_debug.get(
+                                "logistic_detector_score"
+                            ),
+                            "logistic_detector_threshold": detector_debug.get(
+                                "logistic_detector_threshold"
+                            ),
+                            "logistic_detector_feature_count": detector_debug.get(
+                                "logistic_detector_feature_count"
+                            ),
+                            "logistic_detector_train_rows": detector_debug.get(
+                                "logistic_detector_train_rows"
+                            ),
+                            "logistic_detector_train_episodes": detector_debug.get(
+                                "logistic_detector_train_episodes"
+                            ),
                             "oracle_first_bad_index": first_bad_index,
                             "predicted_first_bad_index": predicted_first_bad_index,
                             "heuristic_attributes": spec_info.get(
@@ -2647,6 +3480,57 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             "risk_score": (
                                 spec_info.get("heuristic_attributes") or {}
                             ).get("risk_score"),
+                            "candidate_detector_features": spec_info.get(
+                                "candidate_detector_features"
+                            ),
+                            "generation_nll": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("generation_nll"),
+                            "detector_signal_requested": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("detector_signal_requested"),
+                            "detector_signal_available": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("detector_signal_available"),
+                            "logprobs_source": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("logprobs_source"),
+                            "generation_ppl": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("generation_ppl"),
+                            "mean_top1_probability": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("mean_top1_probability"),
+                            "min_top1_probability": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("min_top1_probability"),
+                            "mean_logprob": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("mean_logprob"),
+                            "min_logprob": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("min_logprob"),
+                            "mean_entropy": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("mean_entropy"),
+                            "max_entropy": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("max_entropy"),
+                            "mean_top1_top2_margin": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("mean_top1_top2_margin"),
+                            "min_top1_top2_margin": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("min_top1_top2_margin"),
+                            "readout_norm": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("readout_norm"),
+                            "readout_prev_cosine_distance": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("readout_prev_cosine_distance"),
+                            "attention_available": (
+                                spec_info.get("candidate_detector_features") or {}
+                            ).get("attention_available"),
                         }
                     )
 
@@ -2777,14 +3661,10 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             info["verify"]["state_matches_reference"] is False
                             for info in segment_infos
                         ],
-                        "harmful_drift_per_step": [
-                            bool(info["verify"]["verify_failed"])
-                            for info in segment_infos
-                        ],
-                        "candidate_drift_per_step": [
-                            bool(info["verify"]["verify_failed"])
-                            for info in segment_infos
-                        ],
+                        "harmful_drift_per_step": oracle_harmful_per_step,
+                        "oracle_harmful_drift_per_step": oracle_harmful_per_step,
+                        "detector_trigger_per_step": detector_trigger_per_step,
+                        "candidate_drift_per_step": oracle_harmful_per_step,
                         "segment_candidate_drift_count": sum(
                             1
                             for info in segment_infos
@@ -2798,9 +3678,10 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             if info["verify"]["state_matches_reference"] is False
                         ),
                         "segment_harmful_drift_count": sum(
-                            1
-                            for info in segment_infos
-                            if info["verify"]["verify_failed"]
+                            1 for harmful in oracle_harmful_per_step if harmful
+                        ),
+                        "segment_detector_trigger_count": sum(
+                            1 for triggered in detector_trigger_per_step if triggered
                         ),
                         "segment_executed_drift_count": sum(
                             1
@@ -2808,6 +3689,44 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             if record.get("executed_action_drift")
                         ),
                         "segment_has_drift": segment_has_drift,
+                        "oracle_segment_unsafe": oracle_segment_unsafe,
+                        "detector_trigger": segment_has_drift,
+                        "detector": detector_debug.get("detector"),
+                        "detector_reason": (
+                            detector_debug.get("detector_reason")
+                            or detector_debug.get("rule_detector_reason")
+                        ),
+                        "detector_tp": detector_confusion["detector_tp"],
+                        "detector_fp": detector_confusion["detector_fp"],
+                        "detector_tn": detector_confusion["detector_tn"],
+                        "detector_fn": detector_confusion["detector_fn"],
+                        "rule_detector_trigger": detector_debug.get(
+                            "rule_detector_trigger"
+                        ),
+                        "rule_detector_max_risk": detector_debug.get(
+                            "rule_detector_max_risk"
+                        ),
+                        "rule_detector_reason": detector_debug.get(
+                            "rule_detector_reason"
+                        ),
+                        "rule_detector_threshold": detector_debug.get(
+                            "rule_detector_threshold"
+                        ),
+                        "logistic_detector_score": detector_debug.get(
+                            "logistic_detector_score"
+                        ),
+                        "logistic_detector_threshold": detector_debug.get(
+                            "logistic_detector_threshold"
+                        ),
+                        "logistic_detector_feature_count": detector_debug.get(
+                            "logistic_detector_feature_count"
+                        ),
+                        "logistic_detector_train_rows": detector_debug.get(
+                            "logistic_detector_train_rows"
+                        ),
+                        "logistic_detector_train_episodes": detector_debug.get(
+                            "logistic_detector_train_episodes"
+                        ),
                         "verify_triggered": True,
                         "rollback_triggered": segment_has_drift,
                         "refresh_triggered": segment_has_drift,
@@ -2831,6 +3750,12 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             "attribution_reason"
                         ),
                         "attribution_safety_margin": self.attribution_safety_margin,
+                        "has_oracle_first_bad": attribution_debug.get(
+                            "has_oracle_first_bad"
+                        ),
+                        "detector_false_positive": attribution_debug.get(
+                            "detector_false_positive"
+                        ),
                         "exact_attribution": attribution_debug.get(
                             "exact_attribution"
                         ),
@@ -2839,6 +3764,9 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         ),
                         "under_rollback": attribution_debug.get("under_rollback"),
                         "over_rollback": attribution_debug.get("over_rollback"),
+                        "rollback_coverage": attribution_debug.get(
+                            "rollback_coverage"
+                        ),
                         "over_rollback_steps": attribution_debug.get(
                             "over_rollback_steps"
                         ),
@@ -2849,11 +3777,26 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             "oracle_rollback_depth"
                         ),
                         "rollback_depth": rollback_steps,
+                        "configured_rollback_depth": configured_rollback_depth,
+                        "actual_rollback_depth": actual_rollback_depth,
+                        "rollback_start_index": rollback_start_index,
+                        "rule_depth_reason": attribution_debug.get(
+                            "rule_depth_reason"
+                        ),
+                        "earliest_suspicious_index": attribution_debug.get(
+                            "earliest_suspicious_index"
+                        ),
+                        "max_risk_index": attribution_debug.get("max_risk_index"),
+                        "strong_suspicious_count": attribution_debug.get(
+                            "strong_suspicious_count"
+                        ),
+                        "strong_suspicious_indices": attribution_debug.get(
+                            "strong_suspicious_indices"
+                        ),
                         "rollback_steps": rollback_steps,
-                        "rollback_policy": (
-                            "none"
-                            if not segment_has_drift
-                            else rollback_restore_policy
+                        "rollback_policy": self.rollback_policy,
+                        "rollback_restore_policy": (
+                            "none" if not segment_has_drift else rollback_restore_policy
                         ),
                         "regen_policy": (
                             "none"
@@ -3026,6 +3969,10 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         "heuristic_attributes_per_step": [
                             info.get("heuristic_attributes") for info in segment_infos
                         ],
+                        "candidate_detector_features_per_step": [
+                            info.get("candidate_detector_features")
+                            for info in segment_infos
+                        ],
                         "final_executed_actions": [
                             record.get("executed_action") for record in final_records
                         ],
@@ -3123,8 +4070,13 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         try:
             result, metadata = self._run_sample_checkpoint_impl(test_case, stats)
         except Exception as exc:
+            if self.kv_restore_strict:
+                raise
             result = f"Error during inference: {exc}"
-            metadata = {"traceback": traceback.format_exc()}
+            metadata = {
+                "traceback": traceback.format_exc(),
+                "inference_error": True,
+            }
             stats.errors.append(str(exc))
         metadata["c2kv_checkpoint_metrics"] = {
             **stats.as_dict(),
@@ -3133,7 +4085,21 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "requested_verifier": self.requested_verifier,
             "attribution": self.attribution,
             "attribution_safety_margin": self.attribution_safety_margin,
-            "rollback_backend": self.rollback_backend,
+        "rollback_policy": self.rollback_policy,
+        "rollback_depth": self.rollback_depth,
+        "rule_detector_threshold": self.rule_detector_threshold,
+        "logistic_detector_features_csv": self.logistic_detector_features_csv,
+        "logistic_detector_threshold": (
+            self.logistic_detector_model.get("threshold")
+            if self.logistic_detector_model
+            else self.logistic_detector_threshold
+        ),
+        "logistic_detector_feature_count": (
+            len(self.logistic_detector_model.get("features") or [])
+            if self.logistic_detector_model
+            else 0
+        ),
+        "rollback_backend": self.rollback_backend,
             "verify_threshold": self.verify_threshold,
             "verify_layers": self.verify_layers,
             "online_verify": self.online_verify,
@@ -3190,7 +4156,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         test_case: dict[str, Any],
         stats: DriftStats,
     ) -> tuple[list[list[str]], dict[str, Any]]:
-        if self.verifier in {"oracle", "heuristic"}:
+        if self.verifier in {"oracle", "heuristic", "rule", "logistic"}:
             return self._run_sample_checkpoint_impl_oracle_multistep(
                 test_case,
                 stats,
@@ -3737,6 +4703,9 @@ def run(args: argparse.Namespace) -> None:
         "verifier": args.verifier,
         "attribution": args.attribution,
         "attribution_safety_margin": args.attribution_safety_margin,
+        "rollback_policy": args.rollback_policy,
+        "rollback_depth": args.rollback_depth,
+        "rule_detector_threshold": args.rule_detector_threshold,
         "rollback_backend": args.rollback_backend,
         "verify_threshold": args.verify_threshold,
         "verify_layers": args.verify_layers,
@@ -3818,10 +4787,30 @@ def parse_args() -> argparse.Namespace:
             "kv_divergence",
             "oracle",
             "heuristic",
+            "rule",
+            "logistic",
         ],
         default="oracle",
     )
     parser.add_argument("--verify-threshold", type=float, default=0.0)
+    parser.add_argument("--rule-detector-threshold", type=float, default=5.0)
+    parser.add_argument(
+        "--logistic-detector-features-csv",
+        default="",
+        help=(
+            "detector_features.csv used to train verifier=logistic from "
+            "calibration split only."
+        ),
+    )
+    parser.add_argument(
+        "--logistic-detector-threshold",
+        type=float,
+        default=-1.0,
+        help=(
+            "Logistic detector threshold. Negative means choose best-F1 "
+            "threshold on the calibration split."
+        ),
+    )
     parser.add_argument(
         "--verify-layers",
         default="25%,50%,75%,last",
@@ -3835,6 +4824,25 @@ def parse_args() -> argparse.Namespace:
         "--reuse-candidate-readout",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    parser.add_argument(
+        "--collect-candidate-detector-signals",
+        action="store_true",
+        help=(
+            "Request logprobs on the normal C2KV candidate generation call and "
+            "record cheap detector features for offline signal benchmarking."
+        ),
+    )
+    parser.add_argument("--candidate-logprobs-top-k", type=int, default=20)
+    parser.add_argument(
+        "--candidate-hidden-readout",
+        action="store_true",
+        help="Also request hidden_states/readout on candidate calls if the server supports it.",
+    )
+    parser.add_argument(
+        "--candidate-attention-summary",
+        action="store_true",
+        help="Reserved for server-side attention summaries; unavailable is logged today.",
     )
     parser.add_argument(
         "--recovery-mode",
@@ -3856,6 +4864,12 @@ def parse_args() -> argparse.Namespace:
         default="auto",
     )
     parser.add_argument("--attribution-safety-margin", type=int, choices=[0, 1], default=0)
+    parser.add_argument(
+        "--rollback-policy",
+        choices=sorted(ROLLBACK_POLICIES),
+        default="attribution",
+    )
+    parser.add_argument("--rollback-depth", type=int, choices=[1, 2, 4], default=1)
     parser.add_argument(
         "--rollback-backend",
         choices=sorted(ROLLBACK_BACKENDS),
