@@ -17,6 +17,13 @@ ARMS = (
     "d_corr_all",
 )
 
+PLAN_COST_ARMS = {
+    "d_sham_neutral",
+    "d_corr",
+    "d_corr_recompute",
+    "d_corr_all",
+}
+
 
 def _load_json(path: Path) -> dict[str, Any]:
     if not path.exists():
@@ -54,6 +61,7 @@ def _find_score(root: Path) -> dict[str, Any]:
 
 def summarize(run_root: Path, arms: list[str]) -> list[dict[str, Any]]:
     detail_by_arm: dict[str, list[dict[str, Any]]] = {}
+    plan_summary = _load_json(run_root / "logs" / "plan_build_summary.json")
     rows = []
     for arm in arms:
         root = run_root / arm
@@ -98,8 +106,86 @@ def summarize(run_root: Path, arms: list[str]) -> list[dict[str, Any]]:
                 if isinstance(step, dict)
             )
         }
-        original = sum(int(row.get("history_original_tokens") or 0) for row in metrics)
-        effective = sum(int(row.get("history_effective_tokens") or 0) for row in metrics)
+        legacy_original = sum(
+            int(row.get("history_original_tokens") or 0) for row in metrics
+        )
+        legacy_effective = sum(
+            int(row.get("history_effective_tokens") or 0) for row in metrics
+        )
+        original = sum(
+            int(
+                row.get("canonical_full_history_tokens")
+                or row.get("history_original_tokens")
+                or 0
+            )
+            for row in metrics
+        )
+        effective = sum(
+            int(
+                row.get("physical_history_kv_tokens")
+                or row.get("history_effective_tokens")
+                or 0
+            )
+            for row in metrics
+        )
+        c2kv_gist = sum(int(row.get("c2kv_gist_tokens") or 0) for row in metrics)
+        repair_kv = sum(int(row.get("repair_kv_tokens") or 0) for row in metrics)
+        recomputed_raw = sum(
+            int(row.get("recomputed_raw_tokens") or 0) for row in metrics
+        )
+        c2kv_extract_work = sum(
+            int(row.get("c2kv_extract_recomputed_tokens") or 0) for row in metrics
+        )
+        repair_extract_work = sum(
+            int(row.get("repair_extract_recomputed_tokens") or 0) for row in metrics
+        )
+        query_prefill_work = sum(
+            int(row.get("query_prefill_tokens") or row.get("chat_prompt_tokens") or 0)
+            for row in metrics
+        )
+        decode_work = sum(
+            int(row.get("decode_tokens") or row.get("chat_completion_tokens") or 0)
+            for row in metrics
+        )
+        total_actual_work = sum(
+            int(row.get("total_actual_recomputed_tokens") or 0)
+            for row in metrics
+        )
+        if not total_actual_work:
+            total_actual_work = (
+                c2kv_extract_work
+                + repair_extract_work
+                + query_prefill_work
+                + decode_work
+            )
+        chat_seconds = sum(float(row.get("chat_seconds") or 0.0) for row in metrics)
+        extract_seconds = sum(float(row.get("extract_seconds") or 0.0) for row in metrics)
+        c2kv_extract_seconds = sum(
+            float(row.get("c2kv_extract_seconds") or 0.0) for row in metrics
+        )
+        repair_extract_seconds = sum(
+            float(row.get("repair_extract_seconds") or 0.0) for row in metrics
+        )
+        tool_execution_seconds = sum(
+            float(row.get("tool_execution_seconds") or 0.0) for row in metrics
+        )
+        observed_e2e_seconds = sum(
+            float(row.get("episode_e2e_observed_seconds") or 0.0)
+            for row in metrics
+        )
+        if not observed_e2e_seconds:
+            observed_e2e_seconds = chat_seconds + extract_seconds + tool_execution_seconds
+        plan_build_seconds = (
+            float(plan_summary.get("plan_build_seconds") or 0.0)
+            if arm in PLAN_COST_ARMS
+            else 0.0
+        )
+        plan_build_tokenization_tokens = (
+            int(plan_summary.get("plan_build_tokenization_tokens") or 0)
+            if arm in PLAN_COST_ARMS
+            else 0
+        )
+        observed_e2e_with_plan_seconds = observed_e2e_seconds + plan_build_seconds
         chat_latencies = [
             float(row.get("avg_chat_seconds"))
             for row in metrics
@@ -120,12 +206,50 @@ def summarize(run_root: Path, arms: list[str]) -> list[dict[str, Any]]:
             "serialization_mismatch_rate": _rate(len(serialization_mismatch_ids), total),
             "full_history_kv_tokens": original,
             "physical_history_kv_tokens": effective,
+            "c2kv_gist_tokens": c2kv_gist,
+            "repair_kv_tokens": repair_kv,
+            "recomputed_raw_tokens": recomputed_raw,
+            "legacy_history_original_tokens": legacy_original,
+            "legacy_history_effective_tokens": legacy_effective,
             "history_kv_compression": original / effective if effective else None,
             "peak_physical_kv_tokens": effective,
             "peak_kv_compression": original / effective if effective else None,
-            "total_actual_recomputed_tokens": None,
+            "c2kv_extract_recomputed_tokens": c2kv_extract_work,
+            "repair_extract_recomputed_tokens": repair_extract_work,
+            "query_prefill_tokens": query_prefill_work,
+            "decode_tokens": decode_work,
+            "total_actual_recomputed_tokens": total_actual_work,
             "e2e_token_work_ratio": None,
+            "chat_seconds": chat_seconds,
+            "extract_seconds": extract_seconds,
+            "c2kv_extract_seconds": c2kv_extract_seconds,
+            "repair_extract_seconds": repair_extract_seconds,
+            "tool_execution_seconds": tool_execution_seconds,
+            "episode_e2e_observed_seconds": observed_e2e_seconds,
+            "avg_episode_e2e_observed_seconds": (
+                observed_e2e_seconds / total if total else None
+            ),
+            "plan_path": plan_summary.get("plan_path") if arm in PLAN_COST_ARMS else None,
+            "plan_build_mode": plan_summary.get("mode") if arm in PLAN_COST_ARMS else None,
+            "plan_build_seconds": plan_build_seconds,
+            "plan_build_tokenization_tokens": plan_build_tokenization_tokens,
+            "plan_n_qids": plan_summary.get("n_qids") if arm in PLAN_COST_ARMS else None,
+            "plan_budget_gate_passed": (
+                plan_summary.get("budget_gate_passed") if arm in PLAN_COST_ARMS else None
+            ),
+            "plan_neutrality_gate_passed": (
+                plan_summary.get("neutrality_gate_passed")
+                if arm in PLAN_COST_ARMS
+                else None
+            ),
+            "episode_e2e_observed_with_plan_seconds": observed_e2e_with_plan_seconds,
+            "avg_episode_e2e_observed_with_plan_seconds": (
+                observed_e2e_with_plan_seconds / total if total else None
+            ),
             "avg_chat_latency_sec": _mean(chat_latencies),
+            "avg_chat_latency_sec_note": "chat/completions only; excludes extract and tool execution",
+            "ttft_sec": None,
+            "ttft_note": "unavailable: server response does not expose first-token timestamp",
             "detail_step_rows": len(drift_steps),
         }
         rows.append(row)
@@ -146,6 +270,20 @@ def summarize(run_root: Path, arms: list[str]) -> list[dict[str, Any]]:
                 "d_sham_mech output mismatch vs c2kv for "
                 f"{len(mismatches)} samples; see {mismatch_path}"
             )
+    full_work = next(
+        (
+            int(row.get("total_actual_recomputed_tokens") or 0)
+            for row in rows
+            if row.get("method") == "full"
+        ),
+        0,
+    )
+    if full_work:
+        for row in rows:
+            method_work = int(row.get("total_actual_recomputed_tokens") or 0)
+            row["e2e_token_work_ratio"] = (
+                full_work / method_work if method_work else None
+            )
     return rows
 
 
@@ -162,12 +300,12 @@ def write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
     lines = [
         "# BFCL History C2KV KV-Repair Sweep",
         "",
-        "| Method | BFCL Acc | Correct | Examples | Errors | History KV Compression | Executed Drift | State Drift | Avg Chat s |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Method | BFCL Acc | Correct | Examples | Errors | History KV Compression | E2E Work Ratio | Executed Drift | State Drift | Avg Chat-only s | Avg Observed E2E s | Plan Build s | Avg E2E+Plan s |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {method} | {acc} | {correct} | {num_examples} | {errors} | {comp} | {edrift} | {sdrift} | {lat} |".format(
+            "| {method} | {acc} | {correct} | {num_examples} | {errors} | {comp} | {work} | {edrift} | {sdrift} | {lat} | {e2e_lat} | {plan_s} | {e2e_plan_lat} |".format(
                 method=row["method"],
                 acc=(
                     f"{float(row['bfcl_accuracy']):.4f}"
@@ -180,6 +318,11 @@ def write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
                 comp=(
                     f"{row['history_kv_compression']:.4f}x"
                     if row["history_kv_compression"] is not None
+                    else "-"
+                ),
+                work=(
+                    f"{row['e2e_token_work_ratio']:.4f}x"
+                    if row["e2e_token_work_ratio"] is not None
                     else "-"
                 ),
                 edrift=(
@@ -195,6 +338,17 @@ def write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
                 lat=(
                     f"{row['avg_chat_latency_sec']:.4f}"
                     if row["avg_chat_latency_sec"] is not None
+                    else "-"
+                ),
+                e2e_lat=(
+                    f"{row['avg_episode_e2e_observed_seconds']:.4f}"
+                    if row["avg_episode_e2e_observed_seconds"] is not None
+                    else "-"
+                ),
+                plan_s=f"{row['plan_build_seconds']:.4f}",
+                e2e_plan_lat=(
+                    f"{row['avg_episode_e2e_observed_with_plan_seconds']:.4f}"
+                    if row["avg_episode_e2e_observed_with_plan_seconds"] is not None
                     else "-"
                 ),
             )

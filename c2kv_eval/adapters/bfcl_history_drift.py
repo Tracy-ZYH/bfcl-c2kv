@@ -251,8 +251,20 @@ class DriftStats:
     extract_calls: int = 0
     extract_success: int = 0
     extract_seconds: float = 0.0
+    c2kv_extract_seconds: float = 0.0
+    repair_extract_seconds: float = 0.0
+    tool_execution_seconds: float = 0.0
+    chat_prompt_tokens: int = 0
+    chat_completion_tokens: int = 0
+    c2kv_extract_recomputed_tokens: int = 0
+    repair_extract_recomputed_tokens: int = 0
     original_history_tokens: int = 0
     effective_history_tokens: int = 0
+    canonical_full_history_tokens: int = 0
+    physical_history_kv_tokens: int = 0
+    c2kv_gist_tokens: int = 0
+    repair_kv_tokens: int = 0
+    recomputed_raw_tokens: int = 0
     first_action_divergence: dict[str, int] | None = None
     first_state_divergence: dict[str, int] | None = None
     errors: list[str] = field(default_factory=list)
@@ -273,8 +285,37 @@ class DriftStats:
                 self.extract_success / self.extract_calls if self.extract_calls else None
             ),
             "extract_seconds": round(self.extract_seconds, 4),
+            "c2kv_extract_seconds": round(self.c2kv_extract_seconds, 4),
+            "repair_extract_seconds": round(self.repair_extract_seconds, 4),
+            "tool_execution_seconds": round(self.tool_execution_seconds, 4),
+            "episode_e2e_observed_seconds": round(
+                self.extract_seconds + self.chat_seconds + self.tool_execution_seconds,
+                4,
+            ),
+            "chat_prompt_tokens": self.chat_prompt_tokens,
+            "chat_completion_tokens": self.chat_completion_tokens,
+            "c2kv_extract_recomputed_tokens": self.c2kv_extract_recomputed_tokens,
+            "repair_extract_recomputed_tokens": self.repair_extract_recomputed_tokens,
+            "query_prefill_tokens": self.chat_prompt_tokens,
+            "decode_tokens": self.chat_completion_tokens,
+            "total_actual_recomputed_tokens": (
+                self.c2kv_extract_recomputed_tokens
+                + self.repair_extract_recomputed_tokens
+                + self.chat_prompt_tokens
+                + self.chat_completion_tokens
+            ),
             "history_original_tokens": self.original_history_tokens,
             "history_effective_tokens": self.effective_history_tokens,
+            "canonical_full_history_tokens": self.canonical_full_history_tokens,
+            "physical_history_kv_tokens": self.physical_history_kv_tokens,
+            "c2kv_gist_tokens": self.c2kv_gist_tokens,
+            "repair_kv_tokens": self.repair_kv_tokens,
+            "recomputed_raw_tokens": self.recomputed_raw_tokens,
+            "canonical_history_kv_compression": (
+                self.canonical_full_history_tokens / self.physical_history_kv_tokens
+                if self.physical_history_kv_tokens
+                else 1.0
+            ),
             "history_compression_ratio": (
                 self.original_history_tokens / self.effective_history_tokens
                 if self.effective_history_tokens
@@ -343,10 +384,16 @@ class HistoryDriftRunner:
         except Exception as exc:
             record = ExtractRecord(success=False, error=str(exc))
             stats.errors.append(f"extract: {exc}")
-        stats.extract_seconds += time.perf_counter() - start
+        elapsed = time.perf_counter() - start
+        stats.extract_seconds += elapsed
+        stats.c2kv_extract_seconds += elapsed
         stats.extract_calls += 1
         if record.success:
             stats.extract_success += 1
+            stats.c2kv_extract_recomputed_tokens += int(
+                record.original_seq_len
+                or len(self.tokenizer.encode(text, add_special_tokens=False))
+            )
         return record
 
     def _build_request_messages(
@@ -418,12 +465,16 @@ class HistoryDriftRunner:
         usage = data.get("usage") or {}
         stats.chat_calls += 1
         stats.chat_seconds += elapsed
-        return text, message, elapsed, {
-            "prompt_tokens": int(usage.get("prompt_tokens") or prompt_tokens),
-            "completion_tokens": int(
+        usage_prompt_tokens = int(usage.get("prompt_tokens") or prompt_tokens)
+        usage_completion_tokens = int(
                 usage.get("completion_tokens")
                 or len(self.tokenizer.encode(text, add_special_tokens=False))
-            ),
+        )
+        stats.chat_prompt_tokens += usage_prompt_tokens
+        stats.chat_completion_tokens += usage_completion_tokens
+        return text, message, elapsed, {
+            "prompt_tokens": usage_prompt_tokens,
+            "completion_tokens": usage_completion_tokens,
         }
 
     def _decode(self, text: str) -> list[str]:
@@ -444,8 +495,6 @@ class HistoryDriftRunner:
         step_idx: int,
         decoded_prediction: list[str],
     ) -> dict[str, Any] | None:
-        if self.mode == "history_full_closed_loop":
-            return None
         if ref_index >= len(reference_steps):
             if stats.first_action_divergence is None:
                 stats.first_action_divergence = {
@@ -482,8 +531,6 @@ class HistoryDriftRunner:
         step_idx: int,
         state_after_step: list[dict[str, Any]],
     ) -> None:
-        if self.mode == "history_full_closed_loop":
-            return
         if not ref_step:
             if stats.first_state_divergence is None:
                 stats.first_state_divergence = {
@@ -604,17 +651,13 @@ class HistoryDriftRunner:
 
                 ref_index = len(drift_steps)
                 state_before_execution = _state_log(involved_instances)
-                if self.mode == "history_full_closed_loop":
-                    ref_step = None
-                    alignment_status = "not_applicable"
-                else:
-                    ref_step, alignment_status = reference_step_for(
-                        reference_map,
-                        reference_result,
-                        turn_idx,
-                        count,
-                        fallback_state=state_before_execution,
-                    )
+                ref_step, alignment_status = reference_step_for(
+                    reference_map,
+                    reference_result,
+                    turn_idx,
+                    count,
+                    fallback_state=state_before_execution,
+                )
                 reference_action = ref_step.get("decoded_action") if ref_step else None
 
                 should_stop_after_record = False
@@ -650,6 +693,7 @@ class HistoryDriftRunner:
                     execution_results = []
                 else:
                     try:
+                        tool_start = time.perf_counter()
                         execution_results, involved_instances = execute_multi_turn_func_call(
                             decoded_to_execute,
                             initial_config,
@@ -659,7 +703,9 @@ class HistoryDriftRunner:
                             long_context=long_context,
                             is_evaL_run=False,
                         )
+                        stats.tool_execution_seconds += time.perf_counter() - tool_start
                     except Exception as exc:
+                        stats.tool_execution_seconds += time.perf_counter() - tool_start
                         execution_error = str(exc)
                         execution_results = []
                         should_stop_after_record = True
@@ -713,13 +759,12 @@ class HistoryDriftRunner:
                     history_execution_results=history_execution_results,
                     roundtrip=roundtrip,
                 )
-                if self.mode != "history_full_closed_loop":
-                    mark_first_divergence(stats, step_record)
-                    if alignment_status == "missing_reference":
-                        stats.errors.append(
-                            f"missing reference action at turn={turn_idx}, step={count}, "
-                            f"candidate_global_step={ref_index}"
-                        )
+                mark_first_divergence(stats, step_record)
+                if alignment_status == "missing_reference":
+                    stats.errors.append(
+                        f"missing reference action at turn={turn_idx}, step={count}, "
+                        f"candidate_global_step={ref_index}"
+                    )
                 drift_steps.append(step_record)
                 if roundtrip["serialization_mismatch"]:
                     stats.errors.append(

@@ -17,6 +17,11 @@ RATIO="${RATIO:-4}"
 IDS_PATH="${IDS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_temp0_stability_20260819_172725/frozen_reference/correct_ids.txt}"
 REFERENCE_DETAILS_PATH="${REFERENCE_DETAILS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_temp0_stability_20260819_172725/frozen_reference/details.jsonl}"
 RUN_ROOT="${RUN_ROOT:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_kv_repair_stable52_$(date +%Y%m%d_%H%M%S)}"
+PLAN_PATH="${PLAN_PATH:-}"
+USE_REPAIR_PLAN="${USE_REPAIR_PLAN:-0}"
+AUTO_BUILD_PLAN="${AUTO_BUILD_PLAN:-0}"
+NEUTRAL_CORPUS_PATH="${NEUTRAL_CORPUS_PATH:-/home/zhuyuhan/project/c2kv/share/d-kv-repair/d_neutral_corpus.txt}"
+SHARE_PLAN_MODULE="${SHARE_PLAN_MODULE:-/home/zhuyuhan/project/c2kv/share/d-kv-repair/d_sham_plan.py}"
 
 DEVICES="${DEVICES:-4,5,6}"
 PORTS="${PORTS:-34200,34201,34202}"
@@ -160,6 +165,7 @@ run_arm() {
       --max-examples "${MAX_EXAMPLES}" \
       --ids-path "${IDS_PATH}" \
       --reference-details-path "${REFERENCE_DETAILS_PATH}" \
+      --plan-path "${PLAN_PATH}" \
       --base-url "http://127.0.0.1:${port}" \
       --model "${MODEL_ID}" \
       --served-model-name "${MODEL_ID}" \
@@ -194,11 +200,92 @@ evaluate_arm() {
   log_info "eval done arm=${arm}"
 }
 
+build_plan_if_needed() {
+  if [[ "${USE_REPAIR_PLAN}" != "1" && "${USE_REPAIR_PLAN}" != "true" ]]; then
+    return 0
+  fi
+  if [[ "${ARMS}" != *d_sham_neutral* && "${ARMS}" != *d_corr* ]]; then
+    return 0
+  fi
+  if [[ -z "${PLAN_PATH}" ]]; then
+    PLAN_PATH="${RUN_ROOT}/logs/d_sham_plan.json"
+  fi
+  if [[ "${AUTO_BUILD_PLAN}" != "1" && "${AUTO_BUILD_PLAN}" != "true" && -f "${PLAN_PATH}" ]]; then
+    "${BFCL_PYTHON}" - "${PLAN_PATH}" "${RUN_ROOT}/logs/plan_build_summary.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+plan_path = Path(sys.argv[1])
+out_path = Path(sys.argv[2])
+plan = json.loads(plan_path.read_text(encoding="utf-8"))
+summary = {
+    "mode": "existing_plan",
+    "plan_path": str(plan_path),
+    "plan_build_seconds": 0.0,
+    "n_qids": plan.get("n_qids"),
+    "typed_tokens_total": (plan.get("budget") or {}).get("typed_tokens_total"),
+    "sham_tokens_total": (plan.get("budget") or {}).get("sham_tokens_total"),
+    "budget_gate_passed": (plan.get("budget") or {}).get("gate_passed"),
+    "neutrality_gate_passed": (plan.get("neutrality") or {}).get("gate_passed"),
+    "doc_table_total_tokens": plan.get("doc_table_total_tokens"),
+    "neutral_corpus_tokens": plan.get("neutral_corpus_tokens"),
+    "plan_build_tokenization_tokens": plan.get("plan_build_tokenization_tokens"),
+}
+out_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+PY
+    return 0
+  fi
+
+  log_info "build repair plan: ${PLAN_PATH}"
+  local start
+  local end
+  start=$("${BFCL_PYTHON}" -c 'import time; print(time.perf_counter())')
+  (
+    cd "${ROOT}"
+    "${BFCL_PYTHON}" -m c2kv_eval.scripts.build_bfcl_kv_repair_plan \
+      --category "${CATEGORY}" \
+      --ids-path "${IDS_PATH}" \
+      --tokenizer-path "${TOKENIZER_PATH}" \
+      --share-plan-module "${SHARE_PLAN_MODULE}" \
+      --neutral-corpus "${NEUTRAL_CORPUS_PATH}" \
+      --out "${PLAN_PATH}"
+  ) >"${RUN_ROOT}/logs/plan_build.log" 2>&1
+  end=$("${BFCL_PYTHON}" -c 'import time; print(time.perf_counter())')
+  "${BFCL_PYTHON}" - "${PLAN_PATH}" "${RUN_ROOT}/logs/plan_build_summary.json" "${start}" "${end}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+plan_path = Path(sys.argv[1])
+out_path = Path(sys.argv[2])
+start = float(sys.argv[3])
+end = float(sys.argv[4])
+plan = json.loads(plan_path.read_text(encoding="utf-8"))
+summary = {
+    "mode": "built_in_sweep",
+    "plan_path": str(plan_path),
+    "plan_build_seconds": end - start,
+    "n_qids": plan.get("n_qids"),
+    "typed_tokens_total": (plan.get("budget") or {}).get("typed_tokens_total"),
+    "sham_tokens_total": (plan.get("budget") or {}).get("sham_tokens_total"),
+    "budget_gate_passed": (plan.get("budget") or {}).get("gate_passed"),
+    "neutrality_gate_passed": (plan.get("neutrality") or {}).get("gate_passed"),
+    "doc_table_total_tokens": plan.get("doc_table_total_tokens"),
+    "neutral_corpus_tokens": plan.get("neutral_corpus_tokens"),
+    "plan_build_tokenization_tokens": plan.get("plan_build_tokenization_tokens"),
+}
+out_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+print(json.dumps(summary, ensure_ascii=False))
+PY
+}
+
 log_info "BFCL KV repair sweep starting"
 log_info "RUN_ROOT=${RUN_ROOT}"
 log_info "ARMS=${ARMS}"
 log_info "DEVICES=${DEVICES} PORTS=${PORTS}"
 log_info "IDS_PATH=${IDS_PATH}"
+log_info "PLAN_PATH=${PLAN_PATH}"
 
 source_env_file /usr/local/Ascend/cann-8.5.0/set_env.sh
 source_env_file /usr/local/Ascend/nnal/atb/set_env.sh
@@ -206,7 +293,9 @@ source_env_file /usr/local/Ascend/nnal/atb/set_env.sh
 if [ "${CLEAN_OUTPUT}" = "1" ]; then
   rm -rf "${RUN_ROOT}"
 fi
-mkdir -p "${RUN_ROOT}"
+mkdir -p "${RUN_ROOT}/logs"
+
+build_plan_if_needed
 
 for slot in "${!DEVICE_LIST[@]}"; do
   start_server "${slot}"
