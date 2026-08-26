@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any, Sequence
 
 from tqdm import tqdm
 
+import bfcl_eval.eval_checker.multi_turn_eval.multi_turn_utils as mt_utils
 from bfcl_eval.utils import load_dataset_entry, make_json_serializable, sort_file_content_by_id, sort_key
 
 from c2kv_eval.adapters.bfcl_history_drift import (
@@ -78,18 +80,61 @@ class KVRepairRunner(HistoryDriftRunner):
         super().__init__(drift_args)
         self.arm = args.arm
         self.repair_trigger = args.repair_trigger
+        self.checkpoint_interval = max(1, int(args.checkpoint_interval))
         self.require_plan = False
         self.plan = self._load_plan(args.plan_path)
         self.neutral_token_ids = self._load_neutral_tokens(args.neutral_corpus_path)
         self._active_tools: list[dict[str, Any]] = []
         self._repair_enabled_for_current_step = True
+        self._repair_target_history_index: int | None = None
 
     def run_sample(self, test_case: dict[str, Any]) -> dict[str, Any]:
         self._active_tools = _tool_payload(test_case["function"])
         try:
-            return super().run_sample(test_case)
+            stats = DriftStats(test_case["id"], self.mode, self.ratio)
+            result, metadata = self._run_sample_impl(test_case, stats)
+            metrics = stats.as_dict()
+            metrics.update(self._repair_metrics(metadata.get("repair_segments") or []))
+            metadata["c2kv_drift_metrics"] = metrics
+            return {"id": test_case["id"], "result": result, **metadata}
         finally:
             self._active_tools = []
+
+    @staticmethod
+    def _repair_metrics(segments: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        total = len(segments)
+        triggered = [seg for seg in segments if seg.get("repair_triggered")]
+        harmful = [seg for seg in segments if seg.get("oracle_segment_harmful")]
+        successful = [
+            seg for seg in triggered if seg.get("repair_segment_success") is True
+        ]
+        return {
+            "repair_segments": total,
+            "oracle_harmful_segments": len(harmful),
+            "detector_trigger_count": len(triggered),
+            "detector_trigger_rate": len(triggered) / total if total else None,
+            "repair_rate": len(triggered) / total if total else None,
+            "repair_success_count": len(successful),
+            "repair_success_rate": (
+                len(successful) / len(triggered) if triggered else None
+            ),
+            "repair_segment_success_rate": (
+                len(successful) / len(harmful) if harmful else None
+            ),
+            "c2kv_wrong_repair_correct": sum(
+                int(seg.get("c2kv_wrong_repair_correct") or 0) for seg in segments
+            ),
+            "c2kv_wrong_repair_wrong": sum(
+                int(seg.get("c2kv_wrong_repair_wrong") or 0) for seg in segments
+            ),
+            "c2kv_correct_repair_wrong": sum(
+                int(seg.get("c2kv_correct_repair_wrong") or 0) for seg in segments
+            ),
+            "speculative_terminal_discarded_count": sum(
+                int(bool(seg.get("speculative_terminal_discarded")))
+                for seg in segments
+            ),
+        }
 
     def _load_plan(self, path: str) -> dict[str, Any]:
         if not path:
@@ -102,6 +147,80 @@ class KVRepairRunner(HistoryDriftRunner):
             return []
         text = Path(path).read_text(encoding="utf-8")
         return self.tokenizer.encode(text, add_special_tokens=False)
+
+    def _restore_instances(
+        self,
+        test_entry_id: str,
+        involved_instances: dict[str, Any],
+    ) -> None:
+        for class_name, instance in involved_instances.items():
+            key = (
+                f"{self.decoder.model_name_underline_replaced}_"
+                f"{test_entry_id}_{class_name}_instance"
+            )
+            key = re.sub(r"[-./:]", "_", key)
+            mt_utils.__dict__[key] = deepcopy(instance)
+
+    def _snapshot(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        involved_instances: dict[str, Any],
+        current_turn_response: list[str],
+        current_turn_inputs: list[int],
+        current_turn_outputs: list[int],
+        current_turn_latency: list[float],
+        turn_log: dict[str, Any],
+        global_step: int,
+    ) -> dict[str, Any]:
+        return {
+            "messages": deepcopy(messages),
+            "instances": deepcopy(involved_instances),
+            "state": _state_log(involved_instances),
+            "current_turn_response": deepcopy(current_turn_response),
+            "current_turn_inputs": deepcopy(current_turn_inputs),
+            "current_turn_outputs": deepcopy(current_turn_outputs),
+            "current_turn_latency": deepcopy(current_turn_latency),
+            "turn_log": deepcopy(turn_log),
+            "global_step": global_step,
+            "repair_target_history_index": self._latest_compressed_history_index(messages),
+        }
+
+    def _restore_snapshot(
+        self,
+        *,
+        test_entry_id: str,
+        snapshot: dict[str, Any],
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[str, Any],
+        list[str],
+        list[int],
+        list[int],
+        list[float],
+        dict[str, Any],
+    ]:
+        instances = deepcopy(snapshot["instances"])
+        self._restore_instances(test_entry_id, instances)
+        self._repair_target_history_index = snapshot.get("repair_target_history_index")
+        return (
+            deepcopy(snapshot["messages"]),
+            instances,
+            deepcopy(snapshot["current_turn_response"]),
+            deepcopy(snapshot["current_turn_inputs"]),
+            deepcopy(snapshot["current_turn_outputs"]),
+            deepcopy(snapshot["current_turn_latency"]),
+            deepcopy(snapshot["turn_log"]),
+        )
+
+    def _latest_compressed_history_index(
+        self,
+        history_messages: Sequence[dict[str, Any]],
+    ) -> int | None:
+        latest_query_index = _latest_user_query_index(history_messages)
+        completed = list(history_messages[:latest_query_index])
+        units = _history_units(completed)
+        return len(units) - 1 if units else None
 
     def _unit_token_ids(self, text: str) -> list[int]:
         rendered = self.tokenizer.apply_chat_template(
@@ -144,38 +263,74 @@ class KVRepairRunner(HistoryDriftRunner):
             ) from exc
         return self._normalize_token_ids(encoded)
 
-    def _full_history_doc_layout(
+    def _role_prompt_token_ids(
         self,
-        texts: Sequence[str],
-        doc_ids: Sequence[list[int]],
+        messages: Sequence[dict[str, Any]],
+    ) -> list[int]:
+        encoded = self.tokenizer.apply_chat_template(
+            list(messages),
+            tokenize=True,
+            add_generation_prompt=False,
+            enable_thinking=False,
+        )
+        return self._normalize_token_ids(encoded)
+
+    def _full_history_unit_layout(
+        self,
+        units: Sequence[Sequence[dict[str, Any]]],
     ) -> tuple[list[int], list[int], list[int]]:
-        """Locate each rendered history document in the real Full prompt.
+        """Locate each role-preserving history unit in the real Full prompt.
 
         The raw repair slice must come from the same token coordinates used by
-        the OpenAI chat endpoint: system/tool template first, then H0..Hk.
+        the OpenAI chat endpoint: system/tool template first, then the original
+        role-preserving completed history.  This intentionally does not reuse
+        the C2KV user-document wrapper, because raw repair KV must be the KV
+        that the target span would have in the exact Full context.
         """
 
-        full_messages = [{"role": "user", "content": text} for text in texts]
+        full_messages = [
+            deepcopy(message)
+            for unit in units
+            for message in unit
+        ]
         full_tokens = self._full_prompt_token_ids(full_messages)
         starts: list[int] = []
         ends: list[int] = []
+        prefix_messages: list[dict[str, Any]] = []
         cursor = 0
-        for index, ids in enumerate(doc_ids):
-            found = -1
-            limit = len(full_tokens) - len(ids) + 1
-            for pos in range(cursor, max(cursor, limit)):
-                if full_tokens[pos : pos + len(ids)] == ids:
-                    found = pos
-                    break
-            if found < 0:
+        for index, unit in enumerate(units):
+            if prefix_messages:
+                start = len(self._full_prompt_token_ids(prefix_messages))
+            else:
+                unit_ids = self._role_prompt_token_ids(unit)
+                found = -1
+                limit = len(full_tokens) - len(unit_ids) + 1
+                for pos in range(cursor, max(cursor, limit)):
+                    if full_tokens[pos : pos + len(unit_ids)] == unit_ids:
+                        found = pos
+                        break
+                if found < 0:
+                    raise RuntimeError(
+                        "Cannot locate first role-preserving history unit in "
+                        "Full prompt tokenization."
+                    )
+                start = found
+            prefix_messages.extend(deepcopy(list(unit)))
+            end = len(self._full_prompt_token_ids(prefix_messages))
+            if not (0 <= start < end <= len(full_tokens)):
                 raise RuntimeError(
-                    "Cannot locate history doc in Full prompt tokenization: "
-                    f"doc_index={index}, doc_len={len(ids)}, cursor={cursor}, "
+                    "Invalid Full prompt history-unit token span: "
+                    f"unit_index={index}, start={start}, end={end}, "
                     f"full_len={len(full_tokens)}"
                 )
-            starts.append(found)
-            ends.append(found + len(ids))
-            cursor = found + len(ids)
+            if full_tokens[:end] != self._full_prompt_token_ids(prefix_messages):
+                raise RuntimeError(
+                    "Full prompt prefix tokenization is not prefix-stable for "
+                    f"history unit {index}; refusing to build raw repair KV."
+                )
+            starts.append(start)
+            ends.append(end)
+            cursor = end
         return full_tokens, starts, ends
 
     def _extract_repair(
@@ -222,12 +377,15 @@ class KVRepairRunner(HistoryDriftRunner):
             plan_root = self.plan
         plan = plan_root.get(sample_id) or plan_root.get(str(sample_id))
         if plan is None:
-            k_star = (num_docs - 1) // 2
+            if self._repair_target_history_index is None:
+                k_star = num_docs - 1
+            else:
+                k_star = min(max(0, int(self._repair_target_history_index)), num_docs - 1)
             return {
                 "k_star": k_star,
                 "span_len": doc_lens[k_star],
                 "sham_token_ids": [],
-                "source": "online_median_doc",
+                "source": "online_latest_compressed_history",
             }
         k_star = int(plan.get("k_star"))
         if not (0 <= k_star < num_docs):
@@ -274,9 +432,9 @@ class KVRepairRunner(HistoryDriftRunner):
 
         texts = [_render_history_unit(unit) for unit in units]
         doc_ids = [self._unit_token_ids(text) for text in texts]
-        full_prompt_ids, starts, ends = self._full_history_doc_layout(texts, doc_ids)
+        full_prompt_ids, starts, ends = self._full_history_unit_layout(units)
         doc_lens = [end - start for start, end in zip(starts, ends)]
-        canonical_full_history_tokens = ends[-1] - starts[0] if starts else 0
+        canonical_full_history_tokens = sum(doc_lens)
         stats.canonical_full_history_tokens += canonical_full_history_tokens
 
         sample_id = getattr(stats, "sample_id", "") or getattr(stats, "id", "")
@@ -383,6 +541,7 @@ class KVRepairRunner(HistoryDriftRunner):
 
     def _oracle_repair_arms(self) -> set[str]:
         return {
+            "d_sham_mech",
             "d_sham_neutral",
             "d_corr",
             "d_corr_recompute",
@@ -446,6 +605,7 @@ class KVRepairRunner(HistoryDriftRunner):
         reference_map = reference_by_turn_step(reference_steps)
         reference_result = (self.reference_by_id.get(test_entry_id) or {}).get("result") or []
         force_quit = False
+        repair_segments: list[dict[str, Any]] = []
 
         for turn_idx, current_turn_message in enumerate(test_case["question"]):
             messages.extend(deepcopy(current_turn_message))
@@ -456,58 +616,34 @@ class KVRepairRunner(HistoryDriftRunner):
             turn_log: dict[str, Any] = {"begin_of_turn_query": current_turn_message}
 
             count = 0
-            while True:
+
+            def run_one_step(
+                *,
+                step_idx: int,
+                global_step: int,
+                repair_enabled: bool,
+                source_info: dict[str, Any] | None = None,
+            ) -> tuple[dict[str, Any], bool]:
+                nonlocal messages, involved_instances, force_quit
+
                 state_before_execution = _state_log(involved_instances)
-                ref_index = len(drift_steps)
                 ref_step, alignment_status = reference_step_for(
                     reference_map,
                     reference_result,
                     turn_idx,
-                    count,
+                    step_idx,
                     fallback_state=state_before_execution,
                 )
 
-                self._repair_enabled_for_current_step = False
+                self._repair_enabled_for_current_step = repair_enabled
                 request_messages = self._build_request_messages(messages, stats)
-                plain_text, plain_response_message, plain_elapsed, plain_usage = self._query(
+                text, response_message, elapsed, usage = self._query(
                     request_messages,
                     tools,
                     stats,
                 )
-                plain_candidate = decode_candidate(self.decoder, plain_text)
-                repair_triggered = self._should_repair_candidate(
-                    ref_step=ref_step,
-                    candidate_action=plain_candidate.action,
-                    candidate_status=plain_candidate.status,
-                )
+                decoded = decode_candidate(self.decoder, text)
 
-                text = plain_text
-                response_message = plain_response_message
-                elapsed = plain_elapsed
-                usage = plain_usage
-                candidate = plain_candidate
-                repaired_candidate = None
-                repair_text = None
-
-                if repair_triggered:
-                    self._repair_enabled_for_current_step = True
-                    repair_request_messages = self._build_request_messages(messages, stats)
-                    repair_text, response_message, repair_elapsed, repair_usage = self._query(
-                        repair_request_messages,
-                        tools,
-                        stats,
-                    )
-                    repaired_candidate = decode_candidate(self.decoder, repair_text)
-                    text = repair_text
-                    elapsed = plain_elapsed + repair_elapsed
-                    usage = {
-                        "prompt_tokens": plain_usage["prompt_tokens"]
-                        + repair_usage["prompt_tokens"],
-                        "completion_tokens": plain_usage["completion_tokens"]
-                        + repair_usage["completion_tokens"],
-                    }
-
-                final_candidate = repaired_candidate or plain_candidate
                 assistant_history = _assistant_history_message(
                     text,
                     response_message.get("tool_calls"),
@@ -517,29 +653,23 @@ class KVRepairRunner(HistoryDriftRunner):
                 current_turn_outputs.append(usage["completion_tokens"])
                 current_turn_latency.append(elapsed)
 
-                step_log = [
+                step_log: list[dict[str, Any]] = [
                     {"role": "assistant", "content": text},
                     {
-                        "role": "c2kv_oracle_repair",
-                        "oracle_repair_triggered": repair_triggered,
-                        "plain_candidate_status": plain_candidate.status,
-                        "plain_candidate_action": plain_candidate.action,
-                        "repair_candidate_action": (
-                            repaired_candidate.action if repaired_candidate else None
-                        ),
+                        "role": "c2kv_repair_segment",
+                        "repair_enabled": repair_enabled,
+                        "repair_mode": self.arm if repair_enabled else "c2kv",
+                        "repair_target_history_index": self._repair_target_history_index,
                     },
                 ]
-                if repair_text is not None:
-                    step_log[-1]["repair_text"] = repair_text
-                turn_log[f"step_{count}"] = step_log
-
-                if final_candidate.decode_error:
+                turn_log[f"step_{step_idx}"] = step_log
+                if decoded.decode_error:
                     step_log.append(
                         {
                             "role": "handler_log",
                             "content": "Error decoding the model response.",
-                            "error": final_candidate.decode_error,
-                            "model_response_decoded": final_candidate.action,
+                            "error": decoded.decode_error,
+                            "model_response_decoded": decoded.action,
                         }
                     )
                 else:
@@ -547,22 +677,20 @@ class KVRepairRunner(HistoryDriftRunner):
                         {
                             "role": "handler_log",
                             "content": "Successfully decoded model response.",
-                            "model_response_decoded": final_candidate.action,
+                            "model_response_decoded": decoded.action,
                         }
                     )
 
-                decoded_to_execute = final_candidate.action
-                assistant_for_history = assistant_history
-                execution_results_for_history = None
+                decoded_to_execute = decoded.action
                 should_stop_after_record = False
                 if (
-                    final_candidate.status
+                    decoded.status
                     in {"decode_error", "invalid_format", "empty_response"}
                     or is_empty_execute_response(decoded_to_execute)
                 ):
                     should_stop_after_record = True
 
-                messages.append(deepcopy(assistant_for_history))
+                messages.append(deepcopy(assistant_history))
                 execution_error = None
                 if is_empty_execute_response(decoded_to_execute):
                     execution_results = []
@@ -584,25 +712,20 @@ class KVRepairRunner(HistoryDriftRunner):
                         execution_error = str(exc)
                         execution_results = []
                         should_stop_after_record = True
-                history_execution_results = (
-                    execution_results_for_history
-                    if execution_results_for_history is not None
-                    else execution_results
-                )
-                for idx, execution_result in enumerate(history_execution_results):
+                for idx, execution_result in enumerate(execution_results):
                     messages.append(
                         {
                             "role": "tool",
                             "content": execution_result,
-                            "tool_call_id": f"call_{turn_idx}_{count}_{idx}",
+                            "tool_call_id": f"call_{turn_idx}_{step_idx}_{idx}",
                         }
                     )
                     step_log.append({"role": "tool", "content": execution_result})
 
                 state_after_step = _state_log(involved_instances)
-                executed_text = _message_text(assistant_for_history)
-                if assistant_for_history.get("tool_calls"):
-                    tool_call_text = _tool_calls_to_text(assistant_for_history.get("tool_calls"))
+                executed_text = _message_text(assistant_history)
+                if assistant_history.get("tool_calls"):
+                    tool_call_text = _tool_calls_to_text(assistant_history.get("tool_calls"))
                     executed_text = (
                         (executed_text + "\n" + tool_call_text).strip()
                         if executed_text
@@ -613,63 +736,271 @@ class KVRepairRunner(HistoryDriftRunner):
                     executed_text,
                     decoded_to_execute,
                 )
+
+                candidate_raw_text = text
+                candidate_action = decoded.action
+                candidate_status = decoded.status
+                candidate_decode_error = decoded.decode_error
+                candidate_empty_response = decoded.empty_response
+                if source_info is not None:
+                    source_record = source_info["step_record"]
+                    candidate_raw_text = source_record.get("candidate_raw_text") or ""
+                    candidate_action = list(source_record.get("candidate_action") or [])
+                    candidate_status = source_record.get("candidate_status") or "empty_action"
+                    candidate_decode_error = source_record.get("decode_error")
+                    candidate_empty_response = bool(source_record.get("empty_response"))
+
                 step_record = build_step_record(
                     sample_id=test_entry_id,
                     turn_idx=turn_idx,
-                    step_idx=count,
-                    global_step=ref_index,
-                    candidate_raw_text=plain_text,
-                    candidate_action=plain_candidate.action,
-                    candidate_status=plain_candidate.status,
+                    step_idx=step_idx,
+                    global_step=global_step,
+                    candidate_raw_text=candidate_raw_text,
+                    candidate_action=candidate_action,
+                    candidate_status=candidate_status,
                     reference_step=ref_step,
                     alignment_status=alignment_status,
                     executed_action=decoded_to_execute,
                     state=state_after_step,
-                    decode_error=plain_candidate.decode_error,
-                    empty_response=plain_candidate.empty_response,
+                    decode_error=candidate_decode_error,
+                    empty_response=candidate_empty_response,
                     execution_error=execution_error,
-                    candidate_assistant_message=_assistant_history_message(
-                        plain_text,
-                        plain_response_message.get("tool_calls"),
+                    candidate_assistant_message=(
+                        source_info["assistant_history"]
+                        if source_info is not None
+                        else assistant_history
                     ),
-                    executed_assistant_message=assistant_for_history,
+                    executed_assistant_message=assistant_history,
                     execution_results=execution_results,
-                    history_execution_results=history_execution_results,
+                    history_execution_results=execution_results,
                     roundtrip=roundtrip,
+                    extra={
+                        "repair_triggered": repair_enabled,
+                        "repair_arm": self.arm,
+                        "repair_mode": self.arm if repair_enabled else "c2kv",
+                        "repair_target_history_index": self._repair_target_history_index,
+                        "repair_raw_text": text if repair_enabled else None,
+                        "repair_action": decoded.action if repair_enabled else None,
+                        "repair_status": decoded.status if repair_enabled else None,
+                    },
                 )
-                step_record["oracle_repair_triggered"] = repair_triggered
-                step_record["repair_trigger"] = self.repair_trigger
-                step_record["repair_arm"] = self.arm
-                step_record["repair_raw_text"] = repair_text
-                step_record["repair_action"] = (
-                    repaired_candidate.action if repaired_candidate else None
+                step_record["oracle_harmful"] = bool(
+                    step_record.get("candidate_action_drift")
+                    or step_record.get("state_drift")
                 )
-                step_record["repair_status"] = (
-                    repaired_candidate.status if repaired_candidate else None
-                )
-                mark_first_divergence(stats, step_record)
+                if source_info is not None:
+                    step_record["plain_c2kv_raw_text"] = candidate_raw_text
+                    step_record["plain_c2kv_action"] = candidate_action
+                    step_record["plain_c2kv_status"] = candidate_status
+                    step_record["c2kv_wrong_repair_correct"] = bool(
+                        step_record.get("candidate_action_drift")
+                        and not step_record.get("executed_action_drift")
+                        and not step_record.get("state_drift")
+                    )
+                    step_record["c2kv_wrong_repair_wrong"] = bool(
+                        step_record.get("candidate_action_drift")
+                        and (
+                            step_record.get("executed_action_drift")
+                            or step_record.get("state_drift")
+                        )
+                    )
+                    step_record["c2kv_correct_repair_wrong"] = bool(
+                        not step_record.get("candidate_action_drift")
+                        and (
+                            step_record.get("executed_action_drift")
+                            or step_record.get("state_drift")
+                        )
+                    )
+                    if self.arm == "d_sham_mech":
+                        expected = (candidate_raw_text or "").strip()
+                        actual = (text or "").strip()
+                        if expected != actual:
+                            raise RuntimeError(
+                                "d_sham_mech changed generated text relative to "
+                                "plain C2KV while repair plumbing should be a no-op."
+                            )
+
                 if alignment_status == "missing_reference":
                     stats.errors.append(
-                        f"missing reference action at turn={turn_idx}, step={count}, "
-                        f"candidate_global_step={ref_index}"
+                        f"missing reference action at turn={turn_idx}, "
+                        f"step={step_idx}, candidate_global_step={global_step}"
                     )
-                drift_steps.append(step_record)
                 if roundtrip["serialization_mismatch"]:
                     stats.errors.append(
-                        f"serialization mismatch at turn={turn_idx}, step={count}, "
-                        f"candidate_global_step={ref_index}"
+                        f"serialization mismatch at turn={turn_idx}, "
+                        f"step={step_idx}, candidate_global_step={global_step}"
                     )
+
                 if should_stop_after_record:
-                    break
-                count += 1
-                if count > MAXIMUM_STEP_LIMIT:
+                    return (
+                        {
+                            "step_record": step_record,
+                            "assistant_history": assistant_history,
+                            "text": text,
+                            "usage": usage,
+                            "elapsed": elapsed,
+                            "terminal": True,
+                        },
+                        True,
+                    )
+                if step_idx + 1 > MAXIMUM_STEP_LIMIT:
                     force_quit = True
                     step_log.append(
                         {
                             "role": "handler_log",
-                            "content": f"Model has been forced to quit after {MAXIMUM_STEP_LIMIT} steps.",
+                            "content": (
+                                f"Model has been forced to quit after "
+                                f"{MAXIMUM_STEP_LIMIT} steps."
+                            ),
                         }
                     )
+                    return (
+                        {
+                            "step_record": step_record,
+                            "assistant_history": assistant_history,
+                            "text": text,
+                            "usage": usage,
+                            "elapsed": elapsed,
+                            "terminal": True,
+                        },
+                        True,
+                    )
+                return (
+                    {
+                        "step_record": step_record,
+                        "assistant_history": assistant_history,
+                        "text": text,
+                        "usage": usage,
+                        "elapsed": elapsed,
+                        "terminal": False,
+                    },
+                    False,
+                )
+
+            while True:
+                segment_checkpoint = self._snapshot(
+                    messages=messages,
+                    involved_instances=involved_instances,
+                    current_turn_response=current_turn_response,
+                    current_turn_inputs=current_turn_inputs,
+                    current_turn_outputs=current_turn_outputs,
+                    current_turn_latency=current_turn_latency,
+                    turn_log=turn_log,
+                    global_step=len(drift_steps),
+                )
+                segment_start_count = count
+                segment_infos: list[dict[str, Any]] = []
+                speculative_terminal = False
+                for _ in range(self.checkpoint_interval):
+                    info, terminal = run_one_step(
+                        step_idx=count,
+                        global_step=len(drift_steps) + len(segment_infos),
+                        repair_enabled=False,
+                    )
+                    segment_infos.append(info)
+                    if terminal:
+                        speculative_terminal = True
+                        break
+                    count += 1
+
+                if not segment_infos:
+                    break
+
+                segment_harmful = any(
+                    bool(info["step_record"].get("oracle_harmful"))
+                    for info in segment_infos
+                )
+                repair_segment = {
+                    "sample_id": test_entry_id,
+                    "turn": turn_idx,
+                    "segment_start_step": segment_start_count,
+                    "segment_length": len(segment_infos),
+                    "checkpoint_interval": self.checkpoint_interval,
+                    "detector_trigger": segment_harmful,
+                    "oracle_segment_harmful": segment_harmful,
+                    "repair_triggered": segment_harmful,
+                    "repair_mode": self.arm if segment_harmful else "c2kv",
+                    "repair_target_history_index": segment_checkpoint.get(
+                        "repair_target_history_index"
+                    ),
+                    "candidate_action_drift_per_step": [
+                        bool(info["step_record"].get("candidate_action_drift"))
+                        for info in segment_infos
+                    ],
+                    "state_drift_per_step": [
+                        bool(info["step_record"].get("state_drift"))
+                        for info in segment_infos
+                    ],
+                    "speculative_terminal_discarded": False,
+                    "repair_segment_success": None,
+                    "c2kv_wrong_repair_correct": 0,
+                    "c2kv_wrong_repair_wrong": 0,
+                    "c2kv_correct_repair_wrong": 0,
+                }
+
+                if not segment_harmful:
+                    for info in segment_infos:
+                        step_record = info["step_record"]
+                        mark_first_divergence(stats, step_record)
+                        drift_steps.append(step_record)
+                    repair_segments.append(repair_segment)
+                    if speculative_terminal or force_quit:
+                        break
+                    continue
+
+                repair_segment["speculative_terminal_discarded"] = speculative_terminal
+                (
+                    messages,
+                    involved_instances,
+                    current_turn_response,
+                    current_turn_inputs,
+                    current_turn_outputs,
+                    current_turn_latency,
+                    turn_log,
+                ) = self._restore_snapshot(
+                    test_entry_id=test_entry_id,
+                    snapshot=segment_checkpoint,
+                )
+                count = segment_start_count
+                repaired_records: list[dict[str, Any]] = []
+                repair_terminal = False
+                for source_info in segment_infos:
+                    info, terminal = run_one_step(
+                        step_idx=count,
+                        global_step=len(drift_steps),
+                        repair_enabled=True,
+                        source_info=source_info,
+                    )
+                    step_record = info["step_record"]
+                    step_record["oracle_segment_harmful"] = True
+                    step_record["detector_trigger"] = True
+                    step_record["repair_triggered"] = True
+                    mark_first_divergence(stats, step_record)
+                    drift_steps.append(step_record)
+                    repaired_records.append(step_record)
+                    repair_segment["c2kv_wrong_repair_correct"] += int(
+                        bool(step_record.get("c2kv_wrong_repair_correct"))
+                    )
+                    repair_segment["c2kv_wrong_repair_wrong"] += int(
+                        bool(step_record.get("c2kv_wrong_repair_wrong"))
+                    )
+                    repair_segment["c2kv_correct_repair_wrong"] += int(
+                        bool(step_record.get("c2kv_correct_repair_wrong"))
+                    )
+                    if terminal:
+                        repair_terminal = True
+                        break
+                    count += 1
+                repair_segment["repair_segment_success"] = bool(
+                    repaired_records
+                    and all(
+                        not row.get("executed_action_drift")
+                        and not row.get("state_drift")
+                        for row in repaired_records
+                    )
+                )
+                repair_segments.append(repair_segment)
+                if repair_terminal or force_quit:
                     break
 
             all_model_response.append(current_turn_response)
@@ -689,6 +1020,7 @@ class KVRepairRunner(HistoryDriftRunner):
             "latency": latency,
             "inference_log": inference_log,
             "drift_steps": drift_steps,
+            "repair_segments": repair_segments,
         }
         return all_model_response, metadata
 
@@ -827,6 +1159,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=72000)
     parser.add_argument("--max-completion-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=4,
+        help="Number of plain C2KV speculative steps before Oracle segment repair.",
+    )
     parser.add_argument("--plan-path", default="")
     parser.add_argument(
         "--repair-trigger",

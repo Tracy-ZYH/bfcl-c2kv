@@ -14,6 +14,7 @@ MODEL_ID="${MODEL_ID:-Qwen/Qwen3-4B-Instruct-2507-FC}"
 CATEGORY="${CATEGORY:-multi_turn_base}"
 MAX_EXAMPLES="${MAX_EXAMPLES:-200}"
 RATIO="${RATIO:-4}"
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-4}"
 IDS_PATH="${IDS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_temp0_stability_20260819_172725/frozen_reference/correct_ids.txt}"
 REFERENCE_DETAILS_PATH="${REFERENCE_DETAILS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_temp0_stability_20260819_172725/frozen_reference/details.jsonl}"
 RUN_ROOT="${RUN_ROOT:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_kv_repair_stable52_$(date +%Y%m%d_%H%M%S)}"
@@ -171,6 +172,8 @@ run_arm() {
       --served-model-name "${MODEL_ID}" \
       --tokenizer-path "${TOKENIZER_PATH}" \
       --ratio "${RATIO}" \
+      --checkpoint-interval "${CHECKPOINT_INTERVAL}" \
+      --repair-trigger oracle \
       --result-dir "${arm_root}/result" \
       --details-path "${arm_root}/logs/details.jsonl" \
       --metrics-path "${arm_root}/logs/metrics.jsonl" \
@@ -283,6 +286,7 @@ PY
 log_info "BFCL KV repair sweep starting"
 log_info "RUN_ROOT=${RUN_ROOT}"
 log_info "ARMS=${ARMS}"
+log_info "CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL}"
 log_info "DEVICES=${DEVICES} PORTS=${PORTS}"
 log_info "IDS_PATH=${IDS_PATH}"
 log_info "PLAN_PATH=${PLAN_PATH}"

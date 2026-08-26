@@ -191,6 +191,25 @@ def summarize(run_root: Path, arms: list[str]) -> list[dict[str, Any]]:
             for row in metrics
             if row.get("avg_chat_seconds") is not None
         ]
+        repair_segments = sum(int(row.get("repair_segments") or 0) for row in metrics)
+        repair_trigger_count = sum(
+            int(row.get("detector_trigger_count") or 0) for row in metrics
+        )
+        repair_success_count = sum(
+            int(row.get("repair_success_count") or 0) for row in metrics
+        )
+        oracle_harmful_segments = sum(
+            int(row.get("oracle_harmful_segments") or 0) for row in metrics
+        )
+        c2kv_wrong_repair_correct = sum(
+            int(row.get("c2kv_wrong_repair_correct") or 0) for row in metrics
+        )
+        c2kv_wrong_repair_wrong = sum(
+            int(row.get("c2kv_wrong_repair_wrong") or 0) for row in metrics
+        )
+        c2kv_correct_repair_wrong = sum(
+            int(row.get("c2kv_correct_repair_wrong") or 0) for row in metrics
+        )
         row = {
             "method": arm,
             "bfcl_accuracy": score.get("accuracy") or score.get("overall_accuracy"),
@@ -204,6 +223,29 @@ def summarize(run_root: Path, arms: list[str]) -> list[dict[str, Any]]:
             "executed_action_drift_rate": _rate(len(executed_drift_ids), total),
             "state_drift_rate": _rate(len(state_drift_ids), total),
             "serialization_mismatch_rate": _rate(len(serialization_mismatch_ids), total),
+            "repair_segments": repair_segments,
+            "oracle_harmful_segments": oracle_harmful_segments,
+            "detector_trigger_count": repair_trigger_count,
+            "detector_trigger_rate": (
+                repair_trigger_count / repair_segments if repair_segments else None
+            ),
+            "repair_rate": (
+                repair_trigger_count / repair_segments if repair_segments else None
+            ),
+            "repair_success_count": repair_success_count,
+            "repair_success_rate": (
+                repair_success_count / repair_trigger_count
+                if repair_trigger_count
+                else None
+            ),
+            "repair_segment_success_rate": (
+                repair_success_count / oracle_harmful_segments
+                if oracle_harmful_segments
+                else None
+            ),
+            "c2kv_wrong_repair_correct": c2kv_wrong_repair_correct,
+            "c2kv_wrong_repair_wrong": c2kv_wrong_repair_wrong,
+            "c2kv_correct_repair_wrong": c2kv_correct_repair_wrong,
             "full_history_kv_tokens": original,
             "physical_history_kv_tokens": effective,
             "c2kv_gist_tokens": c2kv_gist,
@@ -300,12 +342,12 @@ def write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
     lines = [
         "# BFCL History C2KV KV-Repair Sweep",
         "",
-        "| Method | BFCL Acc | Correct | Examples | Errors | History KV Compression | E2E Work Ratio | Executed Drift | State Drift | Avg Chat-only s | Avg Observed E2E s | Plan Build s | Avg E2E+Plan s |",
+        "| Method | BFCL Acc | Correct | Examples | Errors | Repair Rate | Repair Segment Success | C2KV Wrong -> Repair Correct | History KV Compression | E2E Work Ratio | Executed Drift | State Drift | Avg Observed E2E s |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {method} | {acc} | {correct} | {num_examples} | {errors} | {comp} | {work} | {edrift} | {sdrift} | {lat} | {e2e_lat} | {plan_s} | {e2e_plan_lat} |".format(
+            "| {method} | {acc} | {correct} | {num_examples} | {errors} | {repair_rate} | {repair_success} | {w2c} | {comp} | {work} | {edrift} | {sdrift} | {e2e_lat} |".format(
                 method=row["method"],
                 acc=(
                     f"{float(row['bfcl_accuracy']):.4f}"
@@ -315,6 +357,17 @@ def write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
                 correct=row["correct_count"] if row["correct_count"] is not None else "-",
                 num_examples=row["num_examples"],
                 errors=row["errors"],
+                repair_rate=(
+                    f"{row['repair_rate']:.4f}"
+                    if row["repair_rate"] is not None
+                    else "-"
+                ),
+                repair_success=(
+                    f"{row['repair_segment_success_rate']:.4f}"
+                    if row["repair_segment_success_rate"] is not None
+                    else "-"
+                ),
+                w2c=row["c2kv_wrong_repair_correct"],
                 comp=(
                     f"{row['history_kv_compression']:.4f}x"
                     if row["history_kv_compression"] is not None
@@ -335,20 +388,9 @@ def write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
                     if row["state_drift_rate"] is not None
                     else "-"
                 ),
-                lat=(
-                    f"{row['avg_chat_latency_sec']:.4f}"
-                    if row["avg_chat_latency_sec"] is not None
-                    else "-"
-                ),
                 e2e_lat=(
                     f"{row['avg_episode_e2e_observed_seconds']:.4f}"
                     if row["avg_episode_e2e_observed_seconds"] is not None
-                    else "-"
-                ),
-                plan_s=f"{row['plan_build_seconds']:.4f}",
-                e2e_plan_lat=(
-                    f"{row['avg_episode_e2e_observed_with_plan_seconds']:.4f}"
-                    if row["avg_episode_e2e_observed_with_plan_seconds"] is not None
                     else "-"
                 ),
             )
