@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,18 @@ def _mean(values: list[float]) -> float | None:
 
 def _rate(count: int, total: int) -> float | None:
     return count / total if total else None
+
+
+def _positive_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return int(number)
 
 
 def _find_score(root: Path) -> dict[str, Any]:
@@ -139,10 +152,23 @@ def summarize(run_root: Path, arms: list[str]) -> list[dict[str, Any]]:
         repair_extract_work = sum(
             int(row.get("repair_extract_recomputed_tokens") or 0) for row in metrics
         )
-        query_prefill_work = sum(
-            int(row.get("query_prefill_tokens") or row.get("chat_prompt_tokens") or 0)
-            for row in metrics
-        )
+        query_prefill_work = 0
+        query_cache_report_missing = 0
+        kv_runtime_report_missing = 0
+        peak_values: list[int] = []
+        for row in metrics:
+            if "query_prefill_tokens" in row:
+                query_prefill_work += int(row.get("query_prefill_tokens") or 0)
+            else:
+                query_cache_report_missing += 1
+            query_cache_report_missing += int(row.get("chat_cache_report_missing") or 0)
+            kv_runtime_report_missing += int(row.get("kv_runtime_report_missing") or 0)
+            peak = row.get("peak_physical_kv_tokens")
+            if peak is None:
+                peak = row.get("kv_peak_resident_tokens")
+            peak_int = _positive_int(peak)
+            if peak_int is not None:
+                peak_values.append(peak_int)
         decode_work = sum(
             int(row.get("decode_tokens") or row.get("chat_completion_tokens") or 0)
             for row in metrics
@@ -254,11 +280,16 @@ def summarize(run_root: Path, arms: list[str]) -> list[dict[str, Any]]:
             "legacy_history_original_tokens": legacy_original,
             "legacy_history_effective_tokens": legacy_effective,
             "history_kv_compression": original / effective if effective else None,
-            "peak_physical_kv_tokens": effective,
-            "peak_kv_compression": original / effective if effective else None,
+            "peak_physical_kv_tokens": max(peak_values) if peak_values else None,
+            "peak_kv_compression": (
+                original / max(peak_values) if peak_values else None
+            ),
             "c2kv_extract_recomputed_tokens": c2kv_extract_work,
             "repair_extract_recomputed_tokens": repair_extract_work,
             "query_prefill_tokens": query_prefill_work,
+            "query_prefill_tokens_source": "sglang_runtime_cached_tokens",
+            "query_cache_report_missing": query_cache_report_missing,
+            "kv_runtime_report_missing": kv_runtime_report_missing,
             "decode_tokens": decode_work,
             "total_actual_recomputed_tokens": total_actual_work,
             "e2e_token_work_ratio": None,

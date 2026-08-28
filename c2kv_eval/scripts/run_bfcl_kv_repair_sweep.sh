@@ -28,6 +28,7 @@ DEVICES="${DEVICES:-4,5,6}"
 PORTS="${PORTS:-34200,34201,34202}"
 ARMS="${ARMS:-full,c2kv,d_sham_mech,d_sham_neutral,d_corr,d_corr_recompute,d_corr_all}"
 CLEAN_OUTPUT="${CLEAN_OUTPUT:-1}"
+C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION:-0.06}"
 
 SERVER_PIDS=()
 RUNNER_PIDS=()
@@ -129,6 +130,7 @@ start_server() {
       --attention-backend ascend \
       --tool-call-parser qwen25 \
       --enable-c2kv \
+      --c2kv-pool-fraction "${C2KV_POOL_FRACTION}" \
       --dtype bfloat16 \
       --mem-fraction-static "${MEM_FRACTION_STATIC:-0.55}" \
       --host 127.0.0.1 \
@@ -288,6 +290,7 @@ log_info "RUN_ROOT=${RUN_ROOT}"
 log_info "ARMS=${ARMS}"
 log_info "CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL}"
 log_info "DEVICES=${DEVICES} PORTS=${PORTS}"
+log_info "C2KV_POOL_FRACTION=${C2KV_POOL_FRACTION}"
 log_info "IDS_PATH=${IDS_PATH}"
 log_info "PLAN_PATH=${PLAN_PATH}"
 

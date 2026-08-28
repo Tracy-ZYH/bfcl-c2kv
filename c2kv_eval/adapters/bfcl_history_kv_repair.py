@@ -405,9 +405,15 @@ class KVRepairRunner(HistoryDriftRunner):
                     f"d_sham_neutral token length mismatch: {len(sham_ids)} != {span_len}"
                 )
             return [int(x) for x in sham_ids]
-        if len(self.neutral_token_ids) < span_len:
-            raise RuntimeError("neutral corpus does not have enough tokens")
-        return self.neutral_token_ids[:span_len]
+        if not self.neutral_token_ids:
+            raise RuntimeError("neutral corpus does not contain any tokens")
+        if len(self.neutral_token_ids) >= span_len:
+            return self.neutral_token_ids[:span_len]
+
+        repeats = (span_len + len(self.neutral_token_ids) - 1) // len(
+            self.neutral_token_ids
+        )
+        return (self.neutral_token_ids * repeats)[:span_len]
 
     def _build_request_messages(
         self,
@@ -1080,8 +1086,25 @@ def run(args: argparse.Namespace) -> None:
         "chat_prompt_tokens": sum(
             int(row.get("chat_prompt_tokens") or 0) for row in metric_rows
         ),
+        "chat_cached_tokens": sum(
+            int(row.get("chat_cached_tokens") or 0) for row in metric_rows
+        ),
+        "chat_recomputed_prompt_tokens": sum(
+            int(row.get("chat_recomputed_prompt_tokens") or 0)
+            for row in metric_rows
+        ),
+        "chat_cache_report_missing": sum(
+            int(row.get("chat_cache_report_missing") or 0) for row in metric_rows
+        ),
         "chat_completion_tokens": sum(
             int(row.get("chat_completion_tokens") or 0) for row in metric_rows
+        ),
+        "kv_peak_resident_tokens": max(
+            [int(row.get("kv_peak_resident_tokens") or 0) for row in metric_rows]
+            or [0]
+        ),
+        "kv_runtime_report_missing": sum(
+            int(row.get("kv_runtime_report_missing") or 0) for row in metric_rows
         ),
         "c2kv_extract_recomputed_tokens": sum(
             int(row.get("c2kv_extract_recomputed_tokens") or 0)

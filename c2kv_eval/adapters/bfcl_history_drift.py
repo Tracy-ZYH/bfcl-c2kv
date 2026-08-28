@@ -83,6 +83,49 @@ def _post_json(base_url: str, path: str, payload: dict[str, Any], timeout: int) 
     return response.json()
 
 
+def _actual_cached_tokens_from_response(response: dict[str, Any]) -> int | None:
+    usage = response.get("usage") or {}
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    if isinstance(prompt_details, dict) and "cached_tokens" in prompt_details:
+        try:
+            return int(prompt_details.get("cached_tokens") or 0)
+        except Exception:
+            return 0
+
+    sglext = response.get("sglext") or {}
+    cached_details = sglext.get("cached_tokens_details") or {}
+    if isinstance(cached_details, dict) and cached_details:
+        total = 0
+        seen = False
+        for key in ("device", "host", "storage"):
+            if key in cached_details:
+                seen = True
+                try:
+                    total += int(cached_details.get(key) or 0)
+                except Exception:
+                    pass
+        if seen:
+            return total
+
+    meta_info = response.get("meta_info") or {}
+    if isinstance(meta_info, dict) and "cached_tokens" in meta_info:
+        try:
+            return int(meta_info.get("cached_tokens") or 0)
+        except Exception:
+            return 0
+    return None
+
+
+def _kv_runtime_stats_from_response(response: dict[str, Any]) -> dict[str, Any] | None:
+    metadata = response.get("metadata") or {}
+    runtime = metadata.get("sglang_runtime")
+    if isinstance(runtime, dict):
+        return runtime
+    meta_info = response.get("meta_info") or {}
+    runtime = meta_info.get("kv_runtime_stats") if isinstance(meta_info, dict) else None
+    return runtime if isinstance(runtime, dict) else None
+
+
 def _message_text(message: dict[str, Any]) -> str:
     content = message.get("content", "")
     if isinstance(content, str):
@@ -255,7 +298,12 @@ class DriftStats:
     repair_extract_seconds: float = 0.0
     tool_execution_seconds: float = 0.0
     chat_prompt_tokens: int = 0
+    chat_cached_tokens: int = 0
+    chat_recomputed_prompt_tokens: int = 0
+    chat_cache_report_missing: int = 0
     chat_completion_tokens: int = 0
+    kv_peak_resident_tokens: int = 0
+    kv_runtime_report_missing: int = 0
     c2kv_extract_recomputed_tokens: int = 0
     repair_extract_recomputed_tokens: int = 0
     original_history_tokens: int = 0
@@ -293,21 +341,29 @@ class DriftStats:
                 4,
             ),
             "chat_prompt_tokens": self.chat_prompt_tokens,
+            "chat_cached_tokens": self.chat_cached_tokens,
+            "chat_recomputed_prompt_tokens": self.chat_recomputed_prompt_tokens,
+            "chat_cache_report_missing": self.chat_cache_report_missing,
             "chat_completion_tokens": self.chat_completion_tokens,
+            "kv_peak_resident_tokens": self.kv_peak_resident_tokens,
+            "kv_runtime_report_missing": self.kv_runtime_report_missing,
             "c2kv_extract_recomputed_tokens": self.c2kv_extract_recomputed_tokens,
             "repair_extract_recomputed_tokens": self.repair_extract_recomputed_tokens,
-            "query_prefill_tokens": self.chat_prompt_tokens,
+            "query_prefill_tokens": self.chat_recomputed_prompt_tokens,
             "decode_tokens": self.chat_completion_tokens,
             "total_actual_recomputed_tokens": (
                 self.c2kv_extract_recomputed_tokens
                 + self.repair_extract_recomputed_tokens
-                + self.chat_prompt_tokens
+                + self.chat_recomputed_prompt_tokens
                 + self.chat_completion_tokens
             ),
             "history_original_tokens": self.original_history_tokens,
             "history_effective_tokens": self.effective_history_tokens,
             "canonical_full_history_tokens": self.canonical_full_history_tokens,
             "physical_history_kv_tokens": self.physical_history_kv_tokens,
+            "peak_physical_kv_tokens": (
+                self.kv_peak_resident_tokens if self.kv_peak_resident_tokens else None
+            ),
             "c2kv_gist_tokens": self.c2kv_gist_tokens,
             "repair_kv_tokens": self.repair_kv_tokens,
             "recomputed_raw_tokens": self.recomputed_raw_tokens,
@@ -453,6 +509,7 @@ class HistoryDriftRunner:
             "temperature": self.temperature,
             "max_completion_tokens": max_tokens,
             "chat_template_kwargs": {"enable_thinking": False},
+            "return_cached_tokens_details": True,
         }
         start = time.perf_counter()
         data = _post_json(self.base_url, "/v1/chat/completions", payload, self.timeout)
@@ -466,6 +523,26 @@ class HistoryDriftRunner:
         stats.chat_calls += 1
         stats.chat_seconds += elapsed
         usage_prompt_tokens = int(usage.get("prompt_tokens") or prompt_tokens)
+        cached_tokens = _actual_cached_tokens_from_response(data)
+        if cached_tokens is None:
+            stats.chat_cache_report_missing += 1
+            recomputed_prompt_tokens = 0
+        else:
+            cached_tokens = min(usage_prompt_tokens, max(0, int(cached_tokens)))
+            stats.chat_cached_tokens += cached_tokens
+            recomputed_prompt_tokens = max(usage_prompt_tokens - cached_tokens, 0)
+            stats.chat_recomputed_prompt_tokens += recomputed_prompt_tokens
+        runtime = _kv_runtime_stats_from_response(data)
+        if runtime is None:
+            stats.kv_runtime_report_missing += 1
+        else:
+            try:
+                stats.kv_peak_resident_tokens = max(
+                    stats.kv_peak_resident_tokens,
+                    int(runtime.get("kv_resident_tokens") or 0),
+                )
+            except Exception:
+                stats.kv_runtime_report_missing += 1
         usage_completion_tokens = int(
                 usage.get("completion_tokens")
                 or len(self.tokenizer.encode(text, add_special_tokens=False))
@@ -475,6 +552,9 @@ class HistoryDriftRunner:
         return text, message, elapsed, {
             "prompt_tokens": usage_prompt_tokens,
             "completion_tokens": usage_completion_tokens,
+            "cached_tokens": cached_tokens,
+            "recomputed_prompt_tokens": recomputed_prompt_tokens,
+            "kv_runtime_stats": runtime,
         }
 
     def _decode(self, text: str) -> list[str]:
