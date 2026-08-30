@@ -838,6 +838,15 @@ class HistoryDriftRunner:
                     execution_results=execution_results,
                     history_execution_results=history_execution_results,
                     roundtrip=roundtrip,
+                    extra=(
+                        {
+                            "repair_build_info": deepcopy(
+                                getattr(self, "_last_repair_build_info", {})
+                            )
+                        }
+                        if getattr(self, "_last_repair_build_info", None)
+                        else None
+                    ),
                 )
                 mark_first_divergence(stats, step_record)
                 if alignment_status == "missing_reference":

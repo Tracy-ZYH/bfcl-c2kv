@@ -26,9 +26,13 @@ SHARE_PLAN_MODULE="${SHARE_PLAN_MODULE:-/home/zhuyuhan/project/c2kv/share/d-kv-r
 
 DEVICES="${DEVICES:-4,5,6}"
 PORTS="${PORTS:-34200,34201,34202}"
-ARMS="${ARMS:-full,c2kv,d_sham_mech,d_sham_neutral,d_corr,d_corr_recompute,d_corr_all}"
+ARMS="${ARMS:-full,c2kv,d_sham_mech,hint_only,d_corr_w1,d_corr_w2,d_corr_w4,d_corr_w2_hint,d_corr_w2_oracle_location_hint,d_corr_replace_w2,d_corr_recompute_w2,d_corr_all,raw_all_replace}"
 CLEAN_OUTPUT="${CLEAN_OUTPUT:-1}"
 C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION:-0.06}"
+REPAIR_WINDOW="${REPAIR_WINDOW:-1}"
+REPAIR_TRIGGER="${REPAIR_TRIGGER:-oracle}"
+MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-4096}"
+FLUSH_CACHE_BETWEEN_ARMS="${FLUSH_CACHE_BETWEEN_ARMS:-1}"
 
 SERVER_PIDS=()
 RUNNER_PIDS=()
@@ -121,6 +125,9 @@ start_server() {
     https_proxy='' \
     HTTP_PROXY='' \
     HTTPS_PROXY='' \
+    SGLANG_ENABLE_C2KV_LOGGING="${SGLANG_ENABLE_C2KV_LOGGING:-0}" \
+    C2KV_DEBUG_POSITIONS="${C2KV_DEBUG_POSITIONS:-0}" \
+    C2KV_DEBUG_ASCEND_ATTN="${C2KV_DEBUG_ASCEND_ATTN:-0}" \
     ASCEND_RT_VISIBLE_DEVICES="${device}" \
     exec "${SGLANG_PYTHON}" -m sglang.launch_server \
       --model-path "${MODEL_PATH}" \
@@ -153,6 +160,14 @@ wait_health() {
   return 1
 }
 
+flush_server_cache() {
+  local port="$1"
+  if [ "${FLUSH_CACHE_BETWEEN_ARMS}" != "1" ]; then
+    return 0
+  fi
+  curl --noproxy '*' -fsS -X POST "http://127.0.0.1:${port}/flush_cache?timeout=60" >/dev/null
+}
+
 run_arm() {
   local arm="$1"
   local slot="$2"
@@ -160,6 +175,7 @@ run_arm() {
   local arm_root="${RUN_ROOT}/${arm}"
   mkdir -p "${arm_root}/result" "${arm_root}/score" "${arm_root}/logs"
   log_info "runner start arm=${arm} slot=${slot} port=${port}"
+  flush_server_cache "${port}"
   (
     cd "${ROOT}"
     "${BFCL_PYTHON}" -m c2kv_eval.adapters.bfcl_history_kv_repair \
@@ -175,7 +191,9 @@ run_arm() {
       --tokenizer-path "${TOKENIZER_PATH}" \
       --ratio "${RATIO}" \
       --checkpoint-interval "${CHECKPOINT_INTERVAL}" \
-      --repair-trigger oracle \
+      --repair-window "${REPAIR_WINDOW}" \
+      --repair-trigger "${REPAIR_TRIGGER}" \
+      --max-completion-tokens "${MAX_COMPLETION_TOKENS}" \
       --result-dir "${arm_root}/result" \
       --details-path "${arm_root}/logs/details.jsonl" \
       --metrics-path "${arm_root}/logs/metrics.jsonl" \
@@ -291,6 +309,9 @@ log_info "ARMS=${ARMS}"
 log_info "CHECKPOINT_INTERVAL=${CHECKPOINT_INTERVAL}"
 log_info "DEVICES=${DEVICES} PORTS=${PORTS}"
 log_info "C2KV_POOL_FRACTION=${C2KV_POOL_FRACTION}"
+log_info "REPAIR_WINDOW=${REPAIR_WINDOW}"
+log_info "MAX_COMPLETION_TOKENS=${MAX_COMPLETION_TOKENS}"
+log_info "FLUSH_CACHE_BETWEEN_ARMS=${FLUSH_CACHE_BETWEEN_ARMS}"
 log_info "IDS_PATH=${IDS_PATH}"
 log_info "PLAN_PATH=${PLAN_PATH}"
 

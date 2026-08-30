@@ -325,10 +325,12 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         self.logistic_detector_features_csv = args.logistic_detector_features_csv
         self.logistic_detector_threshold = float(args.logistic_detector_threshold)
         self.logistic_detector_model = None
+        self.detector_signal_name = args.detector_signal_name
+        self.detector_signal_threshold = float(args.detector_signal_threshold)
         self.rollback_backend = args.rollback_backend
         self.collect_candidate_detector_signals = bool(
             args.collect_candidate_detector_signals
-        ) or self.verifier == "logistic"
+        ) or self.verifier in {"logistic", "feature_signal"}
         self.candidate_logprobs_top_k = int(args.candidate_logprobs_top_k)
         self.candidate_hidden_readout = bool(args.candidate_hidden_readout)
         self.candidate_attention_summary = bool(args.candidate_attention_summary)
@@ -1501,6 +1503,40 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "logistic_detector_feature_count": len(model["features"]),
             "logistic_detector_train_rows": model["train_rows"],
             "logistic_detector_train_episodes": model["train_episodes"],
+            "rule_detector_trigger": row.get("rule_detector_trigger"),
+            "rule_detector_max_risk": row.get("rule_detector_max_risk"),
+            "rule_detector_reason": None,
+        }
+
+    def _feature_signal_detector(
+        self,
+        segment_infos: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not self.detector_signal_name:
+            raise RuntimeError(
+                "verifier=feature_signal requires --detector-signal-name"
+            )
+        row = self._segment_detector_feature_row(segment_infos)
+        score = self._detector_score_for_feature(
+            self.detector_signal_name,
+            row.get(self.detector_signal_name),
+        )
+        triggered = (
+            False
+            if score is None
+            else score >= self.detector_signal_threshold
+        )
+        return {
+            "detector": "feature_signal",
+            "detector_trigger": triggered,
+            "detector_reason": (
+                f"{self.detector_signal_name}>={self.detector_signal_threshold:g}"
+                if triggered
+                else "feature_signal_safe"
+            ),
+            "detector_signal_name": self.detector_signal_name,
+            "detector_signal_score": score,
+            "detector_signal_threshold": self.detector_signal_threshold,
             "rule_detector_trigger": row.get("rule_detector_trigger"),
             "rule_detector_max_risk": row.get("rule_detector_max_risk"),
             "rule_detector_reason": None,
@@ -2907,6 +2943,8 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                     detector_debug = self._rule_detector(segment_infos)
                 elif self.verifier == "logistic":
                     detector_debug = self._logistic_detector(segment_infos)
+                elif self.verifier == "feature_signal":
+                    detector_debug = self._feature_signal_detector(segment_infos)
                 else:
                     detector_debug = {
                         "detector": self.verifier,
@@ -3445,6 +3483,15 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             "logistic_detector_threshold": detector_debug.get(
                                 "logistic_detector_threshold"
                             ),
+                            "detector_signal_name": detector_debug.get(
+                                "detector_signal_name"
+                            ),
+                            "detector_signal_score": detector_debug.get(
+                                "detector_signal_score"
+                            ),
+                            "detector_signal_threshold": detector_debug.get(
+                                "detector_signal_threshold"
+                            ),
                             "logistic_detector_feature_count": detector_debug.get(
                                 "logistic_detector_feature_count"
                             ),
@@ -3720,6 +3767,15 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         ),
                         "logistic_detector_feature_count": detector_debug.get(
                             "logistic_detector_feature_count"
+                        ),
+                        "detector_signal_name": detector_debug.get(
+                            "detector_signal_name"
+                        ),
+                        "detector_signal_score": detector_debug.get(
+                            "detector_signal_score"
+                        ),
+                        "detector_signal_threshold": detector_debug.get(
+                            "detector_signal_threshold"
                         ),
                         "logistic_detector_train_rows": detector_debug.get(
                             "logistic_detector_train_rows"
@@ -4156,7 +4212,13 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         test_case: dict[str, Any],
         stats: DriftStats,
     ) -> tuple[list[list[str]], dict[str, Any]]:
-        if self.verifier in {"oracle", "heuristic", "rule", "logistic"}:
+        if self.verifier in {
+            "oracle",
+            "heuristic",
+            "rule",
+            "logistic",
+            "feature_signal",
+        }:
             return self._run_sample_checkpoint_impl_oracle_multistep(
                 test_case,
                 stats,
@@ -4164,8 +4226,9 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         if self.checkpoint_interval != 1:
             raise NotImplementedError(
                 "KV/readout checkpoint verification currently supports "
-                "checkpoint_interval=1 only. Run verifier=oracle/heuristic for true "
-                "multi-step rollback with interval=1/2/4."
+                "checkpoint_interval=1 only. Run verifier=oracle/heuristic/rule/"
+                "logistic/feature_signal for true multi-step rollback with "
+                "interval=1/2/3/4."
             )
         initial_config = test_case.get("initial_config", {})
         involved_classes = test_case["involved_classes"]
@@ -4706,6 +4769,8 @@ def run(args: argparse.Namespace) -> None:
         "rollback_policy": args.rollback_policy,
         "rollback_depth": args.rollback_depth,
         "rule_detector_threshold": args.rule_detector_threshold,
+        "detector_signal_name": args.detector_signal_name,
+        "detector_signal_threshold": args.detector_signal_threshold,
         "rollback_backend": args.rollback_backend,
         "verify_threshold": args.verify_threshold,
         "verify_layers": args.verify_layers,
@@ -4789,6 +4854,7 @@ def parse_args() -> argparse.Namespace:
             "heuristic",
             "rule",
             "logistic",
+            "feature_signal",
         ],
         default="oracle",
     )
@@ -4809,6 +4875,24 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Logistic detector threshold. Negative means choose best-F1 "
             "threshold on the calibration split."
+        ),
+    )
+    parser.add_argument(
+        "--detector-signal-name",
+        default="",
+        help=(
+            "Single aggregated detector feature to use with "
+            "verifier=feature_signal, e.g. max_risk_score."
+        ),
+    )
+    parser.add_argument(
+        "--detector-signal-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Score threshold for verifier=feature_signal. Low-is-bad "
+            "features are compared after the same sign flip used by the "
+            "offline detector benchmark."
         ),
     )
     parser.add_argument(

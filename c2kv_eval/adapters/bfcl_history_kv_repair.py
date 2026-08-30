@@ -48,10 +48,20 @@ REPAIR_ARMS = {
     "full",
     "c2kv",
     "d_sham_mech",
+    "hint_only",
     "d_sham_neutral",
     "d_corr",
+    "d_corr_w1",
+    "d_corr_w2",
+    "d_corr_w4",
+    "d_corr_w2_hint",
+    "d_corr_w2_oracle_location_hint",
+    "d_corr_replace_w2",
     "d_corr_recompute",
+    "d_corr_recompute_w2",
     "d_corr_all",
+    "raw_all_replace",
+    "raw_all_replace_direct",
 }
 
 
@@ -87,6 +97,9 @@ class KVRepairRunner(HistoryDriftRunner):
         self._active_tools: list[dict[str, Any]] = []
         self._repair_enabled_for_current_step = True
         self._repair_target_history_index: int | None = None
+        self._repair_window_arg = args.repair_window
+        self._active_oracle_bad_step: int | None = None
+        self._last_repair_build_info: dict[str, Any] = {}
 
     def run_sample(self, test_case: dict[str, Any]) -> dict[str, Any]:
         self._active_tools = _tool_payload(test_case["function"])
@@ -108,6 +121,35 @@ class KVRepairRunner(HistoryDriftRunner):
         successful = [
             seg for seg in triggered if seg.get("repair_segment_success") is True
         ]
+        start_state_correct = [
+            seg for seg in triggered if seg.get("segment_start_state_matches_reference")
+        ]
+        start_state_drifted = [
+            seg
+            for seg in triggered
+            if seg.get("segment_start_state_matches_reference") is False
+        ]
+        start_state_correct_success = [
+            seg for seg in start_state_correct if seg.get("repair_segment_success") is True
+        ]
+        start_state_drifted_success = [
+            seg for seg in start_state_drifted if seg.get("repair_segment_success") is True
+        ]
+        wrong_to_correct = sum(
+            int(seg.get("c2kv_wrong_repair_correct") or 0) for seg in segments
+        )
+        correct_to_wrong = sum(
+            int(seg.get("c2kv_correct_repair_wrong") or 0) for seg in segments
+        )
+        changed_action = sum(
+            int(seg.get("repair_changed_action_count") or 0) for seg in segments
+        )
+        changed_first = sum(
+            int(seg.get("repair_changed_first_token_count") or 0) for seg in segments
+        )
+        repaired_steps = sum(
+            int(seg.get("segment_length") or 0) for seg in triggered
+        )
         return {
             "repair_segments": total,
             "oracle_harmful_segments": len(harmful),
@@ -121,14 +163,30 @@ class KVRepairRunner(HistoryDriftRunner):
             "repair_segment_success_rate": (
                 len(successful) / len(harmful) if harmful else None
             ),
-            "c2kv_wrong_repair_correct": sum(
-                int(seg.get("c2kv_wrong_repair_correct") or 0) for seg in segments
-            ),
+            "c2kv_wrong_repair_correct": wrong_to_correct,
             "c2kv_wrong_repair_wrong": sum(
                 int(seg.get("c2kv_wrong_repair_wrong") or 0) for seg in segments
             ),
-            "c2kv_correct_repair_wrong": sum(
-                int(seg.get("c2kv_correct_repair_wrong") or 0) for seg in segments
+            "c2kv_correct_repair_wrong": correct_to_wrong,
+            "net_repair_gain": wrong_to_correct - correct_to_wrong,
+            "repair_changed_action_count": changed_action,
+            "repair_changed_action_rate": (
+                changed_action / repaired_steps if repaired_steps else None
+            ),
+            "repair_changed_first_token_count": changed_first,
+            "repair_changed_first_token_rate": (
+                changed_first / repaired_steps if repaired_steps else None
+            ),
+            "repaired_step_count": repaired_steps,
+            "repair_success_when_start_state_correct": (
+                len(start_state_correct_success) / len(start_state_correct)
+                if start_state_correct
+                else None
+            ),
+            "repair_success_when_start_state_already_drifted": (
+                len(start_state_drifted_success) / len(start_state_drifted)
+                if start_state_drifted
+                else None
             ),
             "speculative_terminal_discarded_count": sum(
                 int(bool(seg.get("speculative_terminal_discarded")))
@@ -247,13 +305,15 @@ class KVRepairRunner(HistoryDriftRunner):
     def _full_prompt_token_ids(
         self,
         messages: Sequence[dict[str, Any]],
+        *,
+        add_generation_prompt: bool = False,
     ) -> list[int]:
         try:
             encoded = self.tokenizer.apply_chat_template(
                 list(messages),
                 tools=list(self._active_tools),
                 tokenize=True,
-                add_generation_prompt=False,
+                add_generation_prompt=add_generation_prompt,
                 enable_thinking=False,
             )
         except Exception as exc:
@@ -278,22 +338,28 @@ class KVRepairRunner(HistoryDriftRunner):
     def _full_history_unit_layout(
         self,
         units: Sequence[Sequence[dict[str, Any]]],
+        current_messages: Sequence[dict[str, Any]] | None = None,
     ) -> tuple[list[int], list[int], list[int]]:
         """Locate each role-preserving history unit in the real Full prompt.
 
         The raw repair slice must come from the same token coordinates used by
-        the OpenAI chat endpoint: system/tool template first, then the original
-        role-preserving completed history.  This intentionally does not reuse
-        the C2KV user-document wrapper, because raw repair KV must be the KV
-        that the target span would have in the exact Full context.
+        the OpenAI chat endpoint: system/tool template first, the original
+        role-preserving completed history, then the current turn and assistant
+        generation prompt. This intentionally does not reuse the C2KV
+        user-document wrapper, because raw repair KV must be the KV that the
+        target span would have in the exact Full context.
         """
 
-        full_messages = [
+        completed_messages = [
             deepcopy(message)
             for unit in units
             for message in unit
         ]
-        full_tokens = self._full_prompt_token_ids(full_messages)
+        full_messages = completed_messages + deepcopy(list(current_messages or []))
+        full_tokens = self._full_prompt_token_ids(
+            full_messages,
+            add_generation_prompt=True,
+        )
         starts: list[int] = []
         ends: list[int] = []
         prefix_messages: list[dict[str, Any]] = []
@@ -415,11 +481,132 @@ class KVRepairRunner(HistoryDriftRunner):
         )
         return (self.neutral_token_ids * repeats)[:span_len]
 
+    def _arm_config(self, effective_arm: str) -> dict[str, Any]:
+        config = {
+            "operation": "append",
+            "repair_kind": "none",
+            "window": self._repair_window_arg,
+            "hint": False,
+            "oracle_location_hint": False,
+        }
+        if effective_arm in {"c2kv", "d_sham_mech"}:
+            config["repair_kind"] = "none"
+        elif effective_arm == "hint_only":
+            config.update({"repair_kind": "none", "hint": True})
+        elif effective_arm == "d_sham_neutral":
+            config.update({"repair_kind": "neutral", "window": "1"})
+        elif effective_arm in {"d_corr", "d_corr_w1"}:
+            config.update({"repair_kind": "raw", "window": "1"})
+        elif effective_arm in {"d_corr_w2", "d_corr_w2_hint"}:
+            config.update({
+                "repair_kind": "raw",
+                "window": "2",
+                "hint": effective_arm.endswith("_hint"),
+            })
+        elif effective_arm == "d_corr_w2_oracle_location_hint":
+            config.update({
+                "repair_kind": "raw",
+                "window": "2",
+                "hint": True,
+                "oracle_location_hint": True,
+            })
+        elif effective_arm == "d_corr_w4":
+            config.update({"repair_kind": "raw", "window": "4"})
+        elif effective_arm == "d_corr_all":
+            config.update({"repair_kind": "raw", "window": "all"})
+        elif effective_arm == "d_corr_replace_w2":
+            config.update({
+                "operation": "replace",
+                "repair_kind": "raw",
+                "window": "2",
+            })
+        elif effective_arm in {"d_corr_recompute", "d_corr_recompute_w2"}:
+            config.update({
+                "operation": "recompute",
+                "repair_kind": "raw",
+                "window": "2",
+            })
+        elif effective_arm in {"raw_all_replace", "raw_all_replace_direct"}:
+            config.update({
+                "operation": "replace",
+                "repair_kind": "raw",
+                "window": "all",
+            })
+        else:
+            raise RuntimeError(f"Unsupported KV repair arm: {effective_arm}")
+        return config
+
+    @staticmethod
+    def _ordered_roles(unit: Sequence[dict[str, Any]]) -> list[str]:
+        roles: list[str] = []
+        for message in unit:
+            role = str(message.get("role") or "")
+            if role and role not in roles:
+                roles.append(role)
+        return roles
+
+    def _recent_repair_indices(
+        self,
+        *,
+        num_docs: int,
+        latest_index: int,
+        window: str,
+    ) -> list[int]:
+        if num_docs <= 0:
+            return []
+        latest_index = min(max(0, latest_index), num_docs - 1)
+        if window == "all":
+            return list(range(num_docs))
+        try:
+            width = int(window)
+        except Exception as exc:
+            raise RuntimeError(f"Invalid repair window: {window}") from exc
+        if width <= 0:
+            raise RuntimeError(f"repair window must be positive, got {window}")
+        start = max(0, latest_index - width + 1)
+        return list(range(start, latest_index + 1))
+
+    def _repair_hint(
+        self,
+        *,
+        target_metadata: Sequence[dict[str, Any]],
+        include_oracle_location: bool,
+    ) -> str:
+        restored = "; ".join(
+            (
+                f"H{meta['history_index']}: "
+                f"{'+'.join(meta.get('roles') or [])}, "
+                f"{meta.get('raw_token_count', 0)} raw-KV tokens"
+            )
+            for meta in target_metadata
+        )
+        lines = [
+            "Recovery note: the current speculative segment was detected as inconsistent with the execution history.",
+            (
+                "Raw KV memory for history units "
+                f"{[meta['history_index'] for meta in target_metadata]} "
+                "has been restored and attached to the compressed history."
+            ),
+            f"Restored units contain: {restored}.",
+            (
+                "Re-evaluate the current tool call using the restored history, "
+                "especially restored assistant/tool observations."
+            ),
+            "Do not assume the previous candidate action is correct.",
+        ]
+        if include_oracle_location and self._active_oracle_bad_step is not None:
+            lines.append(
+                "The inconsistency was first observed at speculative step "
+                f"S{self._active_oracle_bad_step}."
+            )
+        return "\n".join(lines)
+
     def _build_request_messages(
         self,
         history_messages: Sequence[dict[str, Any]],
         stats: DriftStats,
     ) -> list[dict[str, Any]]:
+        self._last_repair_build_info = {}
         latest_query_index = _latest_user_query_index(history_messages)
         completed = list(history_messages[:latest_query_index])
         current = deepcopy(list(history_messages[latest_query_index:]))
@@ -438,31 +625,217 @@ class KVRepairRunner(HistoryDriftRunner):
 
         texts = [_render_history_unit(unit) for unit in units]
         doc_ids = [self._unit_token_ids(text) for text in texts]
-        full_prompt_ids, starts, ends = self._full_history_unit_layout(units)
+        full_prompt_ids, starts, ends = self._full_history_unit_layout(
+            units,
+            current_messages=current,
+        )
         doc_lens = [end - start for start, end in zip(starts, ends)]
         canonical_full_history_tokens = sum(doc_lens)
         stats.canonical_full_history_tokens += canonical_full_history_tokens
 
         sample_id = getattr(stats, "sample_id", "") or getattr(stats, "id", "")
         plan = self._plan_for(sample_id, len(units), doc_lens)
-        k_star = int(plan.get("k_star", (len(units) - 1) // 2))
+        latest_index = int(plan.get("k_star", (len(units) - 1)))
+        config = self._arm_config(effective_arm)
+        target_indices = self._recent_repair_indices(
+            num_docs=len(units),
+            latest_index=latest_index,
+            window=str(config["window"]),
+        )
+        target_set = set(target_indices)
+        anchor_index = target_indices[0] if target_indices else latest_index
+
+        if (
+            effective_arm in {"raw_all_replace", "raw_all_replace_direct"}
+            and config["operation"] == "replace"
+            and config["repair_kind"] == "raw"
+            and target_indices == list(range(len(units)))
+        ):
+            history_start = starts[0]
+            history_end = ends[-1]
+            history_len = history_end - history_start
+            if history_len != canonical_full_history_tokens:
+                raise RuntimeError(
+                    "raw_all_replace full-history span is not contiguous: "
+                    f"span_len={history_len}, "
+                    f"canonical_full_history_tokens={canonical_full_history_tokens}"
+                )
+
+            repair = self._extract_repair(
+                input_ids=full_prompt_ids[:history_end],
+                span_start=history_start,
+                span_end=history_end,
+                position_offset=0,
+                repair_mode=effective_arm,
+                source_doc_index=None,
+                stats=stats,
+            )
+            token_len = int(repair["token_len"])
+            if token_len != history_len:
+                raise RuntimeError(
+                    "raw_all_replace full-history repair length mismatch: "
+                    f"requested={history_len}, injected={token_len}"
+                )
+            position_start = int(repair.get("position_start", history_start))
+            position_end = int(repair.get("position_end", history_end))
+            if position_start != history_start or position_end != history_end:
+                raise RuntimeError(
+                    "raw_all_replace full-history position range mismatch: "
+                    f"expected=({history_start}, {history_end}), "
+                    f"actual=({position_start}, {position_end})"
+                )
+
+            repair_metadata = [
+                {
+                    "history_index": index,
+                    "roles": self._ordered_roles(units[index]),
+                    "raw_token_count": doc_lens[index],
+                    "absolute_position_start": starts[index],
+                    "absolute_position_end": ends[index],
+                }
+                for index in target_indices
+            ]
+            stats.original_history_tokens += canonical_full_history_tokens
+            stats.effective_history_tokens += token_len
+            stats.physical_history_kv_tokens += token_len
+            stats.repair_kv_tokens += token_len
+
+            self._last_repair_build_info = {
+                "repair_mode": effective_arm,
+                "repair_window": config["window"],
+                "repair_operation": config["operation"],
+                "uses_oracle_error_location": bool(config["oracle_location_hint"]),
+                "repair_target_indices": target_indices,
+                "repair_target_roles": [
+                    self._ordered_roles(units[index]) for index in target_indices
+                ],
+                "repair_target_metadata": repair_metadata,
+                "repair_tokens_requested": token_len,
+                "repair_tokens_injected": token_len,
+                "repair_raw_tokens": token_len,
+                "repair_physical_tokens": token_len,
+                "repair_absolute_position_ranges": [
+                    [meta["absolute_position_start"], meta["absolute_position_end"]]
+                    for meta in repair_metadata
+                ],
+                "combined_full_history_repair": True,
+                "physical_prefix_len_before": 0,
+                "physical_prefix_len_after": token_len,
+                "logical_position_before": canonical_full_history_tokens,
+                "logical_position_after": canonical_full_history_tokens,
+            }
+
+            return [
+                {
+                    "role": "user",
+                    "content": "\n".join(texts),
+                    "c2kv_repair_only_key_hashes": [repair["key_hash"]],
+                },
+                *current,
+            ]
 
         gist_records: list[ExtractRecord | None] = []
         messages: list[dict[str, Any]] = []
+        repair_keys_by_index: dict[int, list[str]] = {}
+        repair_tokens_by_index: dict[int, int] = {}
+        repair_metadata: list[dict[str, Any]] = []
+        repair_tokens = 0
+        local_physical_history_tokens = 0
 
         def should_compress_doc(index: int) -> bool:
-            if effective_arm == "d_corr_recompute" and index > k_star:
+            if config["operation"] == "replace" and index in target_set:
+                return False
+            if config["operation"] == "recompute" and index >= anchor_index:
                 return False
             return True
 
+        def build_repair_for_index(index: int) -> None:
+            nonlocal repair_tokens
+            if config["repair_kind"] == "none":
+                return
+            span_len = doc_lens[index]
+            if config["repair_kind"] == "neutral":
+                input_ids = self._neutral_ids_for(plan, span_len)
+                span_start = 0
+                span_end = span_len
+                position_offset = starts[index]
+            elif config["repair_kind"] == "raw":
+                input_ids = full_prompt_ids[: ends[index]]
+                span_start = starts[index]
+                span_end = ends[index]
+                position_offset = 0
+            else:
+                raise RuntimeError(f"Unsupported repair kind: {config['repair_kind']}")
+
+            repair = self._extract_repair(
+                input_ids=input_ids,
+                span_start=span_start,
+                span_end=span_end,
+                position_offset=position_offset,
+                repair_mode=effective_arm,
+                source_doc_index=index,
+                stats=stats,
+            )
+            token_len = int(repair["token_len"])
+            expected_len = span_len
+            if token_len != expected_len:
+                raise RuntimeError(
+                    "repair token length mismatch: "
+                    f"index={index}, requested={expected_len}, injected={token_len}"
+                )
+            repair_keys_by_index.setdefault(index, []).append(repair["key_hash"])
+            repair_tokens_by_index[index] = repair_tokens_by_index.get(index, 0) + token_len
+            repair_tokens += token_len
+            position_start = int(repair.get("position_start", starts[index]))
+            position_end = int(repair.get("position_end", ends[index]))
+            if position_start != starts[index] or position_end != ends[index]:
+                raise RuntimeError(
+                    "repair position range mismatch: "
+                    f"index={index}, expected=({starts[index]}, {ends[index]}), "
+                    f"actual=({position_start}, {position_end})"
+                )
+            repair_metadata.append(
+                {
+                    "history_index": index,
+                    "roles": self._ordered_roles(units[index]),
+                    "raw_token_count": token_len,
+                    "absolute_position_start": position_start,
+                    "absolute_position_end": position_end,
+                }
+            )
+
+        if config["operation"] == "append":
+            for index in target_indices:
+                build_repair_for_index(index)
+        elif config["operation"] == "replace":
+            for index in target_indices:
+                build_repair_for_index(index)
+        elif config["operation"] == "recompute":
+            build_repair_for_index(anchor_index)
+
         for index, (unit, text, ids) in enumerate(zip(units, texts, doc_ids)):
             if not should_compress_doc(index):
-                full_tokens = _token_count(self.tokenizer, unit)
-                stats.original_history_tokens += full_tokens
-                stats.effective_history_tokens += full_tokens
-                stats.physical_history_kv_tokens += doc_lens[index]
-                stats.recomputed_raw_tokens += doc_lens[index]
-                messages.extend(deepcopy(unit))
+                stats.original_history_tokens += doc_lens[index]
+                if index in repair_keys_by_index:
+                    raw_len = repair_tokens_by_index[index]
+                    stats.effective_history_tokens += raw_len
+                    stats.physical_history_kv_tokens += raw_len
+                    stats.repair_kv_tokens += raw_len
+                    local_physical_history_tokens += raw_len
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": text,
+                            "c2kv_repair_only_key_hashes": repair_keys_by_index[index],
+                        }
+                    )
+                else:
+                    full_tokens = _token_count(self.tokenizer, unit)
+                    stats.effective_history_tokens += full_tokens
+                    stats.physical_history_kv_tokens += doc_lens[index]
+                    stats.recomputed_raw_tokens += doc_lens[index]
+                    local_physical_history_tokens += doc_lens[index]
+                    messages.extend(deepcopy(unit))
                 gist_records.append(None)
                 continue
 
@@ -475,72 +848,80 @@ class KVRepairRunner(HistoryDriftRunner):
             stats.effective_history_tokens += gist_len
             stats.physical_history_kv_tokens += gist_len
             stats.c2kv_gist_tokens += gist_len
+            local_physical_history_tokens += gist_len
             messages.append(
                 {"role": "user", "content": text, "c2kv_key_hash": record.key_hash}
             )
             gist_records.append(record)
 
-        repair_keys: list[str] = []
-        repair_tokens = 0
-        if effective_arm in {"c2kv", "d_sham_mech"}:
-            repair_keys = []
-        elif effective_arm == "d_sham_neutral":
-            span_len = doc_lens[k_star]
-            neutral_ids = self._neutral_ids_for(plan, span_len)
-            repair = self._extract_repair(
-                input_ids=neutral_ids,
-                span_start=0,
-                span_end=span_len,
-                position_offset=starts[k_star],
-                repair_mode=effective_arm,
-                source_doc_index=k_star,
-                stats=stats,
-            )
-            repair_keys.append(repair["key_hash"])
-            repair_tokens += int(repair["token_len"])
-        elif effective_arm in {"d_corr", "d_corr_recompute"}:
-            prefix_ids = full_prompt_ids[: ends[k_star]]
-            repair = self._extract_repair(
-                input_ids=prefix_ids,
-                span_start=starts[k_star],
-                span_end=ends[k_star],
-                position_offset=0,
-                repair_mode=effective_arm,
-                source_doc_index=k_star,
-                stats=stats,
-            )
-            repair_keys.append(repair["key_hash"])
-            repair_tokens += int(repair["token_len"])
-        elif effective_arm == "d_corr_all":
-            for index, ids in enumerate(doc_ids):
-                prefix_ids = full_prompt_ids[: ends[index]]
-                repair = self._extract_repair(
-                    input_ids=prefix_ids,
-                    span_start=starts[index],
-                    span_end=ends[index],
-                    position_offset=0,
-                    repair_mode=effective_arm,
-                    source_doc_index=index,
-                    stats=stats,
-                )
-                repair_keys.append(repair["key_hash"])
-                repair_tokens += int(repair["token_len"])
-
-        if repair_keys:
-            attach_index = k_star if effective_arm == "d_corr_recompute" else len(messages) - 1
-            compressed_seen = -1
+        append_repair_keys = [
+            key_hash
+            for index in target_indices
+            for key_hash in repair_keys_by_index.get(index, [])
+        ]
+        if config["operation"] == "append" and append_repair_keys:
             target_message = None
-            for message in messages:
+            for message in reversed(messages):
                 if message.get("c2kv_key_hash"):
-                    compressed_seen += 1
-                    if compressed_seen == attach_index or effective_arm != "d_corr_recompute":
-                        target_message = message
+                    target_message = message
+                    break
             if target_message is None:
-                raise RuntimeError(f"Cannot attach repair keys for arm={effective_arm}")
-            target_message["c2kv_repair_key_hashes"] = repair_keys
+                raise RuntimeError(f"Cannot attach append repair keys for arm={effective_arm}")
+            target_message["c2kv_repair_key_hashes"] = append_repair_keys
             stats.effective_history_tokens += repair_tokens
             stats.physical_history_kv_tokens += repair_tokens
             stats.repair_kv_tokens += repair_tokens
+            local_physical_history_tokens += repair_tokens
+
+        if config["operation"] == "recompute" and anchor_index + 1 < len(units):
+            recomputed_total = sum(doc_lens[anchor_index + 1 :])
+            if recomputed_total <= 0:
+                raise RuntimeError(
+                    f"{effective_arm} expected downstream recompute tokens."
+                )
+
+        physical_before = local_physical_history_tokens
+        logical_before = canonical_full_history_tokens
+        logical_after = canonical_full_history_tokens
+        if repair_tokens and logical_before != logical_after:
+            raise RuntimeError("repair unexpectedly changed logical current position")
+
+        if config["hint"] and self._repair_enabled_for_current_step:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": self._repair_hint(
+                        target_metadata=repair_metadata,
+                        include_oracle_location=bool(config["oracle_location_hint"]),
+                    ),
+                }
+            )
+
+        self._last_repair_build_info = {
+            "repair_mode": effective_arm,
+            "repair_window": config["window"],
+            "repair_operation": config["operation"],
+            "uses_oracle_error_location": bool(config["oracle_location_hint"]),
+            "repair_target_indices": target_indices,
+            "repair_target_roles": [
+                self._ordered_roles(units[index]) for index in target_indices
+            ],
+            "repair_target_metadata": repair_metadata,
+            "repair_tokens_requested": repair_tokens,
+            "repair_tokens_injected": repair_tokens,
+            "repair_raw_tokens": repair_tokens,
+            "repair_physical_tokens": repair_tokens,
+            "repair_absolute_position_ranges": [
+                [meta["absolute_position_start"], meta["absolute_position_end"]]
+                for meta in repair_metadata
+            ],
+            "physical_prefix_len_before": max(0, physical_before - repair_tokens),
+            "physical_prefix_len_after": physical_before,
+            "logical_position_before": logical_before,
+            "logical_position_after": logical_after,
+        }
+        if repair_tokens != self._last_repair_build_info["repair_tokens_injected"]:
+            raise RuntimeError("repair token accounting invariant failed")
 
         messages.extend(current)
         return messages
@@ -548,10 +929,19 @@ class KVRepairRunner(HistoryDriftRunner):
     def _oracle_repair_arms(self) -> set[str]:
         return {
             "d_sham_mech",
+            "hint_only",
             "d_sham_neutral",
             "d_corr",
+            "d_corr_w1",
+            "d_corr_w2",
+            "d_corr_w4",
+            "d_corr_w2_hint",
+            "d_corr_w2_oracle_location_hint",
+            "d_corr_replace_w2",
             "d_corr_recompute",
+            "d_corr_recompute_w2",
             "d_corr_all",
+            "raw_all_replace",
         }
 
     def _should_repair_candidate(
@@ -643,6 +1033,7 @@ class KVRepairRunner(HistoryDriftRunner):
 
                 self._repair_enabled_for_current_step = repair_enabled
                 request_messages = self._build_request_messages(messages, stats)
+                repair_build_info = deepcopy(self._last_repair_build_info)
                 text, response_message, elapsed, usage = self._query(
                     request_messages,
                     tools,
@@ -666,6 +1057,7 @@ class KVRepairRunner(HistoryDriftRunner):
                         "repair_enabled": repair_enabled,
                         "repair_mode": self.arm if repair_enabled else "c2kv",
                         "repair_target_history_index": self._repair_target_history_index,
+                        "repair_build_info": repair_build_info,
                     },
                 ]
                 turn_log[f"step_{step_idx}"] = step_log
@@ -785,6 +1177,7 @@ class KVRepairRunner(HistoryDriftRunner):
                         "repair_arm": self.arm,
                         "repair_mode": self.arm if repair_enabled else "c2kv",
                         "repair_target_history_index": self._repair_target_history_index,
+                        "repair_build_info": repair_build_info,
                         "repair_raw_text": text if repair_enabled else None,
                         "repair_action": decoded.action if repair_enabled else None,
                         "repair_status": decoded.status if repair_enabled else None,
@@ -798,6 +1191,28 @@ class KVRepairRunner(HistoryDriftRunner):
                     step_record["plain_c2kv_raw_text"] = candidate_raw_text
                     step_record["plain_c2kv_action"] = candidate_action
                     step_record["plain_c2kv_status"] = candidate_status
+                    step_record["repair_changed_action"] = not action_matches(
+                        decoded.action,
+                        candidate_action,
+                    )
+                    candidate_ids = self.tokenizer.encode(
+                        candidate_raw_text,
+                        add_special_tokens=False,
+                    )
+                    repaired_ids = self.tokenizer.encode(
+                        text,
+                        add_special_tokens=False,
+                    )
+                    step_record["candidate_first_token_id"] = (
+                        int(candidate_ids[0]) if candidate_ids else None
+                    )
+                    step_record["repaired_first_token_id"] = (
+                        int(repaired_ids[0]) if repaired_ids else None
+                    )
+                    step_record["repair_changed_first_token"] = (
+                        step_record["candidate_first_token_id"]
+                        != step_record["repaired_first_token_id"]
+                    )
                     step_record["c2kv_wrong_repair_correct"] = bool(
                         step_record.get("candidate_action_drift")
                         and not step_record.get("executed_action_drift")
@@ -820,9 +1235,17 @@ class KVRepairRunner(HistoryDriftRunner):
                     if self.arm == "d_sham_mech":
                         expected = (candidate_raw_text or "").strip()
                         actual = (text or "").strip()
-                        if expected != actual:
+                        expected_ids = self.tokenizer.encode(
+                            expected,
+                            add_special_tokens=False,
+                        )
+                        actual_ids = self.tokenizer.encode(
+                            actual,
+                            add_special_tokens=False,
+                        )
+                        if expected_ids != actual_ids:
                             raise RuntimeError(
-                                "d_sham_mech changed generated text relative to "
+                                "d_sham_mech changed generated token ids relative to "
                                 "plain C2KV while repair plumbing should be a no-op."
                             )
 
@@ -912,20 +1335,49 @@ class KVRepairRunner(HistoryDriftRunner):
                 if not segment_infos:
                     break
 
-                segment_harmful = any(
+                oracle_segment_harmful = any(
                     bool(info["step_record"].get("oracle_harmful"))
                     for info in segment_infos
                 )
+                repair_triggered = (
+                    oracle_segment_harmful
+                    if self.repair_trigger == "oracle"
+                    else self.repair_trigger == "always"
+                )
+                harmful_step_indices = [
+                    idx
+                    for idx, info in enumerate(segment_infos)
+                    if bool(info["step_record"].get("oracle_harmful"))
+                ]
+                has_action_drift = any(
+                    bool(info["step_record"].get("candidate_action_drift"))
+                    for info in segment_infos
+                )
+                has_state_drift = any(
+                    bool(info["step_record"].get("state_drift"))
+                    for info in segment_infos
+                )
+                if has_action_drift and has_state_drift:
+                    harmful_reason = "both"
+                elif has_action_drift:
+                    harmful_reason = "action_drift"
+                elif has_state_drift:
+                    harmful_reason = "state_drift"
+                else:
+                    harmful_reason = "none"
                 repair_segment = {
                     "sample_id": test_entry_id,
                     "turn": turn_idx,
                     "segment_start_step": segment_start_count,
                     "segment_length": len(segment_infos),
                     "checkpoint_interval": self.checkpoint_interval,
-                    "detector_trigger": segment_harmful,
-                    "oracle_segment_harmful": segment_harmful,
-                    "repair_triggered": segment_harmful,
-                    "repair_mode": self.arm if segment_harmful else "c2kv",
+                    "detector_trigger": repair_triggered,
+                    "oracle_segment_harmful": oracle_segment_harmful,
+                    "oracle_harmful_reason": harmful_reason,
+                    "harmful_step_indices": harmful_step_indices,
+                    "repair_triggered": repair_triggered,
+                    "repair_trigger_policy": self.repair_trigger,
+                    "repair_mode": self.arm if repair_triggered else "c2kv",
                     "repair_target_history_index": segment_checkpoint.get(
                         "repair_target_history_index"
                     ),
@@ -942,9 +1394,18 @@ class KVRepairRunner(HistoryDriftRunner):
                     "c2kv_wrong_repair_correct": 0,
                     "c2kv_wrong_repair_wrong": 0,
                     "c2kv_correct_repair_wrong": 0,
+                    "repair_changed_action_count": 0,
+                    "repair_changed_first_token_count": 0,
+                    "candidate_action_correct": not has_action_drift,
+                    "candidate_state_correct": not has_state_drift,
+                    "repaired_action_correct": None,
+                    "repaired_state_correct": None,
+                    "segment_start_state_matches_reference": (
+                        not any(bool(row.get("state_drift")) for row in drift_steps)
+                    ),
                 }
 
-                if not segment_harmful:
+                if not repair_triggered:
                     for info in segment_infos:
                         step_record = info["step_record"]
                         mark_first_divergence(stats, step_record)
@@ -955,6 +1416,9 @@ class KVRepairRunner(HistoryDriftRunner):
                     continue
 
                 repair_segment["speculative_terminal_discarded"] = speculative_terminal
+                self._active_oracle_bad_step = (
+                    harmful_step_indices[0] if harmful_step_indices else None
+                )
                 (
                     messages,
                     involved_instances,
@@ -978,8 +1442,8 @@ class KVRepairRunner(HistoryDriftRunner):
                         source_info=source_info,
                     )
                     step_record = info["step_record"]
-                    step_record["oracle_segment_harmful"] = True
-                    step_record["detector_trigger"] = True
+                    step_record["oracle_segment_harmful"] = oracle_segment_harmful
+                    step_record["detector_trigger"] = repair_triggered
                     step_record["repair_triggered"] = True
                     mark_first_divergence(stats, step_record)
                     drift_steps.append(step_record)
@@ -993,6 +1457,16 @@ class KVRepairRunner(HistoryDriftRunner):
                     repair_segment["c2kv_correct_repair_wrong"] += int(
                         bool(step_record.get("c2kv_correct_repair_wrong"))
                     )
+                    repair_segment["repair_changed_action_count"] += int(
+                        bool(step_record.get("repair_changed_action"))
+                    )
+                    repair_segment["repair_changed_first_token_count"] += int(
+                        bool(step_record.get("repair_changed_first_token"))
+                    )
+                    if step_record.get("repair_build_info"):
+                        build_info = dict(step_record["repair_build_info"])
+                        for key, value in build_info.items():
+                            repair_segment.setdefault(key, value)
                     if terminal:
                         repair_terminal = True
                         break
@@ -1005,7 +1479,16 @@ class KVRepairRunner(HistoryDriftRunner):
                         for row in repaired_records
                     )
                 )
+                repair_segment["repaired_action_correct"] = bool(
+                    repaired_records
+                    and all(not row.get("executed_action_drift") for row in repaired_records)
+                )
+                repair_segment["repaired_state_correct"] = bool(
+                    repaired_records
+                    and all(not row.get("state_drift") for row in repaired_records)
+                )
                 repair_segments.append(repair_segment)
+                self._active_oracle_bad_step = None
                 if repair_terminal or force_quit:
                     break
 
@@ -1139,6 +1622,19 @@ def run(args: argparse.Namespace) -> None:
         "recomputed_raw_tokens": sum(
             int(row.get("recomputed_raw_tokens") or 0) for row in metric_rows
         ),
+        "repaired_step_count": sum(
+            int(row.get("repaired_step_count") or 0) for row in metric_rows
+        ),
+        "repair_changed_action_count": sum(
+            int(row.get("repair_changed_action_count") or 0) for row in metric_rows
+        ),
+        "repair_changed_first_token_count": sum(
+            int(row.get("repair_changed_first_token_count") or 0)
+            for row in metric_rows
+        ),
+        "net_repair_gain": sum(
+            int(row.get("net_repair_gain") or 0) for row in metric_rows
+        ),
     }
     summary["extract_success_rate"] = (
         summary["extract_success"] / summary["extract_calls"]
@@ -1187,6 +1683,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="Number of plain C2KV speculative steps before Oracle segment repair.",
+    )
+    parser.add_argument(
+        "--repair-window",
+        default="1",
+        choices=["1", "2", "4", "all"],
+        help="Recent-W history units to restore for generic repair arms.",
     )
     parser.add_argument("--plan-path", default="")
     parser.add_argument(
