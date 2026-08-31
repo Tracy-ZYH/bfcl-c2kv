@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import math
 import re
 import time
 from copy import deepcopy
@@ -20,8 +22,10 @@ from c2kv_eval.adapters.bfcl_history_drift import (
     ExtractRecord,
     HistoryDriftRunner,
     MAXIMUM_STEP_LIMIT,
+    _actual_cached_tokens_from_response,
     _assistant_history_message,
     _history_units,
+    _kv_runtime_stats_from_response,
     _latest_user_query_index,
     _message_text,
     _post_json,
@@ -42,6 +46,14 @@ from c2kv_eval.adapters.history_step_common import (
     reference_step_for,
     serialization_roundtrip,
 )
+from c2kv_eval.adapters.eval_bfcl_history_checkpoint import (
+    _as_float,
+    _entropy_from_log_probs,
+    _iter_token_logprobs,
+    _mean,
+    _token_top_logprobs,
+    _top1_top2_margin,
+)
 
 
 REPAIR_ARMS = {
@@ -56,12 +68,26 @@ REPAIR_ARMS = {
     "d_corr_w4",
     "d_corr_w2_hint",
     "d_corr_w2_oracle_location_hint",
+    "d_corr_replace_w1",
     "d_corr_replace_w2",
+    "d_corr_replace_w4",
+    "d_corr_replace_all",
     "d_corr_recompute",
     "d_corr_recompute_w2",
     "d_corr_all",
     "raw_all_replace",
     "raw_all_replace_direct",
+}
+
+DETECTOR_ARMS = {
+    "oracle",
+    "combined_logistic",
+    "combined_logistic_best_f1",
+    "combined_logistic_high_recall",
+    "max_risk_score",
+    "rule_trigger",
+    "always_trigger",
+    "never_trigger",
 }
 
 
@@ -90,6 +116,42 @@ class KVRepairRunner(HistoryDriftRunner):
         super().__init__(drift_args)
         self.arm = args.arm
         self.repair_trigger = args.repair_trigger
+        self.detector_arm = getattr(args, "detector_arm", "oracle")
+        if self.detector_arm == "combined_logistic":
+            self.detector_arm = "combined_logistic_best_f1"
+        self.rule_detector_threshold = float(
+            getattr(args, "rule_detector_threshold", 5.0)
+        )
+        self.detector_signal_threshold = float(
+            getattr(args, "detector_signal_threshold", 5.0)
+        )
+        self.candidate_logprobs_top_k = int(
+            getattr(args, "candidate_logprobs_top_k", 20)
+        )
+        self.collect_candidate_detector_signals = bool(
+            getattr(args, "collect_candidate_detector_signals", False)
+            or self.detector_arm
+            in {
+                "combined_logistic_best_f1",
+                "combined_logistic_high_recall",
+            }
+        )
+        self.logistic_detector_model = (
+            self._train_logistic_detector(
+                getattr(args, "logistic_detector_features_csv", ""),
+                threshold_rule=(
+                    "high_recall"
+                    if self.detector_arm == "combined_logistic_high_recall"
+                    else "best_f1"
+                ),
+            )
+            if self.detector_arm
+            in {
+                "combined_logistic_best_f1",
+                "combined_logistic_high_recall",
+            }
+            else None
+        )
         self.checkpoint_interval = max(1, int(args.checkpoint_interval))
         self.require_plan = False
         self.plan = self._load_plan(args.plan_path)
@@ -98,8 +160,17 @@ class KVRepairRunner(HistoryDriftRunner):
         self._repair_enabled_for_current_step = True
         self._repair_target_history_index: int | None = None
         self._repair_window_arg = args.repair_window
+        self.repair_extract_source = getattr(args, "repair_extract_source", "auto")
         self._active_oracle_bad_step: int | None = None
         self._last_repair_build_info: dict[str, Any] = {}
+        self._previous_readout_vector: list[float] | None = None
+
+    def _repair_extract_source_for(self, effective_arm: str, repair_kind: str) -> str:
+        if self.repair_extract_source != "auto":
+            return self.repair_extract_source
+        if repair_kind == "raw" and effective_arm == "raw_all_replace_direct":
+            return "serving_cache"
+        return "model_prefill"
 
     def run_sample(self, test_case: dict[str, Any]) -> dict[str, Any]:
         self._active_tools = _tool_payload(test_case["function"])
@@ -192,6 +263,553 @@ class KVRepairRunner(HistoryDriftRunner):
                 int(bool(seg.get("speculative_terminal_discarded")))
                 for seg in segments
             ),
+            "detector_tp": sum(int(bool(seg.get("detector_tp"))) for seg in segments),
+            "detector_fp": sum(int(bool(seg.get("detector_fp"))) for seg in segments),
+            "detector_tn": sum(int(bool(seg.get("detector_tn"))) for seg in segments),
+            "detector_fn": sum(int(bool(seg.get("detector_fn"))) for seg in segments),
+            "tp_recovery_attempts": sum(
+                int(bool(seg.get("detector_tp"))) for seg in segments
+            ),
+            "tp_recovery_success_count": sum(
+                int(
+                    bool(seg.get("detector_tp"))
+                    and bool(seg.get("repair_segment_success"))
+                )
+                for seg in segments
+            ),
+            "fp_recovery_count": sum(
+                int(bool(seg.get("detector_fp"))) for seg in segments
+            ),
+            "fp_recovery_harm_count": sum(
+                int(
+                    bool(seg.get("detector_fp"))
+                    and bool(seg.get("fp_recovery_harm"))
+                )
+                for seg in segments
+            ),
+            "false_negative_count": sum(
+                int(bool(seg.get("detector_fn"))) for seg in segments
+            ),
+        }
+
+    @staticmethod
+    def _action_text(action: list[str]) -> str:
+        return json.dumps(action or [], ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _parse_action_objects(action: list[str]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for item in action or []:
+            value: Any = item
+            if isinstance(item, str):
+                try:
+                    value = json.loads(item)
+                except Exception:
+                    value = item
+            if isinstance(value, dict):
+                out.append(value)
+        return out
+
+    def _argument_grounding_score(
+        self,
+        *,
+        action: list[str],
+        messages: Sequence[dict[str, Any]],
+    ) -> float:
+        action_objects = self._parse_action_objects(action)
+        if not action_objects:
+            return 1.0 if is_empty_execute_response(action) else 0.0
+        recent_text = "\n".join(
+            str(message.get("content") or "")
+            for message in messages[-12:]
+            if message.get("role") in {"user", "tool", "assistant"}
+        ).lower()
+        values: list[str] = []
+        for obj in action_objects:
+            args = obj.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {"value": args}
+            if isinstance(args, dict):
+                for value in args.values():
+                    if isinstance(value, (str, int, float)) and str(value).strip():
+                        text = str(value).strip().lower()
+                        if len(text) >= 3:
+                            values.append(text)
+        if not values:
+            return 1.0
+        hits = sum(1 for value in values if value in recent_text)
+        return hits / len(values)
+
+    def _repeat_action_score(
+        self,
+        *,
+        action: list[str],
+        segment_infos: Sequence[dict[str, Any]],
+    ) -> float:
+        current = self._action_text(action)
+        if current == "[]":
+            return 0.0
+        previous = [
+            self._action_text(
+                (info.get("step_record") or {}).get("candidate_action") or []
+            )
+            for info in segment_infos
+        ]
+        return 1.0 if current in previous else 0.0
+
+    @staticmethod
+    def _observation_anomaly_score(
+        *,
+        execution_results: Sequence[Any],
+        execution_error: str | None,
+        candidate_status: str,
+        action: list[str],
+    ) -> float:
+        if candidate_status in {"decode_error", "invalid_format"}:
+            return 1.0
+        if execution_error:
+            return 1.0
+        if is_empty_execute_response(action):
+            return 0.5
+        if not execution_results:
+            return 0.5
+        text = "\n".join(str(item) for item in execution_results).lower()
+        bad_markers = [
+            "error",
+            "exception",
+            "failed",
+            "invalid",
+            "not found",
+            "no result",
+            "empty",
+        ]
+        return 1.0 if any(marker in text for marker in bad_markers) else 0.0
+
+    def _heuristic_attributes(
+        self,
+        *,
+        info: dict[str, Any],
+        segment_infos: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        record = info.get("step_record") or {}
+        action = record.get("candidate_action") or []
+        hard_error = bool(
+            record.get("candidate_status") in {"decode_error", "invalid_format"}
+            or record.get("execution_error")
+        )
+        grounding = self._argument_grounding_score(
+            action=action,
+            messages=info.get("micro_snapshot", {}).get("messages") or [],
+        )
+        repeat_score = self._repeat_action_score(
+            action=action,
+            segment_infos=segment_infos,
+        )
+        observation = self._observation_anomaly_score(
+            execution_results=record.get("execution_results") or [],
+            execution_error=record.get("execution_error"),
+            candidate_status=record.get("candidate_status") or "",
+            action=action,
+        )
+        tool_transition_anomaly = (
+            1.0 if repeat_score >= 1.0 and observation > 0.0 else 0.0
+        )
+        risk_score = (
+            (1.0 if hard_error else 0.0) * 10.0
+            + (1.0 - grounding) * 4.0
+            + repeat_score * 2.0
+            + observation * 3.0
+            + tool_transition_anomaly * 2.0
+        )
+        return {
+            "hard_error": hard_error,
+            "argument_grounding_score": grounding,
+            "argument_grounding_failure": grounding < 0.34,
+            "repeat_action_score": repeat_score,
+            "tool_transition_anomaly": tool_transition_anomaly,
+            "observation_anomaly": observation,
+            "risk_score": risk_score,
+        }
+
+    @staticmethod
+    def _detector_low_is_bad(name: str) -> bool:
+        return any(
+            pattern in name
+            for pattern in (
+                "confidence",
+                "probability",
+                "logprob",
+                "margin",
+                "grounding_score",
+            )
+        )
+
+    @classmethod
+    def _detector_score_for_feature(cls, name: str, value: Any) -> float | None:
+        numeric = _as_float(value)
+        if numeric is None:
+            return None
+        return -numeric if cls._detector_low_is_bad(name) else numeric
+
+    @staticmethod
+    def _detector_aggregate_features(
+        step_features: Sequence[dict[str, Any]],
+    ) -> dict[str, float]:
+        values: dict[str, list[float]] = {}
+        for features in step_features:
+            if not isinstance(features, dict):
+                continue
+            for key, value in features.items():
+                numeric = _as_float(value)
+                if numeric is not None:
+                    values.setdefault(key, []).append(numeric)
+        out: dict[str, float] = {}
+        for key, vals in values.items():
+            out[f"mean_{key}"] = sum(vals) / len(vals)
+            out[f"max_{key}"] = max(vals)
+            out[f"min_{key}"] = min(vals)
+        return out
+
+    def _segment_detector_feature_row(
+        self,
+        segment_infos: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        merged_steps: list[dict[str, Any]] = []
+        for info in segment_infos:
+            merged: dict[str, Any] = {}
+            for source in (
+                info.get("candidate_detector_features") or {},
+                info.get("heuristic_attributes") or {},
+            ):
+                if not isinstance(source, dict):
+                    continue
+                for key, value in source.items():
+                    numeric = _as_float(value)
+                    if numeric is not None:
+                        merged[key] = numeric
+            merged_steps.append(merged)
+        features: dict[str, Any] = self._detector_aggregate_features(merged_steps)
+        rule = self._rule_detector(segment_infos)
+        features.update(
+            {
+                "rule_detector_trigger": int(
+                    bool(rule.get("rule_detector_trigger"))
+                ),
+                "rule_detector_binary_score": float(
+                    bool(rule.get("rule_detector_trigger"))
+                ),
+                "rule_detector_max_risk": rule.get("rule_detector_max_risk"),
+                "rule_detector_threshold": self.rule_detector_threshold,
+            }
+        )
+        return features
+
+    def _rule_detector(self, segment_infos: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        attrs = [info.get("heuristic_attributes") or {} for info in segment_infos]
+        hard_trigger = any(bool(attr.get("hard_error")) for attr in attrs)
+        grounding_trigger = any(
+            bool(attr.get("argument_grounding_failure")) for attr in attrs
+        )
+        observation_trigger = any(
+            float(attr.get("observation_anomaly") or 0.0) >= 1.0
+            for attr in attrs
+        )
+        max_risk = max(
+            (float(attr.get("risk_score") or 0.0) for attr in attrs),
+            default=0.0,
+        )
+        risk_trigger = max_risk >= self.rule_detector_threshold
+        if hard_trigger:
+            reason = "hard_error"
+        elif grounding_trigger:
+            reason = "argument_grounding"
+        elif observation_trigger:
+            reason = "observation_anomaly"
+        elif risk_trigger:
+            reason = "risk_threshold"
+        else:
+            reason = "none"
+        triggered = (
+            hard_trigger
+            or grounding_trigger
+            or observation_trigger
+            or risk_trigger
+        )
+        return {
+            "detector": "rule_trigger",
+            "detector_trigger": triggered,
+            "detector_reason": reason,
+            "rule_detector_trigger": triggered,
+            "rule_detector_max_risk": max_risk,
+            "rule_detector_reason": reason,
+            "rule_detector_threshold": self.rule_detector_threshold,
+        }
+
+    @staticmethod
+    def _sigmoid(value: float) -> float:
+        if value >= 0:
+            z = math.exp(-value)
+            return 1.0 / (1.0 + z)
+        z = math.exp(value)
+        return z / (1.0 + z)
+
+    @staticmethod
+    def _threshold_at_high_recall(
+        labels: Sequence[int],
+        scores: Sequence[float],
+        target_recall: float = 0.95,
+    ) -> float:
+        best: tuple[float, float, float] | None = None
+        positives = sum(labels)
+        negatives = len(labels) - positives
+        for threshold in sorted(set(scores), reverse=True):
+            tp = fp = fn = 0
+            for label, score in zip(labels, scores):
+                pred = score >= threshold
+                if pred and label:
+                    tp += 1
+                elif pred and not label:
+                    fp += 1
+                elif not pred and label:
+                    fn += 1
+            recall = tp / positives if positives else 0.0
+            fpr = fp / negatives if negatives else 0.0
+            if recall >= target_recall:
+                candidate = (fpr, -recall, threshold)
+                if best is None or candidate < best:
+                    best = candidate
+        if best is not None:
+            return float(best[2])
+        return min(scores) if scores else 0.5
+
+    @staticmethod
+    def _best_f1_threshold(labels: Sequence[int], scores: Sequence[float]) -> float:
+        best_threshold = 0.5
+        best_f1 = -1.0
+        for threshold in sorted(set(scores), reverse=True):
+            tp = fp = fn = 0
+            for label, score in zip(labels, scores):
+                pred = score >= threshold
+                if pred and label:
+                    tp += 1
+                elif pred and not label:
+                    fp += 1
+                elif not pred and label:
+                    fn += 1
+            precision = tp / (tp + fp) if tp + fp else 0.0
+            recall = tp / (tp + fn) if tp + fn else 0.0
+            f1 = (
+                2 * precision * recall / (precision + recall)
+                if precision + recall
+                else 0.0
+            )
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = float(threshold)
+        return best_threshold
+
+    def _train_logistic_detector(
+        self,
+        features_csv: str,
+        *,
+        threshold_rule: str,
+    ) -> dict[str, Any]:
+        if not features_csv:
+            raise ValueError(
+                f"detector_arm={self.detector_arm} requires "
+                "--logistic-detector-features-csv"
+            )
+        with open(features_csv, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        train = [row for row in rows if row.get("split") == "calibration"]
+        if not train:
+            raise ValueError(
+                "logistic detector feature CSV has no calibration split rows: "
+                f"{features_csv}"
+            )
+        excluded = {
+            "id",
+            "checkpoint_id",
+            "turn",
+            "segment_start_step",
+            "segment_length",
+            "segment_harmful",
+            "split",
+            "rule_detector_reason",
+        }
+        feature_names = [key for key in rows[0].keys() if key not in excluded]
+        usable: list[str] = []
+        for name in feature_names:
+            vals = [
+                self._detector_score_for_feature(name, row.get(name))
+                for row in train
+            ]
+            vals = [value for value in vals if value is not None]
+            if len(vals) >= max(4, len(train) // 2):
+                usable.append(name)
+        if not usable:
+            raise ValueError("logistic detector has no usable numeric features")
+
+        means: dict[str, float] = {}
+        stds: dict[str, float] = {}
+        for name in usable:
+            vals = [
+                self._detector_score_for_feature(name, row.get(name))
+                for row in train
+            ]
+            vals = [value for value in vals if value is not None]
+            mean = sum(vals) / len(vals)
+            var = sum((value - mean) ** 2 for value in vals) / max(len(vals), 1)
+            means[name] = mean
+            stds[name] = math.sqrt(var) or 1.0
+
+        def vector(row: dict[str, Any]) -> list[float]:
+            out = [1.0]
+            for name in usable:
+                value = self._detector_score_for_feature(name, row.get(name))
+                if value is None:
+                    value = means[name]
+                out.append((value - means[name]) / stds[name])
+            return out
+
+        weights = [0.0] * (len(usable) + 1)
+        lr = 0.08
+        l2 = 0.001
+        for _ in range(500):
+            grad = [0.0] * len(weights)
+            for row in train:
+                x = vector(row)
+                y = int(float(row["segment_harmful"]))
+                p = self._sigmoid(sum(w * xi for w, xi in zip(weights, x)))
+                for i, xi in enumerate(x):
+                    grad[i] += (p - y) * xi
+            for i in range(len(weights)):
+                grad[i] /= len(train)
+                if i:
+                    grad[i] += l2 * weights[i]
+                weights[i] -= lr * grad[i]
+
+        train_scores = [
+            self._sigmoid(sum(w * xi for w, xi in zip(weights, vector(row))))
+            for row in train
+        ]
+        train_labels = [int(float(row["segment_harmful"])) for row in train]
+        threshold = (
+            self._threshold_at_high_recall(train_labels, train_scores, 0.95)
+            if threshold_rule == "high_recall"
+            else self._best_f1_threshold(train_labels, train_scores)
+        )
+        return {
+            "features_csv": features_csv,
+            "features": usable,
+            "means": means,
+            "stds": stds,
+            "weights": weights,
+            "threshold": threshold,
+            "threshold_selection_rule": threshold_rule,
+            "train_rows": len(train),
+            "train_episode_ids": sorted({str(row.get("id")) for row in train}),
+            "test_episode_ids": sorted(
+                {str(row.get("id")) for row in rows if row.get("split") == "test"}
+            ),
+        }
+
+    def _logistic_detector(self, segment_infos: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        if self.logistic_detector_model is None:
+            raise RuntimeError("logistic detector model is not initialized")
+        model = self.logistic_detector_model
+        row = self._segment_detector_feature_row(segment_infos)
+        x = [1.0]
+        for name in model["features"]:
+            value = self._detector_score_for_feature(name, row.get(name))
+            if value is None:
+                value = model["means"][name]
+            x.append((value - model["means"][name]) / model["stds"][name])
+        score = self._sigmoid(sum(w * xi for w, xi in zip(model["weights"], x)))
+        threshold = float(model["threshold"])
+        triggered = score >= threshold
+        return {
+            "detector": self.detector_arm,
+            "detector_trigger": triggered,
+            "detector_reason": (
+                "logistic_score_threshold" if triggered else "logistic_safe"
+            ),
+            "detector_threshold": threshold,
+            "threshold_selection_rule": model["threshold_selection_rule"],
+            "logistic_detector_score": score,
+            "logistic_detector_threshold": threshold,
+            "logistic_detector_feature_count": len(model["features"]),
+            "logistic_detector_features": model["features"],
+            "logistic_detector_train_rows": model["train_rows"],
+            "detector_train_episode_ids": model["train_episode_ids"],
+            "detector_test_episode_ids": model["test_episode_ids"],
+            "detector_evaluation_mode": (
+                "in_sample_diagnostic_stable52_calibration_split"
+            ),
+        }
+
+    def _feature_signal_detector(
+        self,
+        segment_infos: Sequence[dict[str, Any]],
+        *,
+        signal_name: str,
+        threshold: float,
+    ) -> dict[str, Any]:
+        row = self._segment_detector_feature_row(segment_infos)
+        score = self._detector_score_for_feature(signal_name, row.get(signal_name))
+        triggered = False if score is None else score >= threshold
+        return {
+            "detector": signal_name,
+            "detector_trigger": triggered,
+            "detector_reason": (
+                f"{signal_name}>={threshold:g}" if triggered else "feature_signal_safe"
+            ),
+            "detector_threshold": threshold,
+            "detector_signal_name": signal_name,
+            "detector_signal_score": score,
+            "detector_signal_threshold": threshold,
+        }
+
+    def _segment_detector(self, segment_infos: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        if self.detector_arm == "never_trigger":
+            return {"detector": "never_trigger", "detector_trigger": False}
+        if self.detector_arm == "always_trigger":
+            return {"detector": "always_trigger", "detector_trigger": True}
+        if self.detector_arm == "oracle":
+            triggered = any(
+                bool((info.get("step_record") or {}).get("oracle_harmful"))
+                for info in segment_infos
+            )
+            return {"detector": "oracle", "detector_trigger": triggered}
+        if self.detector_arm == "rule_trigger":
+            return self._rule_detector(segment_infos)
+        if self.detector_arm in {
+            "combined_logistic_best_f1",
+            "combined_logistic_high_recall",
+        }:
+            return self._logistic_detector(segment_infos)
+        if self.detector_arm == "max_risk_score":
+            return self._feature_signal_detector(
+                segment_infos,
+                signal_name="max_risk_score",
+                threshold=self.detector_signal_threshold,
+            )
+        raise RuntimeError(f"Unsupported detector arm: {self.detector_arm}")
+
+    @staticmethod
+    def _detector_confusion(
+        *,
+        oracle_segment_harmful: bool,
+        detector_trigger: bool,
+    ) -> dict[str, bool]:
+        return {
+            "detector_tp": detector_trigger and oracle_segment_harmful,
+            "detector_fp": detector_trigger and not oracle_segment_harmful,
+            "detector_tn": (not detector_trigger) and (not oracle_segment_harmful),
+            "detector_fn": (not detector_trigger) and oracle_segment_harmful,
         }
 
     def _load_plan(self, path: str) -> dict[str, Any]:
@@ -409,26 +1027,101 @@ class KVRepairRunner(HistoryDriftRunner):
         repair_mode: str,
         source_doc_index: int | None,
         stats: DriftStats,
+        extract_source: str = "model_prefill",
     ) -> dict[str, Any]:
-        start = time.perf_counter()
-        result = _post_json(
-            self.base_url,
-            "/v1/c2kv/repair_extract",
-            {
-                "input_ids": input_ids,
-                "span_start": span_start,
-                "span_end": span_end,
-                "position_offset": position_offset,
-                "repair_mode": repair_mode,
-                "source_doc_index": source_doc_index,
-            },
-            self.timeout,
-        )
-        elapsed = time.perf_counter() - start
+        def _pad_token_id() -> int:
+            for attr in ("eos_token_id", "pad_token_id"):
+                value = getattr(self.tokenizer, attr, None)
+                if value is not None:
+                    return int(value)
+            return 0
+
+        def _align_for_serving_cache(ids: list[int], page_size: int) -> list[int]:
+            if page_size <= 1:
+                return ids
+            target_len = ((span_end + page_size - 1) // page_size) * page_size
+            if len(ids) >= target_len:
+                return ids
+            # Padding is appended strictly after the requested repair span. In
+            # causal prefill it cannot affect the K/V of [span_start, span_end),
+            # but it keeps the containing page resident in the radix cache.
+            return ids + [_pad_token_id()] * (target_len - len(ids))
+
+        def _warm_serving_cache(ids: list[int]) -> None:
+            nonlocal stats
+            warm_start = time.perf_counter()
+            warm = _post_json(
+                self.base_url,
+                "/generate",
+                {
+                    "input_ids": ids,
+                    "sampling_params": {
+                        "max_new_tokens": 0,
+                        "temperature": 0,
+                    },
+                },
+                self.timeout,
+            )
+            warm_elapsed = time.perf_counter() - warm_start
+            stats.extract_seconds += warm_elapsed
+            stats.repair_extract_seconds += warm_elapsed
+            stats.extract_calls += 1
+            stats.extract_success += 1
+            warm_meta = warm.get("meta_info") if isinstance(warm, dict) else {}
+            if isinstance(warm_meta, dict):
+                warm_prompt_tokens = int(
+                    warm_meta.get("prompt_tokens") or len(ids)
+                )
+                warm_cached_tokens = int(warm_meta.get("cached_tokens") or 0)
+                stats.repair_extract_recomputed_tokens += max(
+                    warm_prompt_tokens - warm_cached_tokens,
+                    0,
+                )
+            else:
+                stats.repair_extract_recomputed_tokens += len(ids)
+
+        if extract_source == "serving_cache":
+            _warm_serving_cache(input_ids)
+
+        def _repair_extract_call(ids: list[int]) -> tuple[dict[str, Any], float]:
+            start = time.perf_counter()
+            result = _post_json(
+                self.base_url,
+                "/v1/c2kv/repair_extract",
+                {
+                    "input_ids": ids,
+                    "span_start": span_start,
+                    "span_end": span_end,
+                    "position_offset": position_offset,
+                    "repair_mode": repair_mode,
+                    "source_doc_index": source_doc_index,
+                    "extract_source": extract_source,
+                },
+                self.timeout,
+            )
+            return result, time.perf_counter() - start
+
+        repair_extract_calls = 1
+        result, elapsed = _repair_extract_call(input_ids)
+        if (
+            extract_source == "serving_cache"
+            and not result.get("success")
+            and "PREFIX_NOT_FOUND_IN_SERVING_CACHE" in str(result.get("error") or "")
+        ):
+            match = re.search(r"page_size=(\d+)", str(result.get("error") or ""))
+            if match:
+                page_size = int(match.group(1))
+                padded_input_ids = _align_for_serving_cache(input_ids, page_size)
+                if len(padded_input_ids) > len(input_ids):
+                    _warm_serving_cache(padded_input_ids)
+                    result, retry_elapsed = _repair_extract_call(padded_input_ids)
+                    elapsed += retry_elapsed
+                    repair_extract_calls += 1
         stats.extract_seconds += elapsed
         stats.repair_extract_seconds += elapsed
-        stats.repair_extract_recomputed_tokens += len(input_ids)
-        stats.extract_calls += 1
+        if extract_source != "serving_cache":
+            stats.repair_extract_recomputed_tokens += len(input_ids)
+        stats.extract_calls += repair_extract_calls
         if result.get("success"):
             stats.extract_success += 1
         else:
@@ -436,6 +1129,160 @@ class KVRepairRunner(HistoryDriftRunner):
                 f"repair_extract failed for {repair_mode}: {result.get('error')}"
             )
         return result
+
+    def _query_with_raw(
+        self,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]],
+        stats: DriftStats,
+        *,
+        collect_detector_signals: bool,
+    ) -> tuple[str, dict[str, Any], float, dict[str, Any], dict[str, Any]]:
+        prompt_tokens = _token_count(self.tokenizer, messages)
+        payload = {
+            "model": self.model,
+            "messages": list(messages),
+            "tools": list(tools),
+            "temperature": self.temperature,
+            "max_completion_tokens": max(1, self.max_completion_tokens),
+            "chat_template_kwargs": {"enable_thinking": False},
+            "return_cached_tokens_details": True,
+        }
+        if collect_detector_signals:
+            payload.update(
+                {
+                    "logprobs": True,
+                    "top_logprobs": self.candidate_logprobs_top_k,
+                }
+            )
+        start = time.perf_counter()
+        data = _post_json(self.base_url, "/v1/chat/completions", payload, self.timeout)
+        elapsed = time.perf_counter() - start
+        choice = (data.get("choices") or [{}])[0] or {}
+        message = choice.get("message", {}) or {}
+        text = message.get("content") or ""
+        tool_calls_text = _tool_calls_to_text(message.get("tool_calls"))
+        if tool_calls_text:
+            text = (text + "\n" + tool_calls_text).strip() if text else tool_calls_text
+        usage = data.get("usage") or {}
+        stats.chat_calls += 1
+        stats.chat_seconds += elapsed
+        usage_prompt_tokens = int(usage.get("prompt_tokens") or prompt_tokens)
+        cached_tokens = _actual_cached_tokens_from_response(data)
+        if cached_tokens is None:
+            stats.chat_cache_report_missing += 1
+            recomputed_prompt_tokens = 0
+        else:
+            cached_tokens = min(usage_prompt_tokens, max(0, int(cached_tokens)))
+            stats.chat_cached_tokens += cached_tokens
+            recomputed_prompt_tokens = max(usage_prompt_tokens - cached_tokens, 0)
+            stats.chat_recomputed_prompt_tokens += recomputed_prompt_tokens
+        runtime = _kv_runtime_stats_from_response(data)
+        if runtime is None:
+            stats.kv_runtime_report_missing += 1
+        else:
+            try:
+                stats.kv_peak_resident_tokens = max(
+                    stats.kv_peak_resident_tokens,
+                    int(runtime.get("kv_resident_tokens") or 0),
+                )
+            except Exception:
+                stats.kv_runtime_report_missing += 1
+        usage_completion_tokens = int(
+            usage.get("completion_tokens")
+            or len(self.tokenizer.encode(text, add_special_tokens=False))
+        )
+        stats.chat_prompt_tokens += usage_prompt_tokens
+        stats.chat_completion_tokens += usage_completion_tokens
+        return text, message, elapsed, {
+            "prompt_tokens": usage_prompt_tokens,
+            "completion_tokens": usage_completion_tokens,
+            "cached_tokens": cached_tokens,
+            "recomputed_prompt_tokens": recomputed_prompt_tokens,
+            "kv_runtime_stats": runtime,
+        }, data
+
+    def _candidate_detector_features(self, raw: dict[str, Any]) -> dict[str, Any]:
+        choice = (raw.get("choices") or [{}])[0] or {}
+        token_items = _iter_token_logprobs(choice.get("logprobs"))
+        logprobs_source = "choice.logprobs"
+        if not token_items:
+            meta_info = raw.get("meta_info") or choice.get("meta_info") or {}
+            output_token_logprobs = meta_info.get("output_token_logprobs")
+            output_top_logprobs = meta_info.get("output_top_logprobs")
+            if output_token_logprobs:
+                token_items = []
+                for index, item in enumerate(output_token_logprobs):
+                    entry: dict[str, Any] = {}
+                    if isinstance(item, (list, tuple)):
+                        if len(item) >= 1:
+                            entry["logprob"] = item[0]
+                        if len(item) >= 3:
+                            entry["token"] = item[2]
+                    elif isinstance(item, dict):
+                        entry.update(item)
+                    if output_top_logprobs and index < len(output_top_logprobs):
+                        entry["top_logprobs"] = output_top_logprobs[index]
+                    token_items.append(entry)
+                logprobs_source = "meta_info.output_token_logprobs"
+
+        token_logprobs: list[float] = []
+        top1_probs: list[float] = []
+        entropies: list[float] = []
+        margins: list[float] = []
+        tool_name_logprobs: list[float] = []
+        argument_logprobs: list[float] = []
+        rendered = ""
+        argument_region = False
+        for item in token_items:
+            value = item.get("logprob")
+            token = str(item.get("token") or "")
+            rendered += token
+            if "arguments" in rendered or '"arguments"' in rendered:
+                argument_region = True
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                logprob = float(value)
+                token_logprobs.append(logprob)
+                if argument_region:
+                    argument_logprobs.append(logprob)
+                elif "name" in rendered or '"name"' in rendered:
+                    tool_name_logprobs.append(logprob)
+            top = _token_top_logprobs(item)
+            if top:
+                top_values = sorted(top.values(), reverse=True)
+                if top_values:
+                    top1_probs.append(math.exp(top_values[0]))
+                entropy = _entropy_from_log_probs(top)
+                if entropy is not None:
+                    entropies.append(float(entropy))
+                margin = _top1_top2_margin(top)
+                if margin is not None:
+                    margins.append(float(margin))
+
+        nll = -sum(token_logprobs) / len(token_logprobs) if token_logprobs else None
+        ppl = math.exp(min(nll, 50.0)) if nll is not None else None
+        return {
+            "detector_signal_requested": True,
+            "detector_signal_available": bool(token_logprobs),
+            "logprobs_source": logprobs_source if token_items else None,
+            "generation_token_count": len(token_logprobs),
+            "generation_nll": nll,
+            "generation_ppl": ppl,
+            "mean_top1_probability": _mean(top1_probs),
+            "min_top1_probability": min(top1_probs) if top1_probs else None,
+            "mean_logprob": _mean(token_logprobs),
+            "min_logprob": min(token_logprobs) if token_logprobs else None,
+            "mean_entropy": _mean(entropies),
+            "max_entropy": max(entropies) if entropies else None,
+            "mean_top1_top2_margin": _mean(margins),
+            "min_top1_top2_margin": min(margins) if margins else None,
+            "tool_name_generation_nll": (
+                -_mean(tool_name_logprobs) if tool_name_logprobs else None
+            ),
+            "argument_generation_nll": (
+                -_mean(argument_logprobs) if argument_logprobs else None
+            ),
+        }
 
     def _plan_for(self, sample_id: str, num_docs: int, doc_lens: list[int]) -> dict[str, Any]:
         plan_root = self.plan.get("per_qid") if isinstance(self.plan, dict) else None
@@ -514,11 +1361,29 @@ class KVRepairRunner(HistoryDriftRunner):
             config.update({"repair_kind": "raw", "window": "4"})
         elif effective_arm == "d_corr_all":
             config.update({"repair_kind": "raw", "window": "all"})
+        elif effective_arm == "d_corr_replace_w1":
+            config.update({
+                "operation": "replace",
+                "repair_kind": "raw",
+                "window": "1",
+            })
         elif effective_arm == "d_corr_replace_w2":
             config.update({
                 "operation": "replace",
                 "repair_kind": "raw",
                 "window": "2",
+            })
+        elif effective_arm == "d_corr_replace_w4":
+            config.update({
+                "operation": "replace",
+                "repair_kind": "raw",
+                "window": "4",
+            })
+        elif effective_arm == "d_corr_replace_all":
+            config.update({
+                "operation": "replace",
+                "repair_kind": "raw",
+                "window": "all",
             })
         elif effective_arm in {"d_corr_recompute", "d_corr_recompute_w2"}:
             config.update({
@@ -662,13 +1527,19 @@ class KVRepairRunner(HistoryDriftRunner):
                 )
 
             repair = self._extract_repair(
-                input_ids=full_prompt_ids[:history_end],
+                input_ids=(
+                    full_prompt_ids
+                    if self._repair_extract_source_for(effective_arm, "raw")
+                    == "serving_cache"
+                    else full_prompt_ids[:history_end]
+                ),
                 span_start=history_start,
                 span_end=history_end,
                 position_offset=0,
                 repair_mode=effective_arm,
                 source_doc_index=None,
                 stats=stats,
+                extract_source=self._repair_extract_source_for(effective_arm, "raw"),
             )
             token_len = int(repair["token_len"])
             if token_len != history_len:
@@ -702,6 +1573,10 @@ class KVRepairRunner(HistoryDriftRunner):
 
             self._last_repair_build_info = {
                 "repair_mode": effective_arm,
+                "repair_extract_source": repair.get("extract_source") or "",
+                "repair_extract_cache_hit_tokens": int(
+                    repair.get("cache_hit_tokens") or 0
+                ),
                 "repair_window": config["window"],
                 "repair_operation": config["operation"],
                 "uses_oracle_error_location": bool(config["oracle_location_hint"]),
@@ -760,12 +1635,25 @@ class KVRepairRunner(HistoryDriftRunner):
                 span_end = span_len
                 position_offset = starts[index]
             elif config["repair_kind"] == "raw":
-                input_ids = full_prompt_ids[: ends[index]]
+                extract_source = self._repair_extract_source_for(
+                    effective_arm,
+                    "raw",
+                )
+                input_ids = (
+                    full_prompt_ids
+                    if extract_source == "serving_cache"
+                    else full_prompt_ids[: ends[index]]
+                )
                 span_start = starts[index]
                 span_end = ends[index]
                 position_offset = 0
             else:
                 raise RuntimeError(f"Unsupported repair kind: {config['repair_kind']}")
+            if config["repair_kind"] != "raw":
+                extract_source = self._repair_extract_source_for(
+                    effective_arm,
+                    str(config["repair_kind"]),
+                )
 
             repair = self._extract_repair(
                 input_ids=input_ids,
@@ -775,6 +1663,7 @@ class KVRepairRunner(HistoryDriftRunner):
                 repair_mode=effective_arm,
                 source_doc_index=index,
                 stats=stats,
+                extract_source=extract_source,
             )
             token_len = int(repair["token_len"])
             expected_len = span_len
@@ -801,6 +1690,10 @@ class KVRepairRunner(HistoryDriftRunner):
                     "raw_token_count": token_len,
                     "absolute_position_start": position_start,
                     "absolute_position_end": position_end,
+                    "repair_extract_source": repair.get("extract_source") or "",
+                    "repair_extract_cache_hit_tokens": int(
+                        repair.get("cache_hit_tokens") or 0
+                    ),
                 }
             )
 
@@ -899,6 +1792,10 @@ class KVRepairRunner(HistoryDriftRunner):
 
         self._last_repair_build_info = {
             "repair_mode": effective_arm,
+            "repair_extract_source": self._repair_extract_source_for(
+                effective_arm,
+                str(config["repair_kind"]),
+            ),
             "repair_window": config["window"],
             "repair_operation": config["operation"],
             "uses_oracle_error_location": bool(config["oracle_location_hint"]),
@@ -937,7 +1834,10 @@ class KVRepairRunner(HistoryDriftRunner):
             "d_corr_w4",
             "d_corr_w2_hint",
             "d_corr_w2_oracle_location_hint",
+            "d_corr_replace_w1",
             "d_corr_replace_w2",
+            "d_corr_replace_w4",
+            "d_corr_replace_all",
             "d_corr_recompute",
             "d_corr_recompute_w2",
             "d_corr_all",
@@ -1023,6 +1923,7 @@ class KVRepairRunner(HistoryDriftRunner):
                 nonlocal messages, involved_instances, force_quit
 
                 state_before_execution = _state_log(involved_instances)
+                micro_messages = deepcopy(messages)
                 ref_step, alignment_status = reference_step_for(
                     reference_map,
                     reference_result,
@@ -1034,11 +1935,26 @@ class KVRepairRunner(HistoryDriftRunner):
                 self._repair_enabled_for_current_step = repair_enabled
                 request_messages = self._build_request_messages(messages, stats)
                 repair_build_info = deepcopy(self._last_repair_build_info)
-                text, response_message, elapsed, usage = self._query(
-                    request_messages,
-                    tools,
-                    stats,
-                )
+                raw_response: dict[str, Any] = {}
+                if (not repair_enabled) and self.collect_candidate_detector_signals:
+                    (
+                        text,
+                        response_message,
+                        elapsed,
+                        usage,
+                        raw_response,
+                    ) = self._query_with_raw(
+                        request_messages,
+                        tools,
+                        stats,
+                        collect_detector_signals=True,
+                    )
+                else:
+                    text, response_message, elapsed, usage = self._query(
+                        request_messages,
+                        tools,
+                        stats,
+                    )
                 decoded = decode_candidate(self.decoder, text)
 
                 assistant_history = _assistant_history_message(
@@ -1268,6 +2184,12 @@ class KVRepairRunner(HistoryDriftRunner):
                             "text": text,
                             "usage": usage,
                             "elapsed": elapsed,
+                            "candidate_detector_features": (
+                                self._candidate_detector_features(raw_response)
+                                if raw_response
+                                else {}
+                            ),
+                            "micro_snapshot": {"messages": micro_messages},
                             "terminal": True,
                         },
                         True,
@@ -1290,6 +2212,12 @@ class KVRepairRunner(HistoryDriftRunner):
                             "text": text,
                             "usage": usage,
                             "elapsed": elapsed,
+                            "candidate_detector_features": (
+                                self._candidate_detector_features(raw_response)
+                                if raw_response
+                                else {}
+                            ),
+                            "micro_snapshot": {"messages": micro_messages},
                             "terminal": True,
                         },
                         True,
@@ -1301,6 +2229,12 @@ class KVRepairRunner(HistoryDriftRunner):
                         "text": text,
                         "usage": usage,
                         "elapsed": elapsed,
+                        "candidate_detector_features": (
+                            self._candidate_detector_features(raw_response)
+                            if raw_response
+                            else {}
+                        ),
+                        "micro_snapshot": {"messages": micro_messages},
                         "terminal": False,
                     },
                     False,
@@ -1326,6 +2260,10 @@ class KVRepairRunner(HistoryDriftRunner):
                         global_step=len(drift_steps) + len(segment_infos),
                         repair_enabled=False,
                     )
+                    info["heuristic_attributes"] = self._heuristic_attributes(
+                        info=info,
+                        segment_infos=segment_infos,
+                    )
                     segment_infos.append(info)
                     if terminal:
                         speculative_terminal = True
@@ -1339,10 +2277,19 @@ class KVRepairRunner(HistoryDriftRunner):
                     bool(info["step_record"].get("oracle_harmful"))
                     for info in segment_infos
                 )
-                repair_triggered = (
-                    oracle_segment_harmful
-                    if self.repair_trigger == "oracle"
-                    else self.repair_trigger == "always"
+                detector_debug = self._segment_detector(segment_infos)
+                repair_triggered = bool(detector_debug.get("detector_trigger"))
+                if self.repair_trigger == "always":
+                    repair_triggered = True
+                    detector_debug = {
+                        **detector_debug,
+                        "detector": "always_trigger",
+                        "detector_trigger": True,
+                        "detector_reason": "legacy_repair_trigger_always",
+                    }
+                detector_confusion = self._detector_confusion(
+                    oracle_segment_harmful=oracle_segment_harmful,
+                    detector_trigger=repair_triggered,
                 )
                 harmful_step_indices = [
                     idx
@@ -1372,6 +2319,40 @@ class KVRepairRunner(HistoryDriftRunner):
                     "segment_length": len(segment_infos),
                     "checkpoint_interval": self.checkpoint_interval,
                     "detector_trigger": repair_triggered,
+                    "detector_arm": self.detector_arm,
+                    "detector": detector_debug.get("detector"),
+                    "detector_reason": detector_debug.get("detector_reason"),
+                    "detector_threshold": detector_debug.get("detector_threshold"),
+                    "detector_signal_name": detector_debug.get("detector_signal_name"),
+                    "detector_signal_score": detector_debug.get("detector_signal_score"),
+                    "detector_signal_threshold": detector_debug.get(
+                        "detector_signal_threshold"
+                    ),
+                    "rule_detector_trigger": detector_debug.get(
+                        "rule_detector_trigger"
+                    ),
+                    "rule_detector_max_risk": detector_debug.get(
+                        "rule_detector_max_risk"
+                    ),
+                    "rule_detector_reason": detector_debug.get(
+                        "rule_detector_reason"
+                    ),
+                    "logistic_detector_score": detector_debug.get(
+                        "logistic_detector_score"
+                    ),
+                    "logistic_detector_threshold": detector_debug.get(
+                        "logistic_detector_threshold"
+                    ),
+                    "threshold_selection_rule": detector_debug.get(
+                        "threshold_selection_rule"
+                    ),
+                    "detector_evaluation_mode": detector_debug.get(
+                        "detector_evaluation_mode"
+                    ),
+                    "detector_tp": detector_confusion["detector_tp"],
+                    "detector_fp": detector_confusion["detector_fp"],
+                    "detector_tn": detector_confusion["detector_tn"],
+                    "detector_fn": detector_confusion["detector_fn"],
                     "oracle_segment_harmful": oracle_segment_harmful,
                     "oracle_harmful_reason": harmful_reason,
                     "harmful_step_indices": harmful_step_indices,
@@ -1387,6 +2368,18 @@ class KVRepairRunner(HistoryDriftRunner):
                     ],
                     "state_drift_per_step": [
                         bool(info["step_record"].get("state_drift"))
+                        for info in segment_infos
+                    ],
+                    "oracle_harmful_drift_per_step": [
+                        bool(info["step_record"].get("oracle_harmful"))
+                        for info in segment_infos
+                    ],
+                    "candidate_detector_features_per_step": [
+                        info.get("candidate_detector_features") or {}
+                        for info in segment_infos
+                    ],
+                    "heuristic_attributes_per_step": [
+                        info.get("heuristic_attributes") or {}
                         for info in segment_infos
                     ],
                     "speculative_terminal_discarded": False,
@@ -1487,6 +2480,25 @@ class KVRepairRunner(HistoryDriftRunner):
                     repaired_records
                     and all(not row.get("state_drift") for row in repaired_records)
                 )
+                repair_segment["tp_recovery_attempt"] = bool(
+                    detector_confusion["detector_tp"]
+                )
+                repair_segment["tp_recovery_success"] = bool(
+                    detector_confusion["detector_tp"]
+                    and repair_segment["repair_segment_success"]
+                )
+                repair_segment["fp_recovery_harm"] = bool(
+                    detector_confusion["detector_fp"]
+                    and (
+                        repair_segment["repaired_action_correct"] is False
+                        or repair_segment["repaired_state_correct"] is False
+                    )
+                )
+                repair_segment["fp_recovery_still_correct"] = bool(
+                    detector_confusion["detector_fp"]
+                    and repair_segment["repaired_action_correct"] is True
+                    and repair_segment["repaired_state_correct"] is True
+                )
                 repair_segments.append(repair_segment)
                 self._active_oracle_bad_step = None
                 if repair_terminal or force_quit:
@@ -1547,6 +2559,10 @@ def run(args: argparse.Namespace) -> None:
     _write_jsonl(Path(args.metrics_path), metric_rows)
     summary = {
         "arm": args.arm,
+        "detector_arm": args.detector_arm,
+        "rule_detector_threshold": args.rule_detector_threshold,
+        "detector_signal_threshold": args.detector_signal_threshold,
+        "logistic_detector_features_csv": args.logistic_detector_features_csv,
         "category": args.category,
         "num_examples": len(details_rows),
         "errors": sum(
@@ -1635,6 +2651,25 @@ def run(args: argparse.Namespace) -> None:
         "net_repair_gain": sum(
             int(row.get("net_repair_gain") or 0) for row in metric_rows
         ),
+        "detector_tp": sum(int(row.get("detector_tp") or 0) for row in metric_rows),
+        "detector_fp": sum(int(row.get("detector_fp") or 0) for row in metric_rows),
+        "detector_tn": sum(int(row.get("detector_tn") or 0) for row in metric_rows),
+        "detector_fn": sum(int(row.get("detector_fn") or 0) for row in metric_rows),
+        "tp_recovery_attempts": sum(
+            int(row.get("tp_recovery_attempts") or 0) for row in metric_rows
+        ),
+        "tp_recovery_success_count": sum(
+            int(row.get("tp_recovery_success_count") or 0) for row in metric_rows
+        ),
+        "fp_recovery_count": sum(
+            int(row.get("fp_recovery_count") or 0) for row in metric_rows
+        ),
+        "fp_recovery_harm_count": sum(
+            int(row.get("fp_recovery_harm_count") or 0) for row in metric_rows
+        ),
+        "false_negative_count": sum(
+            int(row.get("false_negative_count") or 0) for row in metric_rows
+        ),
     }
     summary["extract_success_rate"] = (
         summary["extract_success"] / summary["extract_calls"]
@@ -1649,6 +2684,38 @@ def run(args: argparse.Namespace) -> None:
     summary["avg_episode_e2e_observed_seconds"] = (
         summary["episode_e2e_observed_seconds"] / summary["num_examples"]
         if summary["num_examples"]
+        else None
+    )
+    total_pred_pos = summary["detector_tp"] + summary["detector_fp"]
+    total_actual_pos = summary["detector_tp"] + summary["detector_fn"]
+    total_actual_neg = summary["detector_fp"] + summary["detector_tn"]
+    precision = (
+        summary["detector_tp"] / total_pred_pos if total_pred_pos else None
+    )
+    recall = summary["detector_tp"] / total_actual_pos if total_actual_pos else None
+    summary["detector_precision"] = precision
+    summary["detector_recall"] = recall
+    summary["detector_f1"] = (
+        2 * precision * recall / (precision + recall)
+        if precision is not None and recall is not None and precision + recall
+        else None
+    )
+    summary["detector_fpr"] = (
+        summary["detector_fp"] / total_actual_neg if total_actual_neg else None
+    )
+    summary["tp_recovery_success_rate"] = (
+        summary["tp_recovery_success_count"] / summary["tp_recovery_attempts"]
+        if summary["tp_recovery_attempts"]
+        else None
+    )
+    summary["fp_recovery_harm_rate"] = (
+        summary["fp_recovery_harm_count"] / summary["fp_recovery_count"]
+        if summary["fp_recovery_count"]
+        else None
+    )
+    summary["false_negative_rate"] = (
+        summary["false_negative_count"] / total_actual_pos
+        if total_actual_pos
         else None
     )
     Path(args.summary_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1690,6 +2757,16 @@ def parse_args() -> argparse.Namespace:
         choices=["1", "2", "4", "all"],
         help="Recent-W history units to restore for generic repair arms.",
     )
+    parser.add_argument(
+        "--repair-extract-source",
+        default="auto",
+        choices=["auto", "model_prefill", "serving_cache"],
+        help=(
+            "Raw repair KV source. auto keeps existing model_prefill behavior "
+            "except raw_all_replace_direct, which extracts from the normal "
+            "serving radix/KV cache after a /generate warmup."
+        ),
+    )
     parser.add_argument("--plan-path", default="")
     parser.add_argument(
         "--repair-trigger",
@@ -1700,6 +2777,34 @@ def parse_args() -> argparse.Namespace:
             "frozen Full reference says the candidate action drifted. always: "
             "apply the selected repair arm on every step."
         ),
+    )
+    parser.add_argument(
+        "--detector-arm",
+        choices=sorted(DETECTOR_ARMS),
+        default="oracle",
+        help=(
+            "Closed-loop segment detector. All detector arms share the same "
+            "Replace-W recovery path; oracle labels are still logged for "
+            "offline TP/FP/FN accounting."
+        ),
+    )
+    parser.add_argument("--rule-detector-threshold", type=float, default=5.0)
+    parser.add_argument(
+        "--detector-signal-threshold",
+        type=float,
+        default=5.0,
+        help="Threshold for detector-arm=max_risk_score after direction normalization.",
+    )
+    parser.add_argument("--candidate-logprobs-top-k", type=int, default=20)
+    parser.add_argument(
+        "--collect-candidate-detector-signals",
+        action="store_true",
+        help="Request candidate logprobs and record cheap detector signals.",
+    )
+    parser.add_argument(
+        "--logistic-detector-features-csv",
+        default="",
+        help="Episode-split detector_features.csv for combined logistic detector.",
     )
     parser.add_argument(
         "--neutral-corpus-path",

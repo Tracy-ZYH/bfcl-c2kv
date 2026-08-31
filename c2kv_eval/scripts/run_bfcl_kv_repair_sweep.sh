@@ -33,6 +33,7 @@ REPAIR_WINDOW="${REPAIR_WINDOW:-1}"
 REPAIR_TRIGGER="${REPAIR_TRIGGER:-oracle}"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-4096}"
 FLUSH_CACHE_BETWEEN_ARMS="${FLUSH_CACHE_BETWEEN_ARMS:-1}"
+RUN_COMPARE="${RUN_COMPARE:-1}"
 
 SERVER_PIDS=()
 RUNNER_PIDS=()
@@ -128,6 +129,7 @@ start_server() {
     SGLANG_ENABLE_C2KV_LOGGING="${SGLANG_ENABLE_C2KV_LOGGING:-0}" \
     C2KV_DEBUG_POSITIONS="${C2KV_DEBUG_POSITIONS:-0}" \
     C2KV_DEBUG_ASCEND_ATTN="${C2KV_DEBUG_ASCEND_ATTN:-0}" \
+    C2KV_REPAIR_EXTRACT_ATTN_IMPL="${C2KV_REPAIR_EXTRACT_ATTN_IMPL:-prompt_flash}" \
     ASCEND_RT_VISIBLE_DEVICES="${device}" \
     exec "${SGLANG_PYTHON}" -m sglang.launch_server \
       --model-path "${MODEL_PATH}" \
@@ -192,6 +194,7 @@ run_arm() {
       --ratio "${RATIO}" \
       --checkpoint-interval "${CHECKPOINT_INTERVAL}" \
       --repair-window "${REPAIR_WINDOW}" \
+      --repair-extract-source "${REPAIR_EXTRACT_SOURCE:-auto}" \
       --repair-trigger "${REPAIR_TRIGGER}" \
       --max-completion-tokens "${MAX_COMPLETION_TOKENS}" \
       --result-dir "${arm_root}/result" \
@@ -353,9 +356,13 @@ done
 
 (
   cd "${ROOT}"
-  "${BFCL_PYTHON}" -m c2kv_eval.analysis.compare_kv_repair_sweep \
-    --run-root "${RUN_ROOT}" \
-    --arms "${ARMS}"
+  if [ "${RUN_COMPARE}" = "1" ]; then
+    "${BFCL_PYTHON}" -m c2kv_eval.analysis.compare_kv_repair_sweep \
+      --run-root "${RUN_ROOT}" \
+      --arms "${ARMS}"
+  else
+    log_info "skip compare_kv_repair_sweep because RUN_COMPARE=${RUN_COMPARE}"
+  fi
 )
 
 log_info "summary: ${RUN_ROOT}/kv_repair_summary.csv"
