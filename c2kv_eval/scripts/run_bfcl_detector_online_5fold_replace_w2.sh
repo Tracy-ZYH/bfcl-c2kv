@@ -36,7 +36,7 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.55}"
 C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION:-0.10}"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-4096}"
 CANDIDATE_LOGPROBS_TOP_K="${CANDIDATE_LOGPROBS_TOP_K:-20}"
-REQUEST_CANDIDATE_LOGPROBS="${REQUEST_CANDIDATE_LOGPROBS:-1}"
+REQUEST_CANDIDATE_LOGPROBS="${REQUEST_CANDIDATE_LOGPROBS:-auto}"
 LOGISTIC_DETECTOR_FEATURE_SET="${LOGISTIC_DETECTOR_FEATURE_SET:-all}"
 RULE_DETECTOR_THRESHOLD="${RULE_DETECTOR_THRESHOLD:-5}"
 
@@ -190,6 +190,7 @@ run_detector_fold() {
   local ids_path="${RUN_ROOT}/detector_cv/fold_${fold}/test_ids.txt"
   local threshold="${RULE_DETECTOR_THRESHOLD}"
   local extra_args=()
+  local needs_logprobs=0
 
   mkdir -p "${mode_root}/result" "${mode_root}/score" "${mode_root}/logs"
   if [ ! -s "${ids_path}" ]; then
@@ -211,11 +212,23 @@ run_detector_fold() {
       --detector-cv-output-dir "${RUN_ROOT}/detector_cv"
     )
   fi
-  if [ "${REQUEST_CANDIDATE_LOGPROBS}" = "1" ]; then
+  case "${detector}" in
+    max_generation_nll|mean_generation_nll)
+      needs_logprobs=1
+      ;;
+    combined_logistic)
+      if [ "${LOGISTIC_DETECTOR_FEATURE_SET}" = "all" ]; then
+        needs_logprobs=1
+      fi
+      ;;
+  esac
+  if [ "${REQUEST_CANDIDATE_LOGPROBS}" = "1" ] || {
+    [ "${REQUEST_CANDIDATE_LOGPROBS}" = "auto" ] && [ "${needs_logprobs}" = "1" ]
+  }; then
     extra_args+=(--request-candidate-logprobs)
   fi
 
-  log_info "[runner] start detector=${detector} fold=${fold} port=${port}"
+  log_info "[runner] start detector=${detector} fold=${fold} port=${port} request_logprobs=${needs_logprobs}"
   (
     cd "${ROOT}"
     "${BFCL_PYTHON}" -m c2kv_eval.adapters.bfcl_history_kv_repair \

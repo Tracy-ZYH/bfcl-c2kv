@@ -27,6 +27,7 @@ CLEAN_OUTPUT="${CLEAN_OUTPUT:-1}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.55}"
 C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION:-0.06}"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-4096}"
+REPAIR_EXTRACT_SOURCE="${REPAIR_EXTRACT_SOURCE:-auto}"
 
 METHODS="${METHODS:-full,c2kv,rollback_d1,rollback_d2,rollback_d4,replace_w1,replace_w2,replace_w4,replace_all,append_w2,recompute_w2,hint_only,sham_mech}"
 
@@ -78,6 +79,8 @@ manifest = {
     "checkpoint_interval": int("${CHECKPOINT_INTERVAL}"),
     "recent_full_units": int("${RECENT_FULL_UNITS}"),
     "temperature": float("${TEMPERATURE}"),
+    "repair_extract_source": "${REPAIR_EXTRACT_SOURCE}",
+    "c2kv_repair_extract_attn_impl": "${C2KV_REPAIR_EXTRACT_ATTN_IMPL:-prompt_flash}",
     "methods": "${METHODS}".split(","),
     "devices": "${DEVICES}",
     "ports": "${PORTS}",
@@ -136,7 +139,7 @@ run_repair_method() {
     RUN_COMPARE=0 \
     USE_REPAIR_PLAN=0 \
     REPAIR_TRIGGER=oracle \
-    REPAIR_EXTRACT_SOURCE="${REPAIR_EXTRACT_SOURCE:-auto}" \
+    REPAIR_EXTRACT_SOURCE="${REPAIR_EXTRACT_SOURCE}" \
     C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION}" \
     MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC}" \
     MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS}" \
@@ -206,6 +209,7 @@ compare_unified() {
 log_info "Unified BFCL C2KV recovery comparison starting"
 log_info "RUN_ROOT=${RUN_ROOT}"
 log_info "METHODS=${METHODS}"
+log_info "REPAIR_EXTRACT_SOURCE=${REPAIR_EXTRACT_SOURCE}"
 log_info "DEVICES=${DEVICES} PORTS=${PORTS}"
 
 if [ "${CLEAN_OUTPUT}" = "1" ]; then

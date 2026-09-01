@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any
 
 
+MIB = 1024 * 1024
+
+
 DEFAULT_METHODS = (
     ("Full", "full"),
     ("C2KV", "c2kv"),
@@ -78,6 +81,14 @@ CSV_FIELDS = [
     "online_worst_step_gpu_kv_compression",
     "avg_full_history_kv_tokens_per_step",
     "avg_active_history_kv_tokens_per_step",
+    "history_kv_compression",
+    "mean_step_history_kv_compression",
+    "median_step_history_kv_compression",
+    "worst_step_history_kv_compression",
+    "peak_gpu_kv_mib",
+    "peak_main_kv_mib",
+    "peak_c2kv_pool_mib",
+    "peak_host_checkpoint_kv_mib",
     "actual_weighted_history_kv_compression",
     "actual_mean_step_history_kv_compression",
     "actual_median_step_history_kv_compression",
@@ -99,14 +110,18 @@ CSV_FIELDS = [
     "host_checkpoint_kv_tokens",
     "avg_host_checkpoint_kv_tokens",
     "peak_host_checkpoint_kv_tokens",
+    "avg_host_checkpoint_kv_mib",
     "cumulative_host_checkpoint_token_volume",
     "avg_resident_host_checkpoint_kv_tokens",
     "peak_resident_host_checkpoint_kv_tokens",
+    "avg_resident_host_checkpoint_kv_mib",
+    "peak_resident_host_checkpoint_kv_mib",
     "host_raw_bank_kv_tokens",
     "peak_host_kv_tokens",
     "raw_kv_bank_implemented",
     "runtime_memory_report_steps",
     "runtime_memory_missing_steps",
+    "bytes_per_kv_token",
     "schema_version",
 ]
 
@@ -130,6 +145,13 @@ V3_CSV_FIELDS = [
     "model_calls_per_committed_step",
     "avg_full_history_kv_tokens_per_step",
     "avg_active_history_kv_tokens_per_step",
+    "history_kv_compression",
+    "mean_step_history_kv_compression",
+    "worst_step_history_kv_compression",
+    "peak_gpu_kv_mib",
+    "peak_main_kv_mib",
+    "peak_c2kv_pool_mib",
+    "peak_host_checkpoint_kv_mib",
     "actual_weighted_history_kv_compression",
     "actual_mean_step_history_kv_compression",
     "actual_worst_step_history_kv_compression",
@@ -138,6 +160,8 @@ V3_CSV_FIELDS = [
     "estimated_weighted_history_kv_compression",
     "avg_resident_host_checkpoint_kv_tokens",
     "peak_resident_host_checkpoint_kv_tokens",
+    "avg_resident_host_checkpoint_kv_mib",
+    "peak_resident_host_checkpoint_kv_mib",
     "raw_kv_bank_implemented",
     "schema_version",
 ]
@@ -154,12 +178,14 @@ QUICK_CSV_FIELDS = [
     "Regenerated Steps",
     "Model Calls / Committed Step",
     "Avg Active GPU KV Tokens / Step",
-    "Weighted GPU KV Compression",
-    "Mean Step GPU KV Compression",
-    "Worst Step GPU KV Compression",
+    "History KV Compression",
+    "Mean Step History KV Compression",
+    "Worst Step History KV Compression",
+    "Peak GPU KV MiB",
+    "Peak Main KV MiB",
+    "Peak C2KV Pool MiB",
     "Memory Report Coverage",
-    "Avg Host Checkpoint KV",
-    "Peak Host Checkpoint KV",
+    "Peak Host Checkpoint KV MiB",
 ]
 
 
@@ -199,7 +225,9 @@ def _int(value: Any) -> int:
         return 0
 
 
-def _safe_rate(num: float, den: float) -> float | None:
+def _safe_rate(num: float | int | None, den: float | int | None) -> float | None:
+    if num is None:
+        return None
     return num / den if den else None
 
 
@@ -362,19 +390,47 @@ def _segments_from_repair(details: list[dict[str, Any]]) -> list[dict[str, Any]]
 def _memory_from_steps(steps: list[dict[str, Any]]) -> dict[str, Any]:
     actual_pairs: list[tuple[float, float]] = []
     estimated_pairs: list[tuple[float, float]] = []
+    actual_report_count = 0
     missing = 0
+    peak_gpu_bytes: float | None = None
+    peak_main_bytes: float | None = None
+    peak_c2kv_bytes: float | None = None
+    bytes_per_kv_token: float | None = None
     for step in steps:
         report = step.get("kv_memory_report")
         if isinstance(report, dict):
+            actual_report_count += 1
             full = _num(report.get("full_equivalent_history_tokens"))
-            active = _num(
-                report.get("active_history_kv_tokens")
-                or report.get("resident_history_kv_tokens")
-            )
-            if full is not None and active and active > 0:
+            active = _num(report.get("active_history_kv_tokens"))
+            if full is not None and active is not None and active >= 0:
                 actual_pairs.append((full, active))
             else:
                 missing += 1
+            bytes_per_kv_token = bytes_per_kv_token or _num(
+                report.get("bytes_per_kv_token")
+            )
+
+            current_total = _num(report.get("total_gpu_kv_bytes"))
+            peak_total = _num(report.get("peak_total_gpu_kv_bytes"))
+            total_value = peak_total if peak_total is not None else current_total
+            if total_value is not None:
+                peak_gpu_bytes = max(peak_gpu_bytes or 0.0, total_value)
+
+            current_main = _num(report.get("physical_main_kv_bytes"))
+            peak_main_slots = _num(report.get("peak_main_paged_kv_slots"))
+            main_value = current_main
+            if peak_main_slots is not None and bytes_per_kv_token is not None:
+                main_value = max(main_value or 0.0, peak_main_slots * bytes_per_kv_token)
+            if main_value is not None:
+                peak_main_bytes = max(peak_main_bytes or 0.0, main_value)
+
+            current_c2kv = _num(report.get("physical_c2kv_pool_bytes"))
+            peak_c2kv_slots = _num(report.get("peak_c2kv_pool_slots"))
+            c2kv_value = current_c2kv
+            if peak_c2kv_slots is not None and bytes_per_kv_token is not None:
+                c2kv_value = max(c2kv_value or 0.0, peak_c2kv_slots * bytes_per_kv_token)
+            if c2kv_value is not None:
+                peak_c2kv_bytes = max(peak_c2kv_bytes or 0.0, c2kv_value)
         else:
             missing += 1
 
@@ -387,7 +443,11 @@ def _memory_from_steps(steps: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(steps)
 
     def summarize_pairs(pairs: list[tuple[float, float]]) -> dict[str, Any]:
-        ratios = [full / active for full, active in pairs if active > 0]
+        ratios = [
+            full / active
+            for full, active in pairs
+            if full is not None and full > 0 and active is not None and active > 0
+        ]
         sum_full = sum(full for full, _ in pairs)
         sum_active = sum(active for _, active in pairs)
         return {
@@ -401,7 +461,8 @@ def _memory_from_steps(steps: list[dict[str, Any]]) -> dict[str, Any]:
 
     actual = summarize_pairs(actual_pairs)
     estimated = summarize_pairs(estimated_pairs)
-    coverage = _safe_rate(len(actual_pairs), total)
+    coverage = _safe_rate(actual_report_count, total)
+    status = "complete" if total and actual_report_count == total and missing == 0 else "incomplete"
     return {
         "avg_full_equivalent_history_kv_tokens_per_step": actual["avg_full"],
         "avg_active_gpu_history_kv_tokens_per_step": actual["avg_active"],
@@ -410,14 +471,19 @@ def _memory_from_steps(steps: list[dict[str, Any]]) -> dict[str, Any]:
         "online_worst_step_gpu_kv_compression": actual["worst"],
         "avg_full_history_kv_tokens_per_step": actual["avg_full"],
         "avg_active_history_kv_tokens_per_step": actual["avg_active"],
+        "history_kv_compression": actual["weighted"],
+        "mean_step_history_kv_compression": actual["mean"],
+        "median_step_history_kv_compression": actual["median"],
+        "worst_step_history_kv_compression": actual["worst"],
         "actual_weighted_history_kv_compression": actual["weighted"],
         "actual_mean_step_history_kv_compression": actual["mean"],
         "actual_median_step_history_kv_compression": actual["median"],
         "actual_worst_step_history_kv_compression": actual["worst"],
+        "peak_gpu_kv_mib": _safe_rate(peak_gpu_bytes, MIB),
+        "peak_main_kv_mib": _safe_rate(peak_main_bytes, MIB),
+        "peak_c2kv_pool_mib": _safe_rate(peak_c2kv_bytes, MIB),
         "memory_report_coverage": coverage,
-        "actual_compression_status": (
-            "complete" if total and len(actual_pairs) == total else "incomplete"
-        ),
+        "actual_compression_status": status,
         "estimated_avg_full_history_tokens_per_step": estimated["avg_full"],
         "estimated_avg_active_history_tokens_per_step": estimated["avg_active"],
         "estimated_online_weighted_gpu_history_kv_compression": estimated["weighted"],
@@ -425,8 +491,9 @@ def _memory_from_steps(steps: list[dict[str, Any]]) -> dict[str, Any]:
         "estimated_online_median_step_gpu_kv_compression": estimated["median"],
         "estimated_online_worst_step_gpu_kv_compression": estimated["worst"],
         "estimated_weighted_history_kv_compression": estimated["weighted"],
-        "runtime_memory_report_steps": len(actual_pairs),
+        "runtime_memory_report_steps": actual_report_count,
         "runtime_memory_missing_steps": missing,
+        "bytes_per_kv_token": bytes_per_kv_token,
     }
 
 
@@ -560,6 +627,17 @@ def summarize_method(run_root: Path, method: str, dirname: str, category: str) -
         peak_host_checkpoint = _num(checkpoint_summary.get("peak_checkpoint_host_tokens"))
     if peak_host_checkpoint is None:
         peak_host_checkpoint = _num(metrics.get("peak_checkpoint_host_tokens"))
+    bytes_per_kv_token = _num(memory.get("bytes_per_kv_token"))
+    avg_host_checkpoint_mib = (
+        avg_host_checkpoint * bytes_per_kv_token / MIB
+        if avg_host_checkpoint is not None and bytes_per_kv_token is not None
+        else None
+    )
+    peak_host_checkpoint_mib = (
+        peak_host_checkpoint * bytes_per_kv_token / MIB
+        if peak_host_checkpoint is not None and bytes_per_kv_token is not None
+        else None
+    )
 
     row: dict[str, Any] = {
         "method": method,
@@ -609,9 +687,13 @@ def summarize_method(run_root: Path, method: str, dirname: str, category: str) -
         "host_checkpoint_kv_tokens": total_host_checkpoint,
         "avg_host_checkpoint_kv_tokens": avg_host_checkpoint,
         "peak_host_checkpoint_kv_tokens": peak_host_checkpoint,
+        "avg_host_checkpoint_kv_mib": avg_host_checkpoint_mib,
+        "peak_host_checkpoint_kv_mib": peak_host_checkpoint_mib,
         "cumulative_host_checkpoint_token_volume": total_host_checkpoint,
         "avg_resident_host_checkpoint_kv_tokens": avg_host_checkpoint,
         "peak_resident_host_checkpoint_kv_tokens": peak_host_checkpoint,
+        "avg_resident_host_checkpoint_kv_mib": avg_host_checkpoint_mib,
+        "peak_resident_host_checkpoint_kv_mib": peak_host_checkpoint_mib,
         "host_raw_bank_kv_tokens": 0,
         "peak_host_kv_tokens": peak_host_checkpoint
         or _num(checkpoint_summary.get("peak_host_kv_tokens")),
@@ -661,21 +743,19 @@ def _write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
             "Avg Active GPU KV Tokens / Step": row.get(
                 "avg_active_history_kv_tokens_per_step"
             ),
-            "Weighted GPU KV Compression": row.get(
-                "actual_weighted_history_kv_compression"
+            "History KV Compression": row.get("history_kv_compression"),
+            "Mean Step History KV Compression": row.get(
+                "mean_step_history_kv_compression"
             ),
-            "Mean Step GPU KV Compression": row.get(
-                "actual_mean_step_history_kv_compression"
+            "Worst Step History KV Compression": row.get(
+                "worst_step_history_kv_compression"
             ),
-            "Worst Step GPU KV Compression": row.get(
-                "actual_worst_step_history_kv_compression"
-            ),
+            "Peak GPU KV MiB": row.get("peak_gpu_kv_mib"),
+            "Peak Main KV MiB": row.get("peak_main_kv_mib"),
+            "Peak C2KV Pool MiB": row.get("peak_c2kv_pool_mib"),
             "Memory Report Coverage": row.get("memory_report_coverage"),
-            "Avg Host Checkpoint KV": row.get(
-                "avg_resident_host_checkpoint_kv_tokens"
-            ),
-            "Peak Host Checkpoint KV": row.get(
-                "peak_resident_host_checkpoint_kv_tokens"
+            "Peak Host Checkpoint KV MiB": row.get(
+                "peak_resident_host_checkpoint_kv_mib"
             ),
         }
 
@@ -695,9 +775,13 @@ def _write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
         "reference_recovery_success_rate",
         "total_committed_steps",
         "model_calls_per_committed_step",
-        "actual_weighted_history_kv_compression",
-        "estimated_weighted_history_kv_compression",
+        "history_kv_compression",
+        "mean_step_history_kv_compression",
+        "worst_step_history_kv_compression",
+        "peak_gpu_kv_mib",
+        "peak_host_checkpoint_kv_mib",
         "memory_report_coverage",
+        "actual_compression_status",
     ]
     lines = ["# Unified C2KV Recovery Comparison", ""]
     lines.append("| " + " | ".join(md_cols) + " |")
@@ -733,6 +817,102 @@ def _write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
     quick_md_path.write_text("\n".join(quick_lines) + "\n", encoding="utf-8")
 
 
+def _repair_transition_diagnosis(run_root: Path, dirname: str) -> dict[str, Any]:
+    details = _load_jsonl(run_root / dirname / "logs" / "details.jsonl")
+    segments = _segments_from_repair(details)
+    counts = {
+        "triggered": 0,
+        "success": 0,
+        "action_wrong_to_correct": 0,
+        "action_wrong_to_wrong": 0,
+        "action_correct_to_wrong": 0,
+        "action_correct_to_correct": 0,
+        "state_wrong_to_correct": 0,
+        "state_wrong_to_wrong": 0,
+        "state_correct_to_wrong": 0,
+        "state_correct_to_correct": 0,
+    }
+    examples: list[dict[str, Any]] = []
+    for seg in segments:
+        if not bool(seg.get("repair_triggered") or seg.get("detector_trigger")):
+            continue
+        counts["triggered"] += 1
+        if bool(seg.get("repair_segment_success")):
+            counts["success"] += 1
+        before_action = _segment_value(seg, "candidate_action_correct")
+        after_action = _segment_value(
+            seg, "repaired_action_correct", "executed_action_correct"
+        )
+        before_state = _segment_value(seg, "candidate_state_correct")
+        after_state = _segment_value(
+            seg, "repaired_state_correct", "executed_state_correct"
+        )
+        if before_action is False and after_action is True:
+            counts["action_wrong_to_correct"] += 1
+        elif before_action is False and after_action is False:
+            counts["action_wrong_to_wrong"] += 1
+        elif before_action is True and after_action is False:
+            counts["action_correct_to_wrong"] += 1
+            if len(examples) < 8:
+                examples.append(
+                    {
+                        key: seg.get(key)
+                        for key in (
+                            "id",
+                            "turn",
+                            "segment_start_step",
+                            "segment_length",
+                            "repair_target_indices",
+                            "repair_operation",
+                            "candidate_action_correct",
+                            "repaired_action_correct",
+                            "candidate_state_correct",
+                            "repaired_state_correct",
+                            "repair_raw_tokens",
+                            "physical_prefix_len_before",
+                            "physical_prefix_len_after",
+                            "logical_position_before",
+                            "logical_position_after",
+                        )
+                    }
+                )
+        elif before_action is True and after_action is True:
+            counts["action_correct_to_correct"] += 1
+
+        if before_state is False and after_state is True:
+            counts["state_wrong_to_correct"] += 1
+        elif before_state is False and after_state is False:
+            counts["state_wrong_to_wrong"] += 1
+        elif before_state is True and after_state is False:
+            counts["state_correct_to_wrong"] += 1
+        elif before_state is True and after_state is True:
+            counts["state_correct_to_correct"] += 1
+    counts["action_net_recovery_gain"] = (
+        counts["action_wrong_to_correct"] - counts["action_correct_to_wrong"]
+    )
+    counts["state_net_recovery_gain"] = (
+        counts["state_wrong_to_correct"] - counts["state_correct_to_wrong"]
+    )
+    return {"counts": counts, "correct_to_wrong_examples": examples}
+
+
+def _write_append_w2_diagnosis(run_root: Path) -> None:
+    out = {
+        "interpretation": (
+            "Append W2 keeps target gist KV visible while appending the same "
+            "Recent-2 raw KV. If Append has more correct_to_wrong segments than "
+            "Replace W2, the likely cause is duplicate representation interference, "
+            "not a missing repair path."
+        ),
+        "append_w2": _repair_transition_diagnosis(run_root, "append_w2"),
+        "replace_w2": _repair_transition_diagnosis(run_root, "replace_w2"),
+    }
+    (run_root / "append_w2_diagnosis.json").write_text(
+        json.dumps(out, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", required=True)
@@ -762,6 +942,7 @@ def main() -> None:
             continue
         rows.append(summarize_method(run_root, label, dirname, args.category))
     _write_outputs(run_root, rows)
+    _write_append_w2_diagnosis(run_root)
     print(json.dumps({"run_root": str(run_root), "rows": len(rows)}, ensure_ascii=False))
 
 

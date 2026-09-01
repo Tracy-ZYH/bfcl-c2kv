@@ -1864,7 +1864,8 @@ class KVRepairRunner(HistoryDriftRunner):
         anchor_index = target_indices[0] if target_indices else latest_index
 
         if (
-            effective_arm in {"raw_all_replace", "raw_all_replace_direct"}
+            effective_arm
+            in {"d_corr_replace_all", "raw_all_replace", "raw_all_replace_direct"}
             and config["operation"] == "replace"
             and config["repair_kind"] == "raw"
             and target_indices == list(range(len(units)))
@@ -3200,9 +3201,11 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         choices=["auto", "model_prefill", "serving_cache"],
         help=(
-            "Raw repair KV source. auto keeps existing model_prefill behavior "
+            "Raw repair KV source. auto keeps the stable model_prefill path "
             "except raw_all_replace_direct, which extracts from the normal "
-            "serving radix/KV cache after a /generate warmup."
+            "serving radix/KV cache after a /generate warmup. Use "
+            "serving_cache explicitly to debug serving-cache raw copy for all "
+            "raw repair arms."
         ),
     )
     parser.add_argument("--plan-path", default="")
