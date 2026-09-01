@@ -434,6 +434,38 @@ def summarize(run_root: Path, arms: list[str]) -> list[dict[str, Any]]:
                         "diagnostic only; not a fatal no-op failure"
                     )
                     break
+    if "d_corr_replace_w2" in detail_by_arm and "append_masked_w2" in detail_by_arm:
+        replace = {
+            row.get("id"): row.get("result")
+            for row in detail_by_arm["d_corr_replace_w2"]
+        }
+        mismatches = []
+        for row in detail_by_arm["append_masked_w2"]:
+            sample_id = row.get("id")
+            if sample_id in replace and row.get("result") != replace[sample_id]:
+                mismatches.append(sample_id)
+        if mismatches:
+            mismatch_path = run_root / "append_masked_w2_mismatches.json"
+            mismatch_path.write_text(
+                json.dumps(
+                    {
+                        "note": (
+                            "append_masked_w2 should be deterministic-equivalent "
+                            "to d_corr_replace_w2. A mismatch indicates a KV slot "
+                            "ordering, position correction, or mask/layout bug."
+                        ),
+                        "sample_ids": mismatches,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            raise RuntimeError(
+                "append_masked_w2 output mismatch vs d_corr_replace_w2 for "
+                f"{len(mismatches)} samples; see {mismatch_path}"
+            )
     full_work = next(
         (
             int(row.get("total_actual_recomputed_tokens") or 0)

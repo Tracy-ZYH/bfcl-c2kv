@@ -202,9 +202,10 @@ def summarize_mode(run_root: Path, mode: str) -> dict[str, Any]:
             or (segments[0].get("detector_arm") if segments else mode)
         ),
         "threshold": (
-            run_summary.get("detector_signal_threshold")
-            or run_summary.get("rule_detector_threshold")
+            (segments[0].get("logistic_detector_threshold") if segments else None)
             or (segments[0].get("detector_threshold") if segments else None)
+            or run_summary.get("detector_signal_threshold")
+            or run_summary.get("rule_detector_threshold")
         ),
         "bfcl_accuracy": accuracy,
         "correct_count": correct,

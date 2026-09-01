@@ -18,30 +18,29 @@ CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-4}"
 TEMPERATURE="${TEMPERATURE:-0}"
 REPAIR_ARM="${REPAIR_ARM:-d_corr_replace_w2}"
 REPAIR_WINDOW="${REPAIR_WINDOW:-2}"
-RULE_DETECTOR_THRESHOLD="${RULE_DETECTOR_THRESHOLD:-5}"
-CANDIDATE_LOGPROBS_TOP_K="${CANDIDATE_LOGPROBS_TOP_K:-20}"
-REQUEST_CANDIDATE_LOGPROBS="${REQUEST_CANDIDATE_LOGPROBS:-0}"
-LOGISTIC_DETECTOR_KFOLDS="${LOGISTIC_DETECTOR_KFOLDS:-0}"
-LOGISTIC_DETECTOR_FEATURE_SET="${LOGISTIC_DETECTOR_FEATURE_SET:-auto}"
-MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.55}"
-C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION:-0.10}"
-MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-4096}"
+FOLDS="${FOLDS:-5}"
 
 IDS_PATH="${IDS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_temp0_stability_20260819_172725/frozen_reference/correct_ids.txt}"
 REFERENCE_DETAILS="${REFERENCE_DETAILS:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_temp0_stability_20260819_172725/frozen_reference/details.jsonl}"
 DETECTOR_BENCHMARK_ROOT="${DETECTOR_BENCHMARK_ROOT:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_detector_signal_benchmark_20260825_134109/detector_benchmark}"
 LOGISTIC_DETECTOR_FEATURES_CSV="${LOGISTIC_DETECTOR_FEATURES_CSV:-${DETECTOR_BENCHMARK_ROOT}/detector_features.csv}"
-DETECTOR_COMPARISON_CSV="${DETECTOR_COMPARISON_CSV:-${DETECTOR_BENCHMARK_ROOT}/detector_comparison.csv}"
 
-DETECTORS="${DETECTORS:-never_trigger,oracle,combined_logistic_best_f1,combined_logistic_high_recall,max_risk_score,rule_trigger,always_trigger}"
-DEVICES="${DEVICES:-4,7}"
-PORTS="${PORTS:-34704,34707}"
+DETECTORS="${DETECTORS:-never_trigger,oracle,combined_logistic,max_risk_score,rule_detector_max_risk,max_observation_anomaly,mean_risk_score,max_hard_error,rule_trigger,max_generation_nll,mean_generation_nll,always_trigger}"
+DEVICES="${DEVICES:-4,5}"
+PORTS="${PORTS:-35404,35405}"
 STAMP="${STAMP:-$(date '+%Y%m%d_%H%M%S')}"
-RUN_ROOT="${RUN_ROOT:-/home/zhuyuhan/project/gorilla/bfcl_runs/detector_closed_loop_replace_w2_stable52_${STAMP}}"
-CLEAN_OUTPUT="${CLEAN_OUTPUT:-0}"
+RUN_ROOT="${RUN_ROOT:-/home/zhuyuhan/project/gorilla/bfcl_runs/detector_online_5fold_replace_w2_${STAMP}}"
+CLEAN_OUTPUT="${CLEAN_OUTPUT:-1}"
+
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.55}"
+C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION:-0.10}"
+MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-4096}"
+CANDIDATE_LOGPROBS_TOP_K="${CANDIDATE_LOGPROBS_TOP_K:-20}"
+REQUEST_CANDIDATE_LOGPROBS="${REQUEST_CANDIDATE_LOGPROBS:-1}"
+LOGISTIC_DETECTOR_FEATURE_SET="${LOGISTIC_DETECTOR_FEATURE_SET:-all}"
+RULE_DETECTOR_THRESHOLD="${RULE_DETECTOR_THRESHOLD:-5}"
 
 SERVER_PIDS=()
-MODES=()
 
 log_info() {
   echo "[$(date '+%F %T')] $*"
@@ -98,24 +97,6 @@ PY
   fi
 }
 
-threshold_for_signal() {
-  local signal="$1"
-  "${BFCL_PYTHON}" - "${DETECTOR_COMPARISON_CSV}" "${signal}" <<'PY'
-import csv
-import sys
-
-path, signal = sys.argv[1], sys.argv[2]
-with open(path, encoding="utf-8") as f:
-    for row in csv.DictReader(f):
-        if row.get("signal") == signal:
-            value = row.get("best_threshold")
-            if value not in (None, ""):
-                print(value)
-                raise SystemExit(0)
-raise SystemExit(f"missing best_threshold for {signal} in {path}")
-PY
-}
-
 start_server() {
   local device="$1"
   local port="$2"
@@ -146,7 +127,6 @@ start_server() {
       --c2kv-pool-fraction "${C2KV_POOL_FRACTION}" \
       --dtype bfloat16 \
       --mem-fraction-static "${MEM_FRACTION_STATIC}" \
-      --enable-cache-report \
       --host 127.0.0.1 \
       --port "${port}"
   ) >"${log}" 2>&1 &
@@ -170,39 +150,72 @@ wait_health() {
       log_info "[server] healthy on port ${port}"
       return 0
     fi
-    if [ $((attempt % 15)) -eq 0 ]; then
-      log_info "[server] waiting for port ${port} (${attempt}/900)"
-    fi
     sleep 2
   done
   tail -n 120 "${log}" || true
   return 1
 }
 
-run_detector() {
+prepare_cv() {
+  mkdir -p "${RUN_ROOT}/detector_cv"
+  (
+    cd "${ROOT}"
+    "${BFCL_PYTHON}" -m c2kv_eval.analysis.prepare_detector_online_5fold \
+      --ids-path "${IDS_PATH}" \
+      --features-csv "${LOGISTIC_DETECTOR_FEATURES_CSV}" \
+      --output-dir "${RUN_ROOT}/detector_cv" \
+      --folds "${FOLDS}" \
+      --max-examples "${MAX_EXAMPLES}"
+  ) >"${RUN_ROOT}/detector_cv/prepare.log" 2>&1
+}
+
+scalar_threshold_for_fold() {
   local detector="$1"
-  local port="$2"
-  local mode="detector_${detector}"
-  local mode_root="${RUN_ROOT}/${mode}"
-  local signal_threshold="${DETECTOR_SIGNAL_THRESHOLD:-5}"
+  local fold="$2"
+  "${BFCL_PYTHON}" - "${RUN_ROOT}/detector_cv/scalar_thresholds.json" "${detector}" "${fold}" <<'PY'
+import json
+import sys
+
+path, detector, fold = sys.argv[1], sys.argv[2], sys.argv[3]
+payload = json.load(open(path, encoding="utf-8"))
+print(payload["fold_thresholds"][fold][detector])
+PY
+}
+
+run_detector_fold() {
+  local detector="$1"
+  local fold="$2"
+  local port="$3"
+  local mode_root="${RUN_ROOT}/detector_${detector}/fold_${fold}"
+  local ids_path="${RUN_ROOT}/detector_cv/fold_${fold}/test_ids.txt"
+  local threshold="${RULE_DETECTOR_THRESHOLD}"
   local extra_args=()
 
-  if [ "${detector}" = "max_risk_score" ]; then
-    signal_threshold="$(threshold_for_signal max_risk_score)"
+  mkdir -p "${mode_root}/result" "${mode_root}/score" "${mode_root}/logs"
+  if [ ! -s "${ids_path}" ]; then
+    log_info "[runner] skip detector=${detector} fold=${fold}: empty test fold"
+    echo '{"num_examples": 0, "skipped_empty_fold": true}' > "${mode_root}/logs/summary.json"
+    return 0
   fi
-  if [[ "${detector}" == combined_logistic* ]]; then
+
+  case "${detector}" in
+    max_risk_score|rule_detector_max_risk|max_observation_anomaly|mean_risk_score|max_hard_error|max_generation_nll|mean_generation_nll)
+      threshold="$(scalar_threshold_for_fold "${detector}" "${fold}")"
+      ;;
+  esac
+  if [ "${detector}" = "combined_logistic" ]; then
     extra_args+=(
       --logistic-detector-features-csv "${LOGISTIC_DETECTOR_FEATURES_CSV}"
-      --logistic-detector-kfolds "${LOGISTIC_DETECTOR_KFOLDS}"
+      --logistic-detector-kfolds "${FOLDS}"
       --logistic-detector-feature-set "${LOGISTIC_DETECTOR_FEATURE_SET}"
+      --detector-cv-output-dir "${RUN_ROOT}/detector_cv"
     )
   fi
   if [ "${REQUEST_CANDIDATE_LOGPROBS}" = "1" ]; then
     extra_args+=(--request-candidate-logprobs)
   fi
 
-  mkdir -p "${mode_root}/result" "${mode_root}/score" "${mode_root}/logs"
-  log_info "[runner] start detector=${detector} port=${port} mode=${mode}"
+  log_info "[runner] start detector=${detector} fold=${fold} port=${port}"
   (
     cd "${ROOT}"
     "${BFCL_PYTHON}" -m c2kv_eval.adapters.bfcl_history_kv_repair \
@@ -210,7 +223,7 @@ run_detector() {
       --detector-arm "${detector}" \
       --category "${CATEGORY}" \
       --max-examples "${MAX_EXAMPLES}" \
-      --ids-path "${IDS_PATH}" \
+      --ids-path "${ids_path}" \
       --model "${MODEL_ID}" \
       --served-model-name "${MODEL_ID}" \
       --base-url "http://127.0.0.1:${port}" \
@@ -226,7 +239,8 @@ run_detector() {
       --repair-extract-source "${REPAIR_EXTRACT_SOURCE:-auto}" \
       --repair-trigger oracle \
       --rule-detector-threshold "${RULE_DETECTOR_THRESHOLD}" \
-      --detector-signal-threshold "${signal_threshold}" \
+      --detector-signal-threshold "${threshold}" \
+      --detector-thresholds-json "${RUN_ROOT}/detector_cv/scalar_thresholds.json" \
       --candidate-logprobs-top-k "${CANDIDATE_LOGPROBS_TOP_K}" \
       --collect-candidate-detector-signals \
       --max-completion-tokens "${MAX_COMPLETION_TOKENS}" \
@@ -243,19 +257,17 @@ run_detector() {
       --score-dir "${mode_root}/score" \
       --partial-eval
   ) >"${mode_root}/logs/eval.log" 2>&1
-  log_info "[runner] done detector=${detector}"
+  log_info "[runner] done detector=${detector} fold=${fold}"
 }
 
 merge_report() {
-  local mode_csv
-  mode_csv="$(IFS=,; echo "${MODES[*]}")"
   (
     cd "${ROOT}"
-    "${BFCL_PYTHON}" -m c2kv_eval.analysis.compare_detector_closed_loop \
+    "${BFCL_PYTHON}" -m c2kv_eval.analysis.compare_detector_online_5fold \
       --run-root "${RUN_ROOT}" \
-      --modes "${mode_csv}"
-  ) >"${RUN_ROOT}/compare_detector_closed_loop.log" 2>&1
-  log_info "[compare] wrote ${RUN_ROOT}/detector_closed_loop_summary.csv"
+      --detectors "${DETECTORS}" \
+      --folds "${FOLDS}"
+  ) >"${RUN_ROOT}/compare_detector_online_5fold.log" 2>&1
 }
 
 if [ "${CLEAN_OUTPUT}" = "1" ] && [ -d "${RUN_ROOT}" ]; then
@@ -263,18 +275,19 @@ if [ "${CLEAN_OUTPUT}" = "1" ] && [ -d "${RUN_ROOT}" ]; then
 fi
 mkdir -p "${RUN_ROOT}"
 
-log_info "BFCL detector closed-loop Replace-W2 sweep"
+log_info "BFCL detector online 5-fold Replace-W2 benchmark"
 log_info "RUN_ROOT=${RUN_ROOT}"
 log_info "DETECTORS=${DETECTORS}"
 log_info "DEVICES=${DEVICES} PORTS=${PORTS}"
-log_info "REPAIR_ARM=${REPAIR_ARM} K=${CHECKPOINT_INTERVAL} ratio=${RATIO}"
-log_info "LOGISTIC_DETECTOR_KFOLDS=${LOGISTIC_DETECTOR_KFOLDS} LOGISTIC_DETECTOR_FEATURE_SET=${LOGISTIC_DETECTOR_FEATURE_SET} REQUEST_CANDIDATE_LOGPROBS=${REQUEST_CANDIDATE_LOGPROBS}"
+log_info "FEATURES=${LOGISTIC_DETECTOR_FEATURES_CSV}"
+log_info "REQUEST_CANDIDATE_LOGPROBS=${REQUEST_CANDIDATE_LOGPROBS}"
 
 source_env_file /usr/local/Ascend/cann-8.5.0/set_env.sh
 source_env_file /usr/local/Ascend/nnal/atb/set_env.sh
 
 IFS=',' read -r -a DEVICE_LIST <<< "${DEVICES}"
 IFS=',' read -r -a PORT_LIST <<< "${PORTS}"
+IFS=',' read -r -a DETECTOR_LIST <<< "${DETECTORS}"
 if [ "${#DEVICE_LIST[@]}" -ne "${#PORT_LIST[@]}" ]; then
   echo "DEVICES and PORTS must have the same length"
   exit 1
@@ -282,6 +295,9 @@ fi
 for port in "${PORT_LIST[@]}"; do
   check_port_free "${port}"
 done
+
+prepare_cv
+
 for idx in "${!DEVICE_LIST[@]}"; do
   start_server "${DEVICE_LIST[$idx]}" "${PORT_LIST[$idx]}"
 done
@@ -289,24 +305,27 @@ for idx in "${!PORT_LIST[@]}"; do
   wait_health "${PORT_LIST[$idx]}" "${SERVER_PIDS[$idx]}" "${RUN_ROOT}/server_${DEVICE_LIST[$idx]}_${PORT_LIST[$idx]}.log"
 done
 
-IFS=',' read -r -a DETECTOR_LIST <<< "${DETECTORS}"
-PIDS=()
+JOBS=()
 for detector in "${DETECTOR_LIST[@]}"; do
-  MODES+=("detector_${detector}")
+  for fold in $(seq 0 $((FOLDS - 1))); do
+    JOBS+=("${detector}:${fold}")
+  done
 done
 
 run_worker() {
   local worker_idx="$1"
   local port="${PORT_LIST[$worker_idx]}"
   local idx
-  for idx in "${!DETECTOR_LIST[@]}"; do
+  for idx in "${!JOBS[@]}"; do
     if [ $((idx % ${#PORT_LIST[@]})) -ne "${worker_idx}" ]; then
       continue
     fi
-    run_detector "${DETECTOR_LIST[$idx]}" "${port}"
+    IFS=':' read -r detector fold <<< "${JOBS[$idx]}"
+    run_detector_fold "${detector}" "${fold}" "${port}"
   done
 }
 
+PIDS=()
 for worker_idx in "${!PORT_LIST[@]}"; do
   run_worker "${worker_idx}" &
   PIDS+=("$!")
@@ -319,9 +338,9 @@ for pid in "${PIDS[@]}"; do
   fi
 done
 if [ "${status}" -ne 0 ]; then
-  log_info "At least one detector run failed."
+  log_info "At least one detector fold failed."
   exit "${status}"
 fi
 
 merge_report
-log_info "Done. RUN_ROOT=${RUN_ROOT}"
+log_info "Done. Summary: ${RUN_ROOT}/detector_online_5fold_summary.csv"

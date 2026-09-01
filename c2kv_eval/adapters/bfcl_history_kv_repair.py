@@ -26,6 +26,7 @@ from c2kv_eval.adapters.bfcl_history_drift import (
     _assistant_history_message,
     _history_units,
     _kv_runtime_stats_from_response,
+    _kv_memory_report_from_response,
     _latest_user_query_index,
     _message_text,
     _post_json,
@@ -72,6 +73,7 @@ REPAIR_ARMS = {
     "d_corr_replace_w2",
     "d_corr_replace_w4",
     "d_corr_replace_all",
+    "append_masked_w2",
     "d_corr_recompute",
     "d_corr_recompute_w2",
     "d_corr_all",
@@ -85,10 +87,29 @@ DETECTOR_ARMS = {
     "combined_logistic_best_f1",
     "combined_logistic_high_recall",
     "max_risk_score",
+    "rule_detector_max_risk",
+    "max_observation_anomaly",
+    "mean_risk_score",
+    "max_hard_error",
+    "max_generation_nll",
+    "mean_generation_nll",
     "rule_trigger",
     "always_trigger",
     "never_trigger",
 }
+
+LOGISTIC_LOGPROB_FEATURE_PATTERNS = (
+    "generation_nll",
+    "generation_ppl",
+    "generation_token_count",
+    "logprob",
+    "top1_probability",
+    "top1_top2_margin",
+    "entropy",
+    "detector_signal",
+    "attention",
+    "readout",
+)
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -128,6 +149,9 @@ class KVRepairRunner(HistoryDriftRunner):
         self.candidate_logprobs_top_k = int(
             getattr(args, "candidate_logprobs_top_k", 20)
         )
+        self.request_candidate_logprobs = bool(
+            getattr(args, "request_candidate_logprobs", False)
+        )
         self.collect_candidate_detector_signals = bool(
             getattr(args, "collect_candidate_detector_signals", False)
             or self.detector_arm
@@ -135,6 +159,19 @@ class KVRepairRunner(HistoryDriftRunner):
                 "combined_logistic_best_f1",
                 "combined_logistic_high_recall",
             }
+        )
+        self.logistic_detector_kfolds = max(
+            0,
+            int(getattr(args, "logistic_detector_kfolds", 0) or 0),
+        )
+        self.logistic_detector_feature_set = str(
+            getattr(args, "logistic_detector_feature_set", "auto") or "auto"
+        )
+        self.detector_thresholds = self._load_detector_thresholds(
+            getattr(args, "detector_thresholds_json", "")
+        )
+        self.detector_cv_output_dir = str(
+            getattr(args, "detector_cv_output_dir", "") or ""
         )
         self.logistic_detector_model = (
             self._train_logistic_detector(
@@ -163,7 +200,97 @@ class KVRepairRunner(HistoryDriftRunner):
         self.repair_extract_source = getattr(args, "repair_extract_source", "auto")
         self._active_oracle_bad_step: int | None = None
         self._last_repair_build_info: dict[str, Any] = {}
+        self._last_kv_memory_hint: dict[str, Any] | None = None
         self._previous_readout_vector: list[float] | None = None
+
+    def _use_online_safe_logistic_features(self) -> bool:
+        if self.logistic_detector_feature_set == "online_safe":
+            return True
+        if self.logistic_detector_feature_set == "all":
+            return False
+        return not self.request_candidate_logprobs
+
+    @staticmethod
+    def _episode_fold(sample_id: str, folds: int) -> int:
+        import hashlib
+
+        if folds <= 1:
+            return 0
+        digest = hashlib.sha256(str(sample_id).encode("utf-8")).hexdigest()
+        return int(digest[:8], 16) % folds
+
+    @staticmethod
+    def _episode_bucket(sample_id: str, *, salt: str, buckets: int = 1000) -> int:
+        import hashlib
+
+        digest = hashlib.sha256(f"{sample_id}:{salt}".encode("utf-8")).hexdigest()
+        return int(digest[:8], 16) % buckets
+
+    def _inner_train_calibration_split(
+        self,
+        rows: Sequence[dict[str, Any]],
+        *,
+        outer_fold: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        train: list[dict[str, Any]] = []
+        calibration: list[dict[str, Any]] = []
+        episode_ids = sorted({str(row.get("id")) for row in rows})
+        calibration_ids = {
+            sample_id
+            for sample_id in episode_ids
+            if self._episode_bucket(
+                sample_id,
+                salt=f"inner_calibration_fold_{outer_fold}",
+            )
+            < 200
+        }
+        if not calibration_ids and episode_ids:
+            calibration_ids = set(episode_ids[-max(1, len(episode_ids) // 5) :])
+        if len(calibration_ids) == len(episode_ids) and len(episode_ids) > 1:
+            calibration_ids = set(episode_ids[-max(1, len(episode_ids) // 5) :])
+        for row in rows:
+            if str(row.get("id")) in calibration_ids:
+                calibration.append(row)
+            else:
+                train.append(row)
+        if not train:
+            train = list(rows)
+        if not calibration:
+            calibration = list(rows)
+        return train, calibration
+
+    def _logistic_feature_allowed(self, name: str) -> bool:
+        if not self._use_online_safe_logistic_features():
+            return True
+        lowered = name.lower()
+        return not any(pattern in lowered for pattern in LOGISTIC_LOGPROB_FEATURE_PATTERNS)
+
+    @staticmethod
+    def _load_detector_thresholds(path: str) -> dict[str, Any]:
+        if not path:
+            return {}
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else {}
+
+    def _threshold_for_detector(self, detector: str, sample_id: str | None) -> float:
+        if self.detector_thresholds:
+            fold_thresholds = self.detector_thresholds.get("fold_thresholds")
+            if isinstance(fold_thresholds, dict):
+                folds = int(self.detector_thresholds.get("folds") or 0)
+                fold = (
+                    self._episode_fold(str(sample_id), folds)
+                    if sample_id is not None and folds > 1
+                    else None
+                )
+                if fold is not None:
+                    value = (fold_thresholds.get(str(fold)) or {}).get(detector)
+                    if value is not None:
+                        return float(value)
+            value = self.detector_thresholds.get(detector)
+            if value is not None:
+                return float(value)
+        return float(self.detector_signal_threshold)
 
     def _repair_extract_source_for(self, effective_arm: str, repair_kind: str) -> str:
         if self.repair_extract_source != "auto":
@@ -611,25 +738,11 @@ class KVRepairRunner(HistoryDriftRunner):
                 best_threshold = float(threshold)
         return best_threshold
 
-    def _train_logistic_detector(
+    def _select_logistic_features(
         self,
-        features_csv: str,
-        *,
-        threshold_rule: str,
-    ) -> dict[str, Any]:
-        if not features_csv:
-            raise ValueError(
-                f"detector_arm={self.detector_arm} requires "
-                "--logistic-detector-features-csv"
-            )
-        with open(features_csv, encoding="utf-8") as f:
-            rows = list(csv.DictReader(f))
-        train = [row for row in rows if row.get("split") == "calibration"]
-        if not train:
-            raise ValueError(
-                "logistic detector feature CSV has no calibration split rows: "
-                f"{features_csv}"
-            )
+        rows: Sequence[dict[str, Any]],
+        train: Sequence[dict[str, Any]],
+    ) -> list[str]:
         excluded = {
             "id",
             "checkpoint_id",
@@ -640,7 +753,11 @@ class KVRepairRunner(HistoryDriftRunner):
             "split",
             "rule_detector_reason",
         }
-        feature_names = [key for key in rows[0].keys() if key not in excluded]
+        feature_names = [
+            key
+            for key in rows[0].keys()
+            if key not in excluded and self._logistic_feature_allowed(key)
+        ]
         usable: list[str] = []
         for name in feature_names:
             vals = [
@@ -650,9 +767,16 @@ class KVRepairRunner(HistoryDriftRunner):
             vals = [value for value in vals if value is not None]
             if len(vals) >= max(4, len(train) // 2):
                 usable.append(name)
-        if not usable:
-            raise ValueError("logistic detector has no usable numeric features")
+        return usable
 
+    def _fit_logistic_detector(
+        self,
+        train: Sequence[dict[str, Any]],
+        *,
+        usable: Sequence[str],
+        threshold_rule: str,
+        threshold_rows: Sequence[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         means: dict[str, float] = {}
         stds: dict[str, float] = {}
         for name in usable:
@@ -692,35 +816,213 @@ class KVRepairRunner(HistoryDriftRunner):
                     grad[i] += l2 * weights[i]
                 weights[i] -= lr * grad[i]
 
-        train_scores = [
+        calibration_rows = list(threshold_rows or train)
+        calibration_scores = [
             self._sigmoid(sum(w * xi for w, xi in zip(weights, vector(row))))
-            for row in train
+            for row in calibration_rows
         ]
-        train_labels = [int(float(row["segment_harmful"])) for row in train]
+        calibration_labels = [
+            int(float(row["segment_harmful"])) for row in calibration_rows
+        ]
         threshold = (
-            self._threshold_at_high_recall(train_labels, train_scores, 0.95)
+            self._threshold_at_high_recall(calibration_labels, calibration_scores, 0.95)
             if threshold_rule == "high_recall"
-            else self._best_f1_threshold(train_labels, train_scores)
+            else self._best_f1_threshold(calibration_labels, calibration_scores)
         )
         return {
-            "features_csv": features_csv,
-            "features": usable,
+            "features": list(usable),
             "means": means,
             "stds": stds,
             "weights": weights,
             "threshold": threshold,
             "threshold_selection_rule": threshold_rule,
             "train_rows": len(train),
+            "calibration_rows": len(calibration_rows),
             "train_episode_ids": sorted({str(row.get("id")) for row in train}),
-            "test_episode_ids": sorted(
-                {str(row.get("id")) for row in rows if row.get("split") == "test"}
+            "calibration_episode_ids": sorted(
+                {str(row.get("id")) for row in calibration_rows}
             ),
         }
+
+    def _write_logistic_cv_artifacts(self, model: dict[str, Any]) -> None:
+        if not self.detector_cv_output_dir or not model.get("kfold_models"):
+            return
+        import pickle
+
+        root = Path(self.detector_cv_output_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        thresholds: dict[str, Any] = {
+            "detector": self.detector_arm,
+            "kfolds": model.get("kfolds"),
+            "feature_set": model.get("feature_set"),
+            "fold_thresholds": {},
+        }
+        for fold, fold_model in model["kfold_models"].items():
+            fold_dir = root / f"fold_{fold}"
+            fold_dir.mkdir(parents=True, exist_ok=True)
+            with open(fold_dir / "logistic_model.pkl", "wb") as f:
+                pickle.dump(fold_model, f)
+            with open(fold_dir / "scaler.pkl", "wb") as f:
+                pickle.dump(
+                    {
+                        "features": fold_model.get("features"),
+                        "means": fold_model.get("means"),
+                        "stds": fold_model.get("stds"),
+                    },
+                    f,
+                )
+            threshold_path = fold_dir / "thresholds.json"
+            existing_thresholds: dict[str, Any] = {}
+            if threshold_path.exists():
+                try:
+                    existing_thresholds = json.loads(
+                        threshold_path.read_text(encoding="utf-8")
+                    )
+                except Exception:
+                    existing_thresholds = {}
+            fold_threshold = {
+                **existing_thresholds,
+                "combined_logistic": fold_model.get("threshold"),
+                "combined_logistic_best_f1": fold_model.get("threshold"),
+                "threshold_selection_rule": fold_model.get(
+                    "threshold_selection_rule"
+                ),
+                "train_episode_ids": fold_model.get("train_episode_ids"),
+                "calibration_episode_ids": fold_model.get(
+                    "calibration_episode_ids"
+                ),
+                "test_episode_ids": fold_model.get("fold_test_episode_ids"),
+            }
+            (fold_dir / "thresholds.json").write_text(
+                json.dumps(fold_threshold, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            thresholds["fold_thresholds"][str(fold)] = fold_threshold
+        (root / "logistic_cv_thresholds.json").write_text(
+            json.dumps(thresholds, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def _train_logistic_detector(
+        self,
+        features_csv: str,
+        *,
+        threshold_rule: str,
+    ) -> dict[str, Any]:
+        if not features_csv:
+            raise ValueError(
+                f"detector_arm={self.detector_arm} requires "
+                "--logistic-detector-features-csv"
+            )
+        with open(features_csv, encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        if not rows:
+            raise ValueError(f"logistic detector feature CSV is empty: {features_csv}")
+        labeled_rows = [
+            row
+            for row in rows
+            if row.get("id") not in (None, "")
+            and row.get("segment_harmful") not in (None, "")
+        ]
+        if self.logistic_detector_kfolds > 1:
+            folds = self.logistic_detector_kfolds
+            usable = self._select_logistic_features(labeled_rows, labeled_rows)
+            if not usable:
+                raise ValueError("logistic detector has no usable numeric features")
+            fold_models: dict[str, dict[str, Any]] = {}
+            episode_ids = sorted({str(row.get("id")) for row in labeled_rows})
+            for fold in range(folds):
+                train = [
+                    row
+                    for row in labeled_rows
+                    if self._episode_fold(str(row.get("id")), folds) != fold
+                ]
+                train_fit, calibration = self._inner_train_calibration_split(
+                    train,
+                    outer_fold=fold,
+                )
+                test_episode_ids = [
+                    sample_id
+                    for sample_id in episode_ids
+                    if self._episode_fold(sample_id, folds) == fold
+                ]
+                if not train:
+                    raise ValueError(
+                        f"logistic kfold={fold} has no training rows; folds={folds}"
+                    )
+                model = self._fit_logistic_detector(
+                    train_fit,
+                    usable=usable,
+                    threshold_rule=threshold_rule,
+                    threshold_rows=calibration,
+                )
+                model["fold"] = fold
+                model["fold_test_episode_ids"] = test_episode_ids
+                fold_models[str(fold)] = model
+            root_model = {
+                "features_csv": features_csv,
+                "features": usable,
+                "kfolds": folds,
+                "kfold_models": fold_models,
+                "threshold_selection_rule": threshold_rule,
+                "feature_set": (
+                    "online_safe"
+                    if self._use_online_safe_logistic_features()
+                    else "all"
+                ),
+                "train_rows": len(labeled_rows),
+                "train_episode_ids": episode_ids,
+                "test_episode_ids": episode_ids,
+            }
+            self._write_logistic_cv_artifacts(root_model)
+            return root_model
+
+        train = [row for row in labeled_rows if row.get("split") == "calibration"]
+        if not train:
+            raise ValueError(
+                "logistic detector feature CSV has no calibration split rows: "
+                f"{features_csv}"
+            )
+        usable = self._select_logistic_features(labeled_rows, train)
+        if not usable:
+            raise ValueError("logistic detector has no usable numeric features")
+        model = self._fit_logistic_detector(
+            train,
+            usable=usable,
+            threshold_rule=threshold_rule,
+        )
+        model.update(
+            {
+                "features_csv": features_csv,
+                "feature_set": (
+                    "online_safe"
+                    if self._use_online_safe_logistic_features()
+                    else "all"
+                ),
+                "test_episode_ids": sorted(
+                    {
+                        str(row.get("id"))
+                        for row in labeled_rows
+                        if row.get("split") == "test"
+                    }
+                ),
+            }
+        )
+        return model
 
     def _logistic_detector(self, segment_infos: Sequence[dict[str, Any]]) -> dict[str, Any]:
         if self.logistic_detector_model is None:
             raise RuntimeError("logistic detector model is not initialized")
-        model = self.logistic_detector_model
+        root_model = self.logistic_detector_model
+        model = root_model
+        sample_id = None
+        if segment_infos:
+            sample_id = (segment_infos[0].get("step_record") or {}).get("id")
+        selected_fold = None
+        if model.get("kfold_models"):
+            folds = int(model.get("kfolds") or 0)
+            selected_fold = self._episode_fold(str(sample_id), folds)
+            model = model["kfold_models"][str(selected_fold)]
         row = self._segment_detector_feature_row(segment_infos)
         x = [1.0]
         for name in model["features"]:
@@ -745,9 +1047,17 @@ class KVRepairRunner(HistoryDriftRunner):
             "logistic_detector_features": model["features"],
             "logistic_detector_train_rows": model["train_rows"],
             "detector_train_episode_ids": model["train_episode_ids"],
-            "detector_test_episode_ids": model["test_episode_ids"],
+            "detector_test_episode_ids": (
+                model.get("fold_test_episode_ids")
+                or root_model.get("test_episode_ids")
+                or []
+            ),
+            "logistic_detector_kfold": selected_fold,
+            "logistic_detector_feature_set": root_model.get("feature_set"),
             "detector_evaluation_mode": (
-                "in_sample_diagnostic_stable52_calibration_split"
+                "episode_kfold_crossfit"
+                if selected_fold is not None
+                else "stable52_calibration_split"
             ),
         }
 
@@ -774,6 +1084,9 @@ class KVRepairRunner(HistoryDriftRunner):
         }
 
     def _segment_detector(self, segment_infos: Sequence[dict[str, Any]]) -> dict[str, Any]:
+        sample_id = None
+        if segment_infos:
+            sample_id = (segment_infos[0].get("step_record") or {}).get("id")
         if self.detector_arm == "never_trigger":
             return {"detector": "never_trigger", "detector_trigger": False}
         if self.detector_arm == "always_trigger":
@@ -795,7 +1108,22 @@ class KVRepairRunner(HistoryDriftRunner):
             return self._feature_signal_detector(
                 segment_infos,
                 signal_name="max_risk_score",
-                threshold=self.detector_signal_threshold,
+                threshold=self._threshold_for_detector("max_risk_score", sample_id),
+            )
+        scalar_signals = {
+            "rule_detector_max_risk": "rule_detector_max_risk",
+            "max_observation_anomaly": "max_observation_anomaly",
+            "mean_risk_score": "mean_risk_score",
+            "max_hard_error": "max_hard_error",
+            "max_generation_nll": "max_generation_nll",
+            "mean_generation_nll": "mean_generation_nll",
+        }
+        if self.detector_arm in scalar_signals:
+            signal_name = scalar_signals[self.detector_arm]
+            return self._feature_signal_detector(
+                segment_infos,
+                signal_name=signal_name,
+                threshold=self._threshold_for_detector(signal_name, sample_id),
             )
         raise RuntimeError(f"Unsupported detector arm: {self.detector_arm}")
 
@@ -1148,7 +1476,10 @@ class KVRepairRunner(HistoryDriftRunner):
             "chat_template_kwargs": {"enable_thinking": False},
             "return_cached_tokens_details": True,
         }
-        if collect_detector_signals:
+        memory_hint = getattr(self, "_last_kv_memory_hint", None)
+        if isinstance(memory_hint, dict):
+            payload["c2kv_kv_memory_hint"] = memory_hint
+        if collect_detector_signals and self.request_candidate_logprobs:
             payload.update(
                 {
                     "logprobs": True,
@@ -1178,6 +1509,7 @@ class KVRepairRunner(HistoryDriftRunner):
             recomputed_prompt_tokens = max(usage_prompt_tokens - cached_tokens, 0)
             stats.chat_recomputed_prompt_tokens += recomputed_prompt_tokens
         runtime = _kv_runtime_stats_from_response(data)
+        kv_memory_report = _kv_memory_report_from_response(data)
         if runtime is None:
             stats.kv_runtime_report_missing += 1
         else:
@@ -1200,6 +1532,7 @@ class KVRepairRunner(HistoryDriftRunner):
             "cached_tokens": cached_tokens,
             "recomputed_prompt_tokens": recomputed_prompt_tokens,
             "kv_runtime_stats": runtime,
+            "kv_memory_report": kv_memory_report,
         }, data
 
     def _candidate_detector_features(self, raw: dict[str, Any]) -> dict[str, Any]:
@@ -1262,7 +1595,7 @@ class KVRepairRunner(HistoryDriftRunner):
         nll = -sum(token_logprobs) / len(token_logprobs) if token_logprobs else None
         ppl = math.exp(min(nll, 50.0)) if nll is not None else None
         return {
-            "detector_signal_requested": True,
+            "detector_signal_requested": bool(self.request_candidate_logprobs),
             "detector_signal_available": bool(token_logprobs),
             "logprobs_source": logprobs_source if token_items else None,
             "generation_token_count": len(token_logprobs),
@@ -1373,6 +1706,12 @@ class KVRepairRunner(HistoryDriftRunner):
                 "repair_kind": "raw",
                 "window": "2",
             })
+        elif effective_arm == "append_masked_w2":
+            config.update({
+                "operation": "append_masked",
+                "repair_kind": "raw",
+                "window": "2",
+            })
         elif effective_arm == "d_corr_replace_w4":
             config.update({
                 "operation": "replace",
@@ -1472,6 +1811,7 @@ class KVRepairRunner(HistoryDriftRunner):
         stats: DriftStats,
     ) -> list[dict[str, Any]]:
         self._last_repair_build_info = {}
+        self._last_kv_memory_hint = None
         latest_query_index = _latest_user_query_index(history_messages)
         completed = list(history_messages[:latest_query_index])
         current = deepcopy(list(history_messages[latest_query_index:]))
@@ -1481,11 +1821,24 @@ class KVRepairRunner(HistoryDriftRunner):
             stats.effective_history_tokens += full_tokens
             stats.canonical_full_history_tokens += full_tokens
             stats.physical_history_kv_tokens += full_tokens
+            self._last_kv_memory_hint = {
+                "full_equivalent_history_tokens": full_tokens,
+                "active_history_kv_tokens": full_tokens,
+                "active_full_raw_tokens": full_tokens,
+                "history_scope": "completed_history_only",
+                "source": "bfcl_canonical_history_layout",
+            }
             return deepcopy(list(history_messages))
         effective_arm = self.arm if self._repair_enabled_for_current_step else "c2kv"
 
         units = _history_units(completed)
         if not units:
+            self._last_kv_memory_hint = {
+                "full_equivalent_history_tokens": 0,
+                "active_history_kv_tokens": 0,
+                "history_scope": "completed_history_only",
+                "source": "bfcl_canonical_history_layout",
+            }
             return deepcopy(list(history_messages))
 
         texts = [_render_history_unit(unit) for unit in units]
@@ -1599,6 +1952,11 @@ class KVRepairRunner(HistoryDriftRunner):
                 "logical_position_before": canonical_full_history_tokens,
                 "logical_position_after": canonical_full_history_tokens,
             }
+            self._last_kv_memory_hint = {
+                "full_equivalent_history_tokens": canonical_full_history_tokens,
+                "history_scope": "completed_history_only",
+                "source": "bfcl_canonical_history_layout",
+            }
 
             return [
                 {
@@ -1614,11 +1972,14 @@ class KVRepairRunner(HistoryDriftRunner):
         repair_keys_by_index: dict[int, list[str]] = {}
         repair_tokens_by_index: dict[int, int] = {}
         repair_metadata: list[dict[str, Any]] = []
+        history_layout_debug: list[dict[str, Any]] = []
         repair_tokens = 0
         local_physical_history_tokens = 0
 
         def should_compress_doc(index: int) -> bool:
             if config["operation"] == "replace" and index in target_set:
+                return False
+            if config["operation"] == "append_masked" and index in target_set:
                 return False
             if config["operation"] == "recompute" and index >= anchor_index:
                 return False
@@ -1700,7 +2061,7 @@ class KVRepairRunner(HistoryDriftRunner):
         if config["operation"] == "append":
             for index in target_indices:
                 build_repair_for_index(index)
-        elif config["operation"] == "replace":
+        elif config["operation"] in {"replace", "append_masked"}:
             for index in target_indices:
                 build_repair_for_index(index)
         elif config["operation"] == "recompute":
@@ -1715,13 +2076,35 @@ class KVRepairRunner(HistoryDriftRunner):
                     stats.physical_history_kv_tokens += raw_len
                     stats.repair_kv_tokens += raw_len
                     local_physical_history_tokens += raw_len
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": text,
-                            "c2kv_repair_only_key_hashes": repair_keys_by_index[index],
-                        }
-                    )
+                    if config["operation"] == "append_masked":
+                        history_layout_debug.append(
+                            {
+                                "history_index": index,
+                                "mode": "raw_append_masked",
+                                "roles": self._ordered_roles(unit),
+                                "logical_token_range": [starts[index], ends[index]],
+                                "absolute_rope_position_range": [starts[index], ends[index]],
+                                "raw_tokens": raw_len,
+                            }
+                        )
+                    else:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": text,
+                                "c2kv_repair_only_key_hashes": repair_keys_by_index[index],
+                            }
+                        )
+                        history_layout_debug.append(
+                            {
+                                "history_index": index,
+                                "mode": "raw_replace",
+                                "roles": self._ordered_roles(unit),
+                                "logical_token_range": [starts[index], ends[index]],
+                                "absolute_rope_position_range": [starts[index], ends[index]],
+                                "raw_tokens": raw_len,
+                            }
+                        )
                 else:
                     full_tokens = _token_count(self.tokenizer, unit)
                     stats.effective_history_tokens += full_tokens
@@ -1729,6 +2112,20 @@ class KVRepairRunner(HistoryDriftRunner):
                     stats.recomputed_raw_tokens += doc_lens[index]
                     local_physical_history_tokens += doc_lens[index]
                     messages.extend(deepcopy(unit))
+                    history_layout_debug.append(
+                        {
+                            "history_index": index,
+                            "mode": (
+                                "recomputed_raw"
+                                if config["operation"] == "recompute"
+                                else "full"
+                            ),
+                            "roles": self._ordered_roles(unit),
+                            "logical_token_range": [starts[index], ends[index]],
+                            "absolute_rope_position_range": [starts[index], ends[index]],
+                            "raw_tokens": doc_lens[index],
+                        }
+                    )
                 gist_records.append(None)
                 continue
 
@@ -1745,6 +2142,16 @@ class KVRepairRunner(HistoryDriftRunner):
             messages.append(
                 {"role": "user", "content": text, "c2kv_key_hash": record.key_hash}
             )
+            history_layout_debug.append(
+                {
+                    "history_index": index,
+                    "mode": "gist",
+                    "roles": self._ordered_roles(unit),
+                    "logical_token_range": [starts[index], ends[index]],
+                    "physical_kv_tokens": gist_len,
+                    "full_equivalent_tokens": int(record.original_seq_len or full_tokens),
+                }
+            )
             gist_records.append(record)
 
         append_repair_keys = [
@@ -1752,19 +2159,31 @@ class KVRepairRunner(HistoryDriftRunner):
             for index in target_indices
             for key_hash in repair_keys_by_index.get(index, [])
         ]
-        if config["operation"] == "append" and append_repair_keys:
+        if config["operation"] in {"append", "append_masked"} and append_repair_keys:
             target_message = None
             for message in reversed(messages):
                 if message.get("c2kv_key_hash"):
                     target_message = message
                     break
             if target_message is None:
-                raise RuntimeError(f"Cannot attach append repair keys for arm={effective_arm}")
-            target_message["c2kv_repair_key_hashes"] = append_repair_keys
-            stats.effective_history_tokens += repair_tokens
-            stats.physical_history_kv_tokens += repair_tokens
-            stats.repair_kv_tokens += repair_tokens
-            local_physical_history_tokens += repair_tokens
+                if config["operation"] == "append_masked":
+                    messages.insert(
+                        0,
+                        {
+                            "role": "user",
+                            "content": "",
+                            "c2kv_repair_only_key_hashes": append_repair_keys,
+                        },
+                    )
+                else:
+                    raise RuntimeError(f"Cannot attach append repair keys for arm={effective_arm}")
+            else:
+                target_message["c2kv_repair_key_hashes"] = append_repair_keys
+            if config["operation"] == "append":
+                stats.effective_history_tokens += repair_tokens
+                stats.physical_history_kv_tokens += repair_tokens
+                stats.repair_kv_tokens += repair_tokens
+                local_physical_history_tokens += repair_tokens
 
         if config["operation"] == "recompute" and anchor_index + 1 < len(units):
             recomputed_total = sum(doc_lens[anchor_index + 1 :])
@@ -1812,6 +2231,7 @@ class KVRepairRunner(HistoryDriftRunner):
                 [meta["absolute_position_start"], meta["absolute_position_end"]]
                 for meta in repair_metadata
             ],
+            "history_layout": history_layout_debug,
             "physical_prefix_len_before": max(0, physical_before - repair_tokens),
             "physical_prefix_len_after": physical_before,
             "logical_position_before": logical_before,
@@ -1820,6 +2240,11 @@ class KVRepairRunner(HistoryDriftRunner):
         if repair_tokens != self._last_repair_build_info["repair_tokens_injected"]:
             raise RuntimeError("repair token accounting invariant failed")
 
+        self._last_kv_memory_hint = {
+            "full_equivalent_history_tokens": canonical_full_history_tokens,
+            "history_scope": "completed_history_only",
+            "source": "bfcl_canonical_history_layout",
+        }
         messages.extend(current)
         return messages
 
@@ -1838,6 +2263,7 @@ class KVRepairRunner(HistoryDriftRunner):
             "d_corr_replace_w2",
             "d_corr_replace_w4",
             "d_corr_replace_all",
+            "append_masked_w2",
             "d_corr_recompute",
             "d_corr_recompute_w2",
             "d_corr_all",
@@ -2099,6 +2525,10 @@ class KVRepairRunner(HistoryDriftRunner):
                         "repair_status": decoded.status if repair_enabled else None,
                     },
                 )
+                if usage.get("kv_memory_report") is not None:
+                    step_record["kv_memory_report"] = usage.get("kv_memory_report")
+                if usage.get("kv_runtime_stats") is not None:
+                    step_record["kv_runtime_stats"] = usage.get("kv_runtime_stats")
                 step_record["oracle_harmful"] = bool(
                     step_record.get("candidate_action_drift")
                     or step_record.get("state_drift")
@@ -2354,7 +2784,9 @@ class KVRepairRunner(HistoryDriftRunner):
                     "detector_tn": detector_confusion["detector_tn"],
                     "detector_fn": detector_confusion["detector_fn"],
                     "oracle_segment_harmful": oracle_segment_harmful,
+                    "oracle_reference_drift_segment": oracle_segment_harmful,
                     "oracle_harmful_reason": harmful_reason,
+                    "oracle_reference_drift_reason": harmful_reason,
                     "harmful_step_indices": harmful_step_indices,
                     "repair_triggered": repair_triggered,
                     "repair_trigger_policy": self.repair_trigger,
@@ -2472,6 +2904,9 @@ class KVRepairRunner(HistoryDriftRunner):
                         for row in repaired_records
                     )
                 )
+                repair_segment["reference_recovery_success"] = repair_segment[
+                    "repair_segment_success"
+                ]
                 repair_segment["repaired_action_correct"] = bool(
                     repaired_records
                     and all(not row.get("executed_action_drift") for row in repaired_records)
@@ -2563,6 +2998,9 @@ def run(args: argparse.Namespace) -> None:
         "rule_detector_threshold": args.rule_detector_threshold,
         "detector_signal_threshold": args.detector_signal_threshold,
         "logistic_detector_features_csv": args.logistic_detector_features_csv,
+        "logistic_detector_kfolds": args.logistic_detector_kfolds,
+        "logistic_detector_feature_set": args.logistic_detector_feature_set,
+        "request_candidate_logprobs": args.request_candidate_logprobs,
         "category": args.category,
         "num_examples": len(details_rows),
         "errors": sum(
@@ -2793,18 +3231,62 @@ def parse_args() -> argparse.Namespace:
         "--detector-signal-threshold",
         type=float,
         default=5.0,
-        help="Threshold for detector-arm=max_risk_score after direction normalization.",
+        help="Fallback threshold for scalar detector arms after direction normalization.",
+    )
+    parser.add_argument(
+        "--detector-thresholds-json",
+        default="",
+        help=(
+            "Optional fold-wise scalar detector threshold file generated by "
+            "prepare_detector_online_5fold.py."
+        ),
     )
     parser.add_argument("--candidate-logprobs-top-k", type=int, default=20)
     parser.add_argument(
         "--collect-candidate-detector-signals",
         action="store_true",
-        help="Request candidate logprobs and record cheap detector signals.",
+        help=(
+            "Record cheap detector signals for each candidate step. This no "
+            "longer requests token logprobs unless --request-candidate-logprobs "
+            "is also set."
+        ),
+    )
+    parser.add_argument(
+        "--request-candidate-logprobs",
+        action="store_true",
+        help=(
+            "Ask SGLang to return generation logprobs for detector features. "
+            "Keep disabled on current C2KV NPU multi-round path unless that "
+            "server path has been validated."
+        ),
     )
     parser.add_argument(
         "--logistic-detector-features-csv",
         default="",
         help="Episode-split detector_features.csv for combined logistic detector.",
+    )
+    parser.add_argument(
+        "--logistic-detector-kfolds",
+        type=int,
+        default=0,
+        help=(
+            "If >1, train episode-level cross-fit logistic detector models. "
+            "Each episode is scored by a model trained on all other folds."
+        ),
+    )
+    parser.add_argument(
+        "--logistic-detector-feature-set",
+        choices=["auto", "online_safe", "all"],
+        default="auto",
+        help=(
+            "auto uses online-safe non-logprob features unless "
+            "--request-candidate-logprobs is set."
+        ),
+    )
+    parser.add_argument(
+        "--detector-cv-output-dir",
+        default="",
+        help="Directory where k-fold logistic model/scaler/threshold artifacts are saved.",
     )
     parser.add_argument(
         "--neutral-corpus-path",

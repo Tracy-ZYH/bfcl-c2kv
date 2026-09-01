@@ -126,6 +126,16 @@ def _kv_runtime_stats_from_response(response: dict[str, Any]) -> dict[str, Any] 
     return runtime if isinstance(runtime, dict) else None
 
 
+def _kv_memory_report_from_response(response: dict[str, Any]) -> dict[str, Any] | None:
+    metadata = response.get("metadata") or {}
+    report = metadata.get("kv_memory_report")
+    if isinstance(report, dict):
+        return report
+    meta_info = response.get("meta_info") or {}
+    report = meta_info.get("kv_memory_report") if isinstance(meta_info, dict) else None
+    return report if isinstance(report, dict) else None
+
+
 def _message_text(message: dict[str, Any]) -> str:
     content = message.get("content", "")
     if isinstance(content, str):
@@ -511,6 +521,9 @@ class HistoryDriftRunner:
             "chat_template_kwargs": {"enable_thinking": False},
             "return_cached_tokens_details": True,
         }
+        memory_hint = getattr(self, "_last_kv_memory_hint", None)
+        if isinstance(memory_hint, dict):
+            payload["c2kv_kv_memory_hint"] = memory_hint
         start = time.perf_counter()
         data = _post_json(self.base_url, "/v1/chat/completions", payload, self.timeout)
         elapsed = time.perf_counter() - start
@@ -533,6 +546,7 @@ class HistoryDriftRunner:
             recomputed_prompt_tokens = max(usage_prompt_tokens - cached_tokens, 0)
             stats.chat_recomputed_prompt_tokens += recomputed_prompt_tokens
         runtime = _kv_runtime_stats_from_response(data)
+        kv_memory_report = _kv_memory_report_from_response(data)
         if runtime is None:
             stats.kv_runtime_report_missing += 1
         else:
@@ -555,6 +569,7 @@ class HistoryDriftRunner:
             "cached_tokens": cached_tokens,
             "recomputed_prompt_tokens": recomputed_prompt_tokens,
             "kv_runtime_stats": runtime,
+            "kv_memory_report": kv_memory_report,
         }
 
     def _decode(self, text: str) -> list[str]:
@@ -848,6 +863,10 @@ class HistoryDriftRunner:
                         else None
                     ),
                 )
+                if usage.get("kv_memory_report") is not None:
+                    step_record["kv_memory_report"] = usage.get("kv_memory_report")
+                if usage.get("kv_runtime_stats") is not None:
+                    step_record["kv_runtime_stats"] = usage.get("kv_runtime_stats")
                 mark_first_divergence(stats, step_record)
                 if alignment_status == "missing_reference":
                     stats.errors.append(

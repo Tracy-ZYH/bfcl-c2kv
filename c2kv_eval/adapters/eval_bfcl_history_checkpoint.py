@@ -2471,7 +2471,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
         candidate_readout_reused: bool = False,
     ) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "id": step_record["id"],
             "global_step": step_record["global_step"],
             "candidate_global_step": step_record["candidate_global_step"],
@@ -2532,6 +2532,8 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "history_prompt_tokens": history_prompt_tokens,
             "request_history_tokens": request_history_tokens,
             "full_history_tokens": full_history_tokens,
+            "kv_memory_report": step_record.get("kv_memory_report"),
+            "kv_runtime_stats": step_record.get("kv_runtime_stats"),
         }
 
     def _make_final_step_record(
@@ -2553,7 +2555,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             executed_text,
             executed_action,
         )
-        return build_step_record(
+        record = build_step_record(
             sample_id=spec_info["sample_id"],
             turn_idx=spec_info["turn_idx"],
             step_idx=spec_info["step_idx"],
@@ -2578,6 +2580,14 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             roundtrip=roundtrip,
             extra=extra,
         )
+        usage_source = extra.get("executed_usage")
+        if not isinstance(usage_source, dict):
+            usage_source = spec_info.get("candidate_usage") or {}
+        if usage_source.get("kv_memory_report") is not None:
+            record["kv_memory_report"] = usage_source.get("kv_memory_report")
+        if usage_source.get("kv_runtime_stats") is not None:
+            record["kv_runtime_stats"] = usage_source.get("kv_runtime_stats")
+        return record
 
     def _run_sample_checkpoint_impl_oracle_multistep(
         self,
@@ -3310,6 +3320,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                                 "rollback_triggered": True,
                                 "candidate_execution_error": info["execution_error"],
                                 "regenerated_status": recovery_candidate.status,
+                                "executed_usage": recovery_usage,
                                 "rollback_backend": rollback_backend_info.get(
                                     "rollback_backend"
                                 ),
@@ -3671,9 +3682,34 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         for info in segment_infos[rollback_start_index:]
                     )
                 )
+                segment_executed_drift_count = sum(
+                    1
+                    for record in final_records
+                    if record.get("executed_action_drift")
+                )
+                state_drift_after_recovery = any(
+                    bool(record.get("state_drift"))
+                    for record in final_records
+                )
+                segment_recovery_success = bool(
+                    segment_has_drift
+                    and segment_executed_drift_count == 0
+                    and not state_drift_after_recovery
+                )
+                segment_checkpoint_metadata = (
+                    chain_advance_metadata
+                    if chain_advance_metadata and chain_advance_metadata.get("available")
+                    else segment_initial_full_checkpoint_metadata
+                ) or {}
+                segment_checkpoint_host_tokens = int(
+                    segment_checkpoint_metadata.get("checkpoint_host_tokens") or 0
+                )
+                segment_checkpoint_device_tokens = int(
+                    segment_checkpoint_metadata.get("checkpoint_device_tokens") or 0
+                )
                 checkpoint_segments.append(
                     {
-                        "schema_version": 2,
+                        "schema_version": 3,
                         "id": test_entry_id,
                         "checkpoint_id": checkpoint_id,
                         "checkpoint_interval": self.checkpoint_interval,
@@ -3730,13 +3766,12 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         "segment_detector_trigger_count": sum(
                             1 for triggered in detector_trigger_per_step if triggered
                         ),
-                        "segment_executed_drift_count": sum(
-                            1
-                            for record in final_records
-                            if record.get("executed_action_drift")
+                        "segment_executed_drift_count": (
+                            segment_executed_drift_count
                         ),
                         "segment_has_drift": segment_has_drift,
                         "oracle_segment_unsafe": oracle_segment_unsafe,
+                        "oracle_reference_drift_segment": oracle_segment_unsafe,
                         "detector_trigger": segment_has_drift,
                         "detector": detector_debug.get("detector"),
                         "detector_reason": (
@@ -3786,6 +3821,8 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         "verify_triggered": True,
                         "rollback_triggered": segment_has_drift,
                         "refresh_triggered": segment_has_drift,
+                        "segment_recovery_success": segment_recovery_success,
+                        "reference_recovery_success": segment_recovery_success,
                         "checkpoint_state": segment_checkpoint.get("state"),
                         "speculative_end_state": speculative_end_state,
                         "restored_state": restored_state,
@@ -3977,6 +4014,8 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         "full_checkpoint_chain_metadata": (
                             make_json_serializable(chain_advance_metadata)
                         ),
+                        "checkpoint_host_tokens": segment_checkpoint_host_tokens,
+                        "checkpoint_device_tokens": segment_checkpoint_device_tokens,
                         "checkpoint_maintenance_recomputed_tokens": (
                             segment_checkpoint_maintenance.get(
                                 "checkpoint_maintenance_recomputed_tokens"
@@ -4036,10 +4075,7 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             bool(record.get("executed_action_drift"))
                             for record in final_records
                         ],
-                        "state_drift_after_recovery": any(
-                            bool(record.get("state_drift"))
-                            for record in final_records
-                        ),
+                        "state_drift_after_recovery": state_drift_after_recovery,
                         "speculative_terminal_after_segment": (
                             speculative_terminal_after_segment
                         ),
@@ -4082,6 +4118,18 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             int(row.get("checkpoint_maintenance_cache_report_missing") or 0)
             for row in checkpoint_segments
         )
+        checkpoint_host_tokens_total = sum(
+            int(row.get("checkpoint_host_tokens") or 0)
+            for row in checkpoint_segments
+        )
+        checkpoint_device_tokens_total = sum(
+            int(row.get("checkpoint_device_tokens") or 0)
+            for row in checkpoint_segments
+        )
+        peak_checkpoint_host_tokens = max(
+            (int(row.get("checkpoint_host_tokens") or 0) for row in checkpoint_segments),
+            default=0,
+        )
 
         metadata = {
             "input_token_count": input_token_count,
@@ -4113,6 +4161,9 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             "checkpoint_maintenance_cache_report_missing": (
                 checkpoint_maintenance_cache_report_missing_total
             ),
+            "checkpoint_host_tokens": checkpoint_host_tokens_total,
+            "checkpoint_device_tokens": checkpoint_device_tokens_total,
+            "peak_checkpoint_host_tokens": peak_checkpoint_host_tokens,
             "rollback_latency_sec": rollback_latency_total,
             "restore_latency_sec": restore_latency_total,
             "regenerated_steps": regenerated_steps_total,
@@ -4180,6 +4231,12 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
             ),
             "actual_cache_report_missing": metadata.get(
                 "actual_cache_report_missing",
+                0,
+            ),
+            "checkpoint_host_tokens": metadata.get("checkpoint_host_tokens", 0),
+            "checkpoint_device_tokens": metadata.get("checkpoint_device_tokens", 0),
+            "peak_checkpoint_host_tokens": metadata.get(
+                "peak_checkpoint_host_tokens",
                 0,
             ),
             "message_replay_prefill_tokens": metadata.get(
@@ -4574,6 +4631,10 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                         "candidate_execution_error": candidate_execution_error,
                     },
                 )
+                if executed_usage.get("kv_memory_report") is not None:
+                    step_record["kv_memory_report"] = executed_usage.get("kv_memory_report")
+                if executed_usage.get("kv_runtime_stats") is not None:
+                    step_record["kv_runtime_stats"] = executed_usage.get("kv_runtime_stats")
                 step_record["candidate_action_matches_reference"] = verify[
                     "candidate_action_matches_reference"
                 ]
@@ -4678,6 +4739,8 @@ class HistoryCheckpointRunner(HistoryDriftRunner):
                             self.tokenizer,
                             checkpoint_messages,
                         ),
+                        "kv_memory_report": executed_usage.get("kv_memory_report"),
+                        "kv_runtime_stats": executed_usage.get("kv_runtime_stats"),
                     }
                 )
 

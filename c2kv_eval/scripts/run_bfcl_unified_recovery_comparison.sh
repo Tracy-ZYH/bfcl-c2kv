@@ -198,7 +198,8 @@ compare_unified() {
     cd "${ROOT}"
     "${BFCL_PYTHON}" -m c2kv_eval.analysis.compare_unified_recovery \
       --run-root "${RUN_ROOT}" \
-      --category "${CATEGORY}"
+      --category "${CATEGORY}" \
+      --methods "${METHODS}"
   )
 }
 

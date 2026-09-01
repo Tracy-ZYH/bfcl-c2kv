@@ -24,6 +24,8 @@ DEFAULT_METHODS = (
     ("Sham Mech", "sham_mech"),
 )
 
+DISPLAY_NAME_BY_DIR = {dirname: label for label, dirname in DEFAULT_METHODS}
+
 
 CSV_FIELDS = [
     "method",
@@ -32,16 +34,24 @@ CSV_FIELDS = [
     "correct_count",
     "num_examples",
     "turn_joint_pass_rate",
+    "episode_candidate_action_drift_rate",
+    "episode_executed_action_drift_rate",
+    "episode_state_drift_rate",
+    "step_candidate_action_drift_rate",
+    "step_executed_action_drift_rate",
+    "step_state_drift_rate",
     "candidate_action_drift_rate",
     "executed_action_drift_rate",
     "state_drift_rate",
     "detector",
     "oracle_harmful_segments",
+    "oracle_reference_drift_segments",
     "detector_trigger_count",
     "detector_trigger_rate",
     "recovery_attempt_count",
     "recovery_success_count",
     "recovery_success_rate",
+    "reference_recovery_success_rate",
     "total_committed_steps",
     "avg_committed_steps_per_episode",
     "total_candidate_steps",
@@ -66,6 +76,12 @@ CSV_FIELDS = [
     "online_mean_step_gpu_kv_compression",
     "online_weighted_gpu_history_kv_compression",
     "online_worst_step_gpu_kv_compression",
+    "avg_full_history_kv_tokens_per_step",
+    "avg_active_history_kv_tokens_per_step",
+    "actual_weighted_history_kv_compression",
+    "actual_mean_step_history_kv_compression",
+    "actual_median_step_history_kv_compression",
+    "actual_worst_step_history_kv_compression",
     "memory_report_coverage",
     "actual_compression_status",
     "estimated_avg_full_history_tokens_per_step",
@@ -74,18 +90,76 @@ CSV_FIELDS = [
     "estimated_online_mean_step_gpu_kv_compression",
     "estimated_online_median_step_gpu_kv_compression",
     "estimated_online_worst_step_gpu_kv_compression",
+    "estimated_weighted_history_kv_compression",
     "reference_aligned_mean_step_compression",
     "reference_aligned_weighted_compression",
     "reference_aligned_worst_step_compression",
     "reference_aligned_num_steps",
     "reference_aligned_status",
     "host_checkpoint_kv_tokens",
+    "avg_host_checkpoint_kv_tokens",
+    "peak_host_checkpoint_kv_tokens",
+    "cumulative_host_checkpoint_token_volume",
+    "avg_resident_host_checkpoint_kv_tokens",
+    "peak_resident_host_checkpoint_kv_tokens",
     "host_raw_bank_kv_tokens",
     "peak_host_kv_tokens",
     "raw_kv_bank_implemented",
     "runtime_memory_report_steps",
     "runtime_memory_missing_steps",
     "schema_version",
+]
+
+V3_CSV_FIELDS = [
+    "method",
+    "bfcl_accuracy",
+    "turn_joint_pass_rate",
+    "episode_candidate_action_drift_rate",
+    "episode_executed_action_drift_rate",
+    "episode_state_drift_rate",
+    "step_candidate_action_drift_rate",
+    "step_executed_action_drift_rate",
+    "step_state_drift_rate",
+    "detector",
+    "detector_trigger_rate",
+    "reference_recovery_success_rate",
+    "total_committed_steps",
+    "total_candidate_steps",
+    "total_regenerated_steps",
+    "total_model_generation_calls",
+    "model_calls_per_committed_step",
+    "avg_full_history_kv_tokens_per_step",
+    "avg_active_history_kv_tokens_per_step",
+    "actual_weighted_history_kv_compression",
+    "actual_mean_step_history_kv_compression",
+    "actual_worst_step_history_kv_compression",
+    "memory_report_coverage",
+    "actual_compression_status",
+    "estimated_weighted_history_kv_compression",
+    "avg_resident_host_checkpoint_kv_tokens",
+    "peak_resident_host_checkpoint_kv_tokens",
+    "raw_kv_bank_implemented",
+    "schema_version",
+]
+
+QUICK_CSV_FIELDS = [
+    "Method",
+    "BFCL Acc",
+    "Turn Joint",
+    "Step Executed Action Drift",
+    "Step State Drift",
+    "Detector Trigger Rate",
+    "Recovery Success Rate",
+    "Avg Committed Steps / Episode",
+    "Regenerated Steps",
+    "Model Calls / Committed Step",
+    "Avg Active GPU KV Tokens / Step",
+    "Weighted GPU KV Compression",
+    "Mean Step GPU KV Compression",
+    "Worst Step GPU KV Compression",
+    "Memory Report Coverage",
+    "Avg Host Checkpoint KV",
+    "Peak Host Checkpoint KV",
 ]
 
 
@@ -196,6 +270,16 @@ def _episode_rate(details: list[dict[str, Any]], key: str, false_key: str | None
     return bad / total
 
 
+def _step_rate(steps: list[dict[str, Any]], key: str, false_key: str | None = None) -> float | None:
+    if not steps:
+        return None
+    bad = 0
+    for step in steps:
+        if step.get(key) is True or (false_key and step.get(false_key) is False):
+            bad += 1
+    return bad / len(steps)
+
+
 def _turn_joint(details: list[dict[str, Any]]) -> float | None:
     total = 0
     passed = 0
@@ -217,7 +301,7 @@ def _turn_joint(details: list[dict[str, Any]]) -> float | None:
     return _safe_rate(passed, total)
 
 
-def _latest_metrics(details: list[dict[str, Any]]) -> dict[str, int | float]:
+def _latest_metrics(details: list[dict[str, Any]]) -> dict[str, int | float | None]:
     keys = [
         "chat_calls",
         "canonical_full_history_tokens",
@@ -226,15 +310,25 @@ def _latest_metrics(details: list[dict[str, Any]]) -> dict[str, int | float]:
         "repair_kv_tokens",
         "kv_runtime_report_missing",
         "kv_peak_resident_tokens",
+        "checkpoint_host_tokens",
+        "checkpoint_device_tokens",
+        "peak_checkpoint_host_tokens",
     ]
-    out: dict[str, int | float] = {key: 0 for key in keys}
+    out: dict[str, int | float] = {}
     for row in details:
-        metrics = row.get("c2kv_drift_metrics") or row.get("checkpoint_metrics") or {}
+        metrics = (
+            row.get("c2kv_drift_metrics")
+            or row.get("c2kv_checkpoint_metrics")
+            or row.get("checkpoint_metrics")
+            or {}
+        )
         if not isinstance(metrics, dict):
             continue
         for key in keys:
-            out[key] = out.get(key, 0) + (_num(metrics.get(key)) or 0)
-    return out
+            value = _num(metrics.get(key))
+            if value is not None:
+                out[key] = out.get(key, 0) + value
+    return {key: out.get(key) for key in keys}
 
 
 def _checkpoint_logs(root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -314,6 +408,12 @@ def _memory_from_steps(steps: list[dict[str, Any]]) -> dict[str, Any]:
         "online_mean_step_gpu_kv_compression": actual["mean"],
         "online_weighted_gpu_history_kv_compression": actual["weighted"],
         "online_worst_step_gpu_kv_compression": actual["worst"],
+        "avg_full_history_kv_tokens_per_step": actual["avg_full"],
+        "avg_active_history_kv_tokens_per_step": actual["avg_active"],
+        "actual_weighted_history_kv_compression": actual["weighted"],
+        "actual_mean_step_history_kv_compression": actual["mean"],
+        "actual_median_step_history_kv_compression": actual["median"],
+        "actual_worst_step_history_kv_compression": actual["worst"],
         "memory_report_coverage": coverage,
         "actual_compression_status": (
             "complete" if total and len(actual_pairs) == total else "incomplete"
@@ -324,6 +424,7 @@ def _memory_from_steps(steps: list[dict[str, Any]]) -> dict[str, Any]:
         "estimated_online_mean_step_gpu_kv_compression": estimated["mean"],
         "estimated_online_median_step_gpu_kv_compression": estimated["median"],
         "estimated_online_worst_step_gpu_kv_compression": estimated["worst"],
+        "estimated_weighted_history_kv_compression": estimated["weighted"],
         "runtime_memory_report_steps": len(actual_pairs),
         "runtime_memory_missing_steps": missing,
     }
@@ -416,14 +517,49 @@ def summarize_method(run_root: Path, method: str, dirname: str, category: str) -
         for seg in segments
         if bool(seg.get("segment_recovery_success") or seg.get("repair_segment_success"))
     )
+    if checkpoint_segments and recovery_attempts and recovery_success == 0:
+        recovery_success = sum(
+            1
+            for seg in checkpoint_segments
+            if bool(seg.get("rollback_triggered"))
+            and _int(seg.get("segment_executed_drift_count")) == 0
+            and not bool(seg.get("state_drift_after_recovery"))
+        )
 
     memory = _memory_from_steps(steps)
-    if memory["estimated_online_weighted_gpu_history_kv_compression"] is None:
-        full_tokens = _num(metrics.get("canonical_full_history_tokens")) or 0
-        active_tokens = _num(metrics.get("physical_history_kv_tokens")) or 0
-        memory["estimated_avg_full_history_tokens_per_step"] = _safe_rate(full_tokens, committed_steps)
-        memory["estimated_avg_active_history_tokens_per_step"] = _safe_rate(active_tokens, committed_steps)
-        memory["estimated_online_weighted_gpu_history_kv_compression"] = _safe_rate(full_tokens, active_tokens)
+
+    episode_candidate_drift = _episode_rate(
+        details, "candidate_action_drift", "candidate_action_matches_reference"
+    )
+    episode_executed_drift = _episode_rate(
+        details, "executed_action_drift", "executed_action_matches_reference"
+    )
+    episode_state_drift = _episode_rate(
+        details, "state_drift", "state_matches_reference"
+    )
+    step_candidate_drift = _step_rate(
+        steps, "candidate_action_drift", "candidate_action_matches_reference"
+    )
+    step_executed_drift = _step_rate(
+        steps, "executed_action_drift", "executed_action_matches_reference"
+    )
+    step_state_drift = _step_rate(steps, "state_drift", "state_matches_reference")
+
+    host_values = [
+        _num(seg.get("checkpoint_host_tokens"))
+        for seg in checkpoint_segments
+        if _num(seg.get("checkpoint_host_tokens")) is not None
+    ]
+    host_values = [value for value in host_values if value is not None]
+    avg_host_checkpoint = _mean(host_values)
+    peak_host_checkpoint = max(host_values) if host_values else None
+    total_host_checkpoint = _num(checkpoint_summary.get("checkpoint_host_tokens"))
+    if total_host_checkpoint is None:
+        total_host_checkpoint = _num(metrics.get("checkpoint_host_tokens"))
+    if peak_host_checkpoint is None:
+        peak_host_checkpoint = _num(checkpoint_summary.get("peak_checkpoint_host_tokens"))
+    if peak_host_checkpoint is None:
+        peak_host_checkpoint = _num(metrics.get("peak_checkpoint_host_tokens"))
 
     row: dict[str, Any] = {
         "method": method,
@@ -432,16 +568,26 @@ def summarize_method(run_root: Path, method: str, dirname: str, category: str) -
         "correct_count": correct,
         "num_examples": total,
         "turn_joint_pass_rate": _turn_joint(details),
-        "candidate_action_drift_rate": _episode_rate(details, "candidate_action_drift", "candidate_action_matches_reference"),
-        "executed_action_drift_rate": _episode_rate(details, "executed_action_drift", "executed_action_matches_reference"),
-        "state_drift_rate": _episode_rate(details, "state_drift", "state_matches_reference"),
+        "episode_candidate_action_drift_rate": episode_candidate_drift,
+        "episode_executed_action_drift_rate": episode_executed_drift,
+        "episode_state_drift_rate": episode_state_drift,
+        "step_candidate_action_drift_rate": step_candidate_drift,
+        "step_executed_action_drift_rate": step_executed_drift,
+        "step_state_drift_rate": step_state_drift,
+        "candidate_action_drift_rate": episode_candidate_drift,
+        "executed_action_drift_rate": episode_executed_drift,
+        "state_drift_rate": episode_state_drift,
         "detector": "oracle" if method not in {"Full", "C2KV"} else "",
         "oracle_harmful_segments": oracle_harmful,
+        "oracle_reference_drift_segments": oracle_harmful,
         "detector_trigger_count": detector_trigger,
         "detector_trigger_rate": _safe_rate(detector_trigger, len(segments)),
         "recovery_attempt_count": recovery_attempts,
         "recovery_success_count": recovery_success,
         "recovery_success_rate": _safe_rate(recovery_success, recovery_attempts),
+        "reference_recovery_success_rate": _safe_rate(
+            recovery_success, recovery_attempts
+        ),
         "total_committed_steps": committed_steps,
         "avg_committed_steps_per_episode": _safe_rate(committed_steps, total),
         "total_candidate_steps": candidate_steps,
@@ -450,17 +596,27 @@ def summarize_method(run_root: Path, method: str, dirname: str, category: str) -
         "avg_regenerated_steps_per_episode": _safe_rate(regenerated_steps, total),
         "total_model_generation_calls": candidate_steps + regenerated_steps,
         "model_calls_per_committed_step": _safe_rate(candidate_steps + regenerated_steps, committed_steps),
-        "chat_calls": _int(metrics.get("chat_calls") or checkpoint_summary.get("chat_calls")),
+        "chat_calls": (
+            _num(metrics.get("chat_calls"))
+            if metrics.get("chat_calls") is not None
+            else _num(checkpoint_summary.get("chat_calls"))
+        ),
         "reference_aligned_mean_step_compression": None,
         "reference_aligned_weighted_compression": None,
         "reference_aligned_worst_step_compression": None,
         "reference_aligned_num_steps": None,
         "reference_aligned_status": "not_generated",
-        "host_checkpoint_kv_tokens": _int(checkpoint_summary.get("host_checkpoint_kv_tokens")),
+        "host_checkpoint_kv_tokens": total_host_checkpoint,
+        "avg_host_checkpoint_kv_tokens": avg_host_checkpoint,
+        "peak_host_checkpoint_kv_tokens": peak_host_checkpoint,
+        "cumulative_host_checkpoint_token_volume": total_host_checkpoint,
+        "avg_resident_host_checkpoint_kv_tokens": avg_host_checkpoint,
+        "peak_resident_host_checkpoint_kv_tokens": peak_host_checkpoint,
         "host_raw_bank_kv_tokens": 0,
-        "peak_host_kv_tokens": _int(checkpoint_summary.get("peak_host_kv_tokens")),
+        "peak_host_kv_tokens": peak_host_checkpoint
+        or _num(checkpoint_summary.get("peak_host_kv_tokens")),
         "raw_kv_bank_implemented": False,
-        "schema_version": 2,
+        "schema_version": 3,
     }
     row.update(memory)
     row.update(_transition_counts(segments))
@@ -469,14 +625,66 @@ def summarize_method(run_root: Path, method: str, dirname: str, category: str) -
 
 def _write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
     csv_path = run_root / "unified_recovery_comparison.csv"
+    v3_csv_path = run_root / "unified_recovery_summary_v3.csv"
     json_path = run_root / "unified_recovery_comparison.json"
     md_path = run_root / "unified_recovery_comparison.md"
+    quick_csv_path = run_root / "quick_recovery_comparison.csv"
+    quick_md_path = run_root / "quick_recovery_comparison.md"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
+    with open(v3_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=V3_CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
     json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def quick_row(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "Method": row.get("method"),
+            "BFCL Acc": row.get("bfcl_accuracy"),
+            "Turn Joint": row.get("turn_joint_pass_rate"),
+            "Step Executed Action Drift": row.get("step_executed_action_drift_rate"),
+            "Step State Drift": row.get("step_state_drift_rate"),
+            "Detector Trigger Rate": row.get("detector_trigger_rate"),
+            "Recovery Success Rate": row.get("recovery_success_rate"),
+            "Avg Committed Steps / Episode": row.get(
+                "avg_committed_steps_per_episode"
+            ),
+            "Regenerated Steps": row.get("total_regenerated_steps"),
+            "Model Calls / Committed Step": row.get(
+                "model_calls_per_committed_step"
+            ),
+            "Avg Active GPU KV Tokens / Step": row.get(
+                "avg_active_history_kv_tokens_per_step"
+            ),
+            "Weighted GPU KV Compression": row.get(
+                "actual_weighted_history_kv_compression"
+            ),
+            "Mean Step GPU KV Compression": row.get(
+                "actual_mean_step_history_kv_compression"
+            ),
+            "Worst Step GPU KV Compression": row.get(
+                "actual_worst_step_history_kv_compression"
+            ),
+            "Memory Report Coverage": row.get("memory_report_coverage"),
+            "Avg Host Checkpoint KV": row.get(
+                "avg_resident_host_checkpoint_kv_tokens"
+            ),
+            "Peak Host Checkpoint KV": row.get(
+                "peak_resident_host_checkpoint_kv_tokens"
+            ),
+        }
+
+    with open(quick_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=QUICK_CSV_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(quick_row(row))
+
     md_cols = [
         "method",
         "bfcl_accuracy",
@@ -484,11 +692,11 @@ def _write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
         "executed_action_drift_rate",
         "state_drift_rate",
         "detector_trigger_rate",
-        "recovery_success_rate",
+        "reference_recovery_success_rate",
         "total_committed_steps",
         "model_calls_per_committed_step",
-        "online_weighted_gpu_history_kv_compression",
-        "estimated_online_weighted_gpu_history_kv_compression",
+        "actual_weighted_history_kv_compression",
+        "estimated_weighted_history_kv_compression",
         "memory_report_coverage",
     ]
     lines = ["# Unified C2KV Recovery Comparison", ""]
@@ -506,6 +714,23 @@ def _write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
                 vals.append(str(value))
         lines.append("| " + " | ".join(vals) + " |")
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    quick_lines = ["# Quick Recovery Comparison", ""]
+    quick_lines.append("| " + " | ".join(QUICK_CSV_FIELDS) + " |")
+    quick_lines.append("| " + " | ".join(["---"] * len(QUICK_CSV_FIELDS)) + " |")
+    for row in rows:
+        item = quick_row(row)
+        vals = []
+        for col in QUICK_CSV_FIELDS:
+            value = item.get(col)
+            if isinstance(value, float):
+                vals.append(f"{value:.4f}")
+            elif value is None:
+                vals.append("-")
+            else:
+                vals.append(str(value))
+        quick_lines.append("| " + " | ".join(vals) + " |")
+    quick_md_path.write_text("\n".join(quick_lines) + "\n", encoding="utf-8")
 
 
 def parse_args() -> argparse.Namespace:
@@ -530,7 +755,8 @@ def main() -> None:
         if ":" in spec:
             label, dirname = spec.split(":", 1)
         else:
-            label = dirname = spec
+            dirname = spec
+            label = DISPLAY_NAME_BY_DIR.get(dirname, dirname)
         if not (run_root / dirname).exists():
             rows.append({"method": label, "run_dir": dirname, "schema_version": 2})
             continue
