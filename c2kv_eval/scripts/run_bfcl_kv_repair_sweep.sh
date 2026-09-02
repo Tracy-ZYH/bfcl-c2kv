@@ -32,6 +32,8 @@ C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION:-0.06}"
 REPAIR_WINDOW="${REPAIR_WINDOW:-1}"
 REPAIR_TRIGGER="${REPAIR_TRIGGER:-oracle}"
 REPAIR_EXTRACT_SOURCE="${REPAIR_EXTRACT_SOURCE:-auto}"
+C2KV_APPEND_POSITION_FRAME="${C2KV_APPEND_POSITION_FRAME:-wrapper}"
+C2KV_DEBUG_POSITION_FRAME="${C2KV_DEBUG_POSITION_FRAME:-0}"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-4096}"
 FLUSH_CACHE_BETWEEN_ARMS="${FLUSH_CACHE_BETWEEN_ARMS:-1}"
 RUN_COMPARE="${RUN_COMPARE:-1}"
@@ -196,13 +198,15 @@ run_arm() {
       --checkpoint-interval "${CHECKPOINT_INTERVAL}" \
       --repair-window "${REPAIR_WINDOW}" \
       --repair-extract-source "${REPAIR_EXTRACT_SOURCE}" \
+      --c2kv-append-position-frame "${C2KV_APPEND_POSITION_FRAME}" \
       --repair-trigger "${REPAIR_TRIGGER}" \
       --max-completion-tokens "${MAX_COMPLETION_TOKENS}" \
       --result-dir "${arm_root}/result" \
       --details-path "${arm_root}/logs/details.jsonl" \
       --metrics-path "${arm_root}/logs/metrics.jsonl" \
       --summary-path "${arm_root}/logs/summary.json" \
-      --temperature 0
+      --temperature 0 \
+      $([ "${C2KV_DEBUG_POSITION_FRAME}" = "1" ] && printf '%s' '--c2kv-debug-position-frame')
   ) >"${arm_root}/logs/runner.log" 2>&1
   log_info "runner done arm=${arm}"
 }

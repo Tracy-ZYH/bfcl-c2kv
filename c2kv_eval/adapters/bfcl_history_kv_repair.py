@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import re
 import time
 from copy import deepcopy
@@ -84,8 +85,15 @@ REPAIR_ARMS = {
 DETECTOR_ARMS = {
     "oracle",
     "combined_logistic",
+    "combined_logistic_fixed",
     "combined_logistic_best_f1",
     "combined_logistic_high_recall",
+    "combined_logistic_rate_10",
+    "combined_logistic_rate_20",
+    "combined_logistic_rate_30",
+    "combined_logistic_rate_40",
+    "combined_logistic_rate_50",
+    "combined_logistic_rate_60",
     "max_risk_score",
     "rule_detector_max_risk",
     "max_observation_anomaly",
@@ -140,11 +148,20 @@ class KVRepairRunner(HistoryDriftRunner):
         self.detector_arm = getattr(args, "detector_arm", "oracle")
         if self.detector_arm == "combined_logistic":
             self.detector_arm = "combined_logistic_best_f1"
+        self._logistic_trigger_rate = self._parse_logistic_trigger_rate(
+            self.detector_arm
+        )
         self.rule_detector_threshold = float(
             getattr(args, "rule_detector_threshold", 5.0)
         )
         self.detector_signal_threshold = float(
             getattr(args, "detector_signal_threshold", 5.0)
+        )
+        self.logistic_detector_threshold = float(
+            getattr(args, "logistic_detector_threshold", -1.0)
+        )
+        self.logistic_detector_fixed_fold = int(
+            getattr(args, "logistic_detector_fixed_fold", -1)
         )
         self.candidate_logprobs_top_k = int(
             getattr(args, "candidate_logprobs_top_k", 20)
@@ -158,7 +175,9 @@ class KVRepairRunner(HistoryDriftRunner):
             in {
                 "combined_logistic_best_f1",
                 "combined_logistic_high_recall",
+                "combined_logistic_fixed",
             }
+            or self._logistic_trigger_rate is not None
         )
         self.logistic_detector_kfolds = max(
             0,
@@ -179,6 +198,10 @@ class KVRepairRunner(HistoryDriftRunner):
                 threshold_rule=(
                     "high_recall"
                     if self.detector_arm == "combined_logistic_high_recall"
+                    else "fixed"
+                    if self.detector_arm == "combined_logistic_fixed"
+                    else f"trigger_rate_{int(self._logistic_trigger_rate * 100)}"
+                    if self._logistic_trigger_rate is not None
                     else "best_f1"
                 ),
             )
@@ -186,7 +209,9 @@ class KVRepairRunner(HistoryDriftRunner):
             in {
                 "combined_logistic_best_f1",
                 "combined_logistic_high_recall",
+                "combined_logistic_fixed",
             }
+            or self._logistic_trigger_rate is not None
             else None
         )
         self.checkpoint_interval = max(1, int(args.checkpoint_interval))
@@ -198,6 +223,12 @@ class KVRepairRunner(HistoryDriftRunner):
         self._repair_target_history_index: int | None = None
         self._repair_window_arg = args.repair_window
         self.repair_extract_source = getattr(args, "repair_extract_source", "auto")
+        self.c2kv_debug_position_frame = bool(
+            getattr(args, "c2kv_debug_position_frame", False)
+        )
+        self.c2kv_append_position_frame = str(
+            getattr(args, "c2kv_append_position_frame", "wrapper") or "wrapper"
+        )
         self._active_oracle_bad_step: int | None = None
         self._last_repair_build_info: dict[str, Any] = {}
         self._last_kv_memory_hint: dict[str, Any] | None = None
@@ -291,6 +322,19 @@ class KVRepairRunner(HistoryDriftRunner):
             if value is not None:
                 return float(value)
         return float(self.detector_signal_threshold)
+
+    @staticmethod
+    def _parse_logistic_trigger_rate(detector_arm: str) -> float | None:
+        prefix = "combined_logistic_rate_"
+        if not detector_arm.startswith(prefix):
+            return None
+        try:
+            value = int(detector_arm[len(prefix) :])
+        except Exception:
+            return None
+        if value <= 0 or value >= 100:
+            return None
+        return value / 100.0
 
     def _repair_extract_source_for(self, effective_arm: str, repair_kind: str) -> str:
         if self.repair_extract_source != "auto":
@@ -738,6 +782,65 @@ class KVRepairRunner(HistoryDriftRunner):
                 best_threshold = float(threshold)
         return best_threshold
 
+    @staticmethod
+    def _threshold_at_trigger_rate(scores: Sequence[float], rate: float) -> float:
+        usable = sorted(float(score) for score in scores if math.isfinite(float(score)))
+        if not usable:
+            return 1.0
+        rate = min(max(rate, 0.0), 1.0)
+        if rate <= 0.0:
+            return usable[-1] + 1e-12
+        if rate >= 1.0:
+            return usable[0] - 1e-12
+        candidates = [usable[-1] + 1e-12]
+        candidates.extend(sorted(set(usable)))
+        candidates.append(usable[0] - 1e-12)
+        best_threshold = candidates[0]
+        best_delta = float("inf")
+        best_trigger = -1.0
+        for threshold in candidates:
+            actual = sum(1 for score in usable if score >= threshold) / len(usable)
+            delta = abs(actual - rate)
+            if (
+                delta < best_delta
+                or (delta == best_delta and actual <= rate and actual > best_trigger)
+                or (delta == best_delta and best_trigger > rate and actual < best_trigger)
+            ):
+                best_threshold = threshold
+                best_delta = delta
+                best_trigger = actual
+        return float(best_threshold)
+
+    @staticmethod
+    def _score_distribution(scores: Sequence[float]) -> dict[str, Any]:
+        usable = sorted(float(score) for score in scores if math.isfinite(float(score)))
+        if not usable:
+            return {
+                "train_score_count": 0,
+                "train_score_num_unique": 0,
+            }
+
+        def percentile(percent: int) -> float:
+            index = int(round((percent / 100.0) * (len(usable) - 1)))
+            index = min(max(index, 0), len(usable) - 1)
+            return float(usable[index])
+
+        return {
+            "train_score_count": len(usable),
+            "train_score_num_unique": len({round(score, 12) for score in usable}),
+            "train_score_min": float(usable[0]),
+            "train_score_p10": percentile(10),
+            "train_score_p20": percentile(20),
+            "train_score_p30": percentile(30),
+            "train_score_p40": percentile(40),
+            "train_score_p50": percentile(50),
+            "train_score_p60": percentile(60),
+            "train_score_p70": percentile(70),
+            "train_score_p80": percentile(80),
+            "train_score_p90": percentile(90),
+            "train_score_max": float(usable[-1]),
+        }
+
     def _select_logistic_features(
         self,
         rows: Sequence[dict[str, Any]],
@@ -824,11 +927,37 @@ class KVRepairRunner(HistoryDriftRunner):
         calibration_labels = [
             int(float(row["segment_harmful"])) for row in calibration_rows
         ]
-        threshold = (
-            self._threshold_at_high_recall(calibration_labels, calibration_scores, 0.95)
-            if threshold_rule == "high_recall"
-            else self._best_f1_threshold(calibration_labels, calibration_scores)
+        threshold_trigger_rate = None
+        if threshold_rule.startswith("trigger_rate_"):
+            threshold_trigger_rate = int(threshold_rule.rsplit("_", 1)[-1]) / 100.0
+            threshold = self._threshold_at_trigger_rate(
+                calibration_scores,
+                threshold_trigger_rate,
+            )
+        elif threshold_rule == "fixed":
+            threshold = (
+                float(self.logistic_detector_threshold)
+                if self.logistic_detector_threshold >= 0.0
+                else 0.5
+            )
+        else:
+            threshold = (
+                self._threshold_at_high_recall(calibration_labels, calibration_scores, 0.95)
+                if threshold_rule == "high_recall"
+                else self._best_f1_threshold(calibration_labels, calibration_scores)
+            )
+        actual_train_trigger_rate = (
+            sum(1 for score in calibration_scores if score >= threshold)
+            / len(calibration_scores)
+            if calibration_scores
+            else None
         )
+        train_reference_drift_rate = (
+            sum(calibration_labels) / len(calibration_labels)
+            if calibration_labels
+            else None
+        )
+        score_distribution = self._score_distribution(calibration_scores)
         return {
             "features": list(usable),
             "means": means,
@@ -836,6 +965,10 @@ class KVRepairRunner(HistoryDriftRunner):
             "weights": weights,
             "threshold": threshold,
             "threshold_selection_rule": threshold_rule,
+            "target_trigger_rate": threshold_trigger_rate,
+            "train_trigger_rate_at_threshold": actual_train_trigger_rate,
+            "train_reference_drift_rate": train_reference_drift_rate,
+            **score_distribution,
             "train_rows": len(train),
             "calibration_rows": len(calibration_rows),
             "train_episode_ids": sorted({str(row.get("id")) for row in train}),
@@ -882,17 +1015,43 @@ class KVRepairRunner(HistoryDriftRunner):
                     existing_thresholds = {}
             fold_threshold = {
                 **existing_thresholds,
-                "combined_logistic": fold_model.get("threshold"),
-                "combined_logistic_best_f1": fold_model.get("threshold"),
+                self.detector_arm: fold_model.get("threshold"),
                 "threshold_selection_rule": fold_model.get(
                     "threshold_selection_rule"
                 ),
+                "target_trigger_rate": fold_model.get("target_trigger_rate"),
+                "train_trigger_rate_at_threshold": fold_model.get(
+                    "train_trigger_rate_at_threshold"
+                ),
+                "train_reference_drift_rate": fold_model.get(
+                    "train_reference_drift_rate"
+                ),
+                "train_score_count": fold_model.get("train_score_count"),
+                "train_score_num_unique": fold_model.get("train_score_num_unique"),
+                "train_score_min": fold_model.get("train_score_min"),
+                "train_score_p10": fold_model.get("train_score_p10"),
+                "train_score_p20": fold_model.get("train_score_p20"),
+                "train_score_p30": fold_model.get("train_score_p30"),
+                "train_score_p40": fold_model.get("train_score_p40"),
+                "train_score_p50": fold_model.get("train_score_p50"),
+                "train_score_p60": fold_model.get("train_score_p60"),
+                "train_score_p70": fold_model.get("train_score_p70"),
+                "train_score_p80": fold_model.get("train_score_p80"),
+                "train_score_p90": fold_model.get("train_score_p90"),
+                "train_score_max": fold_model.get("train_score_max"),
                 "train_episode_ids": fold_model.get("train_episode_ids"),
                 "calibration_episode_ids": fold_model.get(
                     "calibration_episode_ids"
                 ),
                 "test_episode_ids": fold_model.get("fold_test_episode_ids"),
             }
+            if self.detector_arm in {
+                "combined_logistic_best_f1",
+                "combined_logistic_high_recall",
+                "combined_logistic_fixed",
+            }:
+                fold_threshold["combined_logistic"] = fold_model.get("threshold")
+                fold_threshold[self.detector_arm] = fold_model.get("threshold")
             (fold_dir / "thresholds.json").write_text(
                 json.dumps(fold_threshold, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
@@ -937,10 +1096,14 @@ class KVRepairRunner(HistoryDriftRunner):
                     for row in labeled_rows
                     if self._episode_fold(str(row.get("id")), folds) != fold
                 ]
-                train_fit, calibration = self._inner_train_calibration_split(
-                    train,
-                    outer_fold=fold,
-                )
+                if threshold_rule.startswith("trigger_rate_") or threshold_rule == "fixed":
+                    train_fit = train
+                    calibration = train
+                else:
+                    train_fit, calibration = self._inner_train_calibration_split(
+                        train,
+                        outer_fold=fold,
+                    )
                 test_episode_ids = [
                     sample_id
                     for sample_id in episode_ids
@@ -1021,7 +1184,11 @@ class KVRepairRunner(HistoryDriftRunner):
         selected_fold = None
         if model.get("kfold_models"):
             folds = int(model.get("kfolds") or 0)
-            selected_fold = self._episode_fold(str(sample_id), folds)
+            selected_fold = (
+                self.logistic_detector_fixed_fold
+                if self.logistic_detector_fixed_fold >= 0
+                else self._episode_fold(str(sample_id), folds)
+            )
             model = model["kfold_models"][str(selected_fold)]
         row = self._segment_detector_feature_row(segment_infos)
         x = [1.0]
@@ -1032,6 +1199,11 @@ class KVRepairRunner(HistoryDriftRunner):
             x.append((value - model["means"][name]) / model["stds"][name])
         score = self._sigmoid(sum(w * xi for w, xi in zip(model["weights"], x)))
         threshold = float(model["threshold"])
+        if self.detector_arm == "combined_logistic_fixed":
+            override = self._threshold_for_detector("combined_logistic", sample_id)
+            if self.logistic_detector_threshold >= 0.0:
+                override = self.logistic_detector_threshold
+            threshold = float(override)
         triggered = score >= threshold
         return {
             "detector": self.detector_arm,
@@ -1102,7 +1274,8 @@ class KVRepairRunner(HistoryDriftRunner):
         if self.detector_arm in {
             "combined_logistic_best_f1",
             "combined_logistic_high_recall",
-        }:
+            "combined_logistic_fixed",
+        } or self._parse_logistic_trigger_rate(self.detector_arm) is not None:
             return self._logistic_detector(segment_infos)
         if self.detector_arm == "max_risk_score":
             return self._feature_signal_detector(
@@ -1345,6 +1518,17 @@ class KVRepairRunner(HistoryDriftRunner):
             cursor = end
         return full_tokens, starts, ends
 
+    @staticmethod
+    def _cumulative_spans(lengths: Sequence[int]) -> tuple[list[int], list[int]]:
+        starts: list[int] = []
+        ends: list[int] = []
+        cursor = 0
+        for length in lengths:
+            starts.append(cursor)
+            cursor += int(length)
+            ends.append(cursor)
+        return starts, ends
+
     def _extract_repair(
         self,
         *,
@@ -1352,6 +1536,8 @@ class KVRepairRunner(HistoryDriftRunner):
         span_start: int,
         span_end: int,
         position_offset: int,
+        repair_position_ids: list[int] | None = None,
+        raw_kv_position_mode: str = "rotated",
         repair_mode: str,
         source_doc_index: int | None,
         stats: DriftStats,
@@ -1421,6 +1607,8 @@ class KVRepairRunner(HistoryDriftRunner):
                     "span_start": span_start,
                     "span_end": span_end,
                     "position_offset": position_offset,
+                    "repair_position_ids": repair_position_ids,
+                    "raw_kv_position_mode": raw_kv_position_mode,
                     "repair_mode": repair_mode,
                     "source_doc_index": source_doc_index,
                     "extract_source": extract_source,
@@ -1848,6 +2036,12 @@ class KVRepairRunner(HistoryDriftRunner):
             current_messages=current,
         )
         doc_lens = [end - start for start, end in zip(starts, ends)]
+        wrapper_local_starts, wrapper_local_ends = self._cumulative_spans(
+            [len(ids) for ids in doc_ids]
+        )
+        wrapper_base = starts[0] if starts else 0
+        wrapper_starts = [wrapper_base + start for start in wrapper_local_starts]
+        wrapper_ends = [wrapper_base + end for end in wrapper_local_ends]
         canonical_full_history_tokens = sum(doc_lens)
         stats.canonical_full_history_tokens += canonical_full_history_tokens
 
@@ -1964,6 +2158,7 @@ class KVRepairRunner(HistoryDriftRunner):
                     "role": "user",
                     "content": "\n".join(texts),
                     "c2kv_repair_only_key_hashes": [repair["key_hash"]],
+                    "c2kv_use_gist_projection": True,
                 },
                 *current,
             ]
@@ -1991,16 +2186,31 @@ class KVRepairRunner(HistoryDriftRunner):
             if config["repair_kind"] == "none":
                 return
             span_len = doc_lens[index]
+            operation = str(config["operation"])
+            append_coordinate_frame = (
+                operation == "append"
+                and self.c2kv_append_position_frame == "wrapper"
+            )
+            repair_position_ids: list[int] | None = None
+            raw_kv_position_mode = "rotated"
             if config["repair_kind"] == "neutral":
                 input_ids = self._neutral_ids_for(plan, span_len)
                 span_start = 0
                 span_end = span_len
-                position_offset = starts[index]
+                position_offset = (
+                    wrapper_starts[index] if append_coordinate_frame else starts[index]
+                )
             elif config["repair_kind"] == "raw":
                 extract_source = self._repair_extract_source_for(
                     effective_arm,
                     "raw",
                 )
+                if append_coordinate_frame and extract_source == "serving_cache":
+                    raise RuntimeError(
+                        "Append repair needs pre-RoPE raw K so it can be placed "
+                        "in the C2KV wrapper frame; serving_cache only contains "
+                        "already-rotated native-frame K."
+                    )
                 input_ids = (
                     full_prompt_ids
                     if extract_source == "serving_cache"
@@ -2009,6 +2219,16 @@ class KVRepairRunner(HistoryDriftRunner):
                 span_start = starts[index]
                 span_end = ends[index]
                 position_offset = 0
+                if append_coordinate_frame:
+                    # The raw repair KV length is the native Full-context span
+                    # length. The C2KV wrapper unit may tokenize longer/shorter,
+                    # so place raw KV in the wrapper coordinate frame starting at
+                    # the corresponding unit start, but keep the position vector
+                    # exactly token_len long.
+                    repair_position_ids = list(
+                        range(wrapper_starts[index], wrapper_starts[index] + span_len)
+                    )
+                    raw_kv_position_mode = "pre_rope"
             else:
                 raise RuntimeError(f"Unsupported repair kind: {config['repair_kind']}")
             if config["repair_kind"] != "raw":
@@ -2022,6 +2242,8 @@ class KVRepairRunner(HistoryDriftRunner):
                 span_start=span_start,
                 span_end=span_end,
                 position_offset=position_offset,
+                repair_position_ids=repair_position_ids,
+                raw_kv_position_mode=raw_kv_position_mode,
                 repair_mode=effective_arm,
                 source_doc_index=index,
                 stats=stats,
@@ -2039,10 +2261,22 @@ class KVRepairRunner(HistoryDriftRunner):
             repair_tokens += token_len
             position_start = int(repair.get("position_start", starts[index]))
             position_end = int(repair.get("position_end", ends[index]))
-            if position_start != starts[index] or position_end != ends[index]:
+            expected_position_start = (
+                wrapper_starts[index] if append_coordinate_frame else starts[index]
+            )
+            expected_position_end = (
+                wrapper_starts[index] + span_len
+                if append_coordinate_frame
+                else ends[index]
+            )
+            if (
+                position_start != expected_position_start
+                or position_end != expected_position_end
+            ):
                 raise RuntimeError(
                     "repair position range mismatch: "
-                    f"index={index}, expected=({starts[index]}, {ends[index]}), "
+                    f"index={index}, expected=({expected_position_start}, "
+                    f"{expected_position_end}), "
                     f"actual=({position_start}, {position_end})"
                 )
             repair_metadata.append(
@@ -2050,8 +2284,19 @@ class KVRepairRunner(HistoryDriftRunner):
                     "history_index": index,
                     "roles": self._ordered_roles(units[index]),
                     "raw_token_count": token_len,
+                    "native_position_start": starts[index],
+                    "native_position_end": ends[index],
+                    "wrapper_position_start": wrapper_starts[index],
+                    "wrapper_position_end": wrapper_ends[index],
+                    "wrapper_unit_token_count": wrapper_ends[index]
+                    - wrapper_starts[index],
+                    "wrapper_native_token_delta": (
+                        wrapper_ends[index] - wrapper_starts[index] - token_len
+                    ),
                     "absolute_position_start": position_start,
                     "absolute_position_end": position_end,
+                    "raw_kv_position_mode": raw_kv_position_mode,
+                    "already_rotated": raw_kv_position_mode != "pre_rope",
                     "repair_extract_source": repair.get("extract_source") or "",
                     "repair_extract_cache_hit_tokens": int(
                         repair.get("cache_hit_tokens") or 0
@@ -2084,6 +2329,11 @@ class KVRepairRunner(HistoryDriftRunner):
                                 "mode": "raw_append_masked",
                                 "roles": self._ordered_roles(unit),
                                 "logical_token_range": [starts[index], ends[index]],
+                                "native_position_range": [starts[index], ends[index]],
+                                "wrapper_position_range": [
+                                    wrapper_starts[index],
+                                    wrapper_ends[index],
+                                ],
                                 "absolute_rope_position_range": [starts[index], ends[index]],
                                 "raw_tokens": raw_len,
                             }
@@ -2094,6 +2344,7 @@ class KVRepairRunner(HistoryDriftRunner):
                                 "role": "user",
                                 "content": text,
                                 "c2kv_repair_only_key_hashes": repair_keys_by_index[index],
+                                "c2kv_use_gist_projection": True,
                             }
                         )
                         history_layout_debug.append(
@@ -2102,6 +2353,11 @@ class KVRepairRunner(HistoryDriftRunner):
                                 "mode": "raw_replace",
                                 "roles": self._ordered_roles(unit),
                                 "logical_token_range": [starts[index], ends[index]],
+                                "native_position_range": [starts[index], ends[index]],
+                                "wrapper_position_range": [
+                                    wrapper_starts[index],
+                                    wrapper_ends[index],
+                                ],
                                 "absolute_rope_position_range": [starts[index], ends[index]],
                                 "raw_tokens": raw_len,
                             }
@@ -2123,6 +2379,11 @@ class KVRepairRunner(HistoryDriftRunner):
                             ),
                             "roles": self._ordered_roles(unit),
                             "logical_token_range": [starts[index], ends[index]],
+                            "native_position_range": [starts[index], ends[index]],
+                            "wrapper_position_range": [
+                                wrapper_starts[index],
+                                wrapper_ends[index],
+                            ],
                             "absolute_rope_position_range": [starts[index], ends[index]],
                             "raw_tokens": doc_lens[index],
                         }
@@ -2141,7 +2402,12 @@ class KVRepairRunner(HistoryDriftRunner):
             stats.c2kv_gist_tokens += gist_len
             local_physical_history_tokens += gist_len
             messages.append(
-                {"role": "user", "content": text, "c2kv_key_hash": record.key_hash}
+                {
+                    "role": "user",
+                    "content": text,
+                    "c2kv_key_hash": record.key_hash,
+                    "c2kv_use_gist_projection": True,
+                }
             )
             history_layout_debug.append(
                 {
@@ -2149,6 +2415,11 @@ class KVRepairRunner(HistoryDriftRunner):
                     "mode": "gist",
                     "roles": self._ordered_roles(unit),
                     "logical_token_range": [starts[index], ends[index]],
+                    "native_position_range": [starts[index], ends[index]],
+                    "wrapper_position_range": [
+                        wrapper_starts[index],
+                        wrapper_ends[index],
+                    ],
                     "physical_kv_tokens": gist_len,
                     "full_equivalent_tokens": int(record.original_seq_len or full_tokens),
                 }
@@ -2161,24 +2432,27 @@ class KVRepairRunner(HistoryDriftRunner):
             for key_hash in repair_keys_by_index.get(index, [])
         ]
         if config["operation"] in {"append", "append_masked"} and append_repair_keys:
-            target_message = None
-            for message in reversed(messages):
-                if message.get("c2kv_key_hash"):
-                    target_message = message
-                    break
-            if target_message is None:
-                if config["operation"] == "append_masked":
-                    messages.insert(
-                        0,
-                        {
-                            "role": "user",
-                            "content": "",
-                            "c2kv_repair_only_key_hashes": append_repair_keys,
-                        },
-                    )
-                else:
-                    raise RuntimeError(f"Cannot attach append repair keys for arm={effective_arm}")
+            if config["operation"] == "append_masked":
+                # Diagnostic parity mode for replace_w2: build the raw repair
+                # keys through the append plumbing, but expose them as a
+                # repair-only carrier after the remaining gist history so the
+                # active layout is G0...Gk + Rtarget, not Gtarget + Rtarget.
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "",
+                        "c2kv_repair_only_key_hashes": append_repair_keys,
+                        "c2kv_use_gist_projection": True,
+                    }
+                )
             else:
+                target_message = None
+                for message in reversed(messages):
+                    if message.get("c2kv_key_hash"):
+                        target_message = message
+                        break
+                if target_message is None:
+                    raise RuntimeError(f"Cannot attach append repair keys for arm={effective_arm}")
                 target_message["c2kv_repair_key_hashes"] = append_repair_keys
             if config["operation"] == "append":
                 stats.effective_history_tokens += repair_tokens
@@ -2233,6 +2507,17 @@ class KVRepairRunner(HistoryDriftRunner):
                 for meta in repair_metadata
             ],
             "history_layout": history_layout_debug,
+            "position_frame_debug_enabled": self.c2kv_debug_position_frame,
+            "history_original_tokens": sum(len(ids) for ids in doc_ids),
+            "canonical_full_history_tokens": canonical_full_history_tokens,
+            "wrapper_native_length_delta": (
+                sum(len(ids) for ids in doc_ids) - canonical_full_history_tokens
+            ),
+            "wrapper_native_length_ratio": (
+                sum(len(ids) for ids in doc_ids) / canonical_full_history_tokens
+                if canonical_full_history_tokens
+                else None
+            ),
             "physical_prefix_len_before": max(0, physical_before - repair_tokens),
             "physical_prefix_len_after": physical_before,
             "logical_position_before": logical_before,
@@ -3278,6 +3563,25 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--logistic-detector-threshold",
+        type=float,
+        default=-1.0,
+        help=(
+            "External threshold for combined_logistic_fixed. Negative keeps "
+            "the detector's internal threshold selection."
+        ),
+    )
+    parser.add_argument(
+        "--logistic-detector-fixed-fold",
+        type=int,
+        default=-1,
+        help=(
+            "If >=0 with k-fold logistic, force all samples to use this "
+            "outer-fold model. This is used for train closed-loop threshold "
+            "sweeps and held-out evaluation."
+        ),
+    )
+    parser.add_argument(
         "--logistic-detector-feature-set",
         choices=["auto", "online_safe", "all"],
         default="auto",
@@ -3290,6 +3594,24 @@ def parse_args() -> argparse.Namespace:
         "--detector-cv-output-dir",
         default="",
         help="Directory where k-fold logistic model/scaler/threshold artifacts are saved.",
+    )
+    parser.add_argument(
+        "--c2kv-debug-position-frame",
+        action="store_true",
+        help=(
+            "Record native/wrapper repair position ranges and injected RoPE "
+            "position metadata for C2KV KV-repair debugging."
+        ),
+    )
+    parser.add_argument(
+        "--c2kv-append-position-frame",
+        choices=["native", "wrapper"],
+        default=os.environ.get("C2KV_APPEND_POSITION_FRAME", "wrapper"),
+        help=(
+            "Position frame for append-only raw/neutral repair KV. native "
+            "keeps the old Full-prompt RoPE placement; wrapper places pre-RoPE "
+            "raw K at C2KV wrapper-frame positions."
+        ),
     )
     parser.add_argument(
         "--neutral-corpus-path",

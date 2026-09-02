@@ -29,6 +29,24 @@ SUMMARY_FIELDS = [
     "overall_trigger_rate",
 ]
 
+PARETO_FIELDS = [
+    "Detector / Operating Point",
+    "Target Trigger Rate",
+    "Actual Trigger Rate",
+    "BFCL Accuracy",
+    "BFCL Fold Std",
+    "Correct / 52",
+    "Pareto Frontier",
+]
+
+BFCL_TRIGGER_SUMMARY_FIELDS = [
+    "Detector",
+    "BFCL Acc",
+    "Trigger Rate",
+    "BFCL Fold Std",
+    "Correct / 52",
+]
+
 DETAIL_FIELDS = [
     "detector",
     "fold",
@@ -50,6 +68,44 @@ DETAIL_FIELDS = [
     "detector_fp",
     "detector_tn",
     "detector_fn",
+]
+
+LOGISTIC_DIAGNOSTIC_FIELDS = [
+    "detector",
+    "fold",
+    "target_trigger_rate",
+    "threshold",
+    "train_actual_trigger_rate",
+    "train_reference_drift_rate",
+    "online_actual_trigger_rate",
+    "train_score_count",
+    "train_score_num_unique",
+    "train_score_min",
+    "train_score_p10",
+    "train_score_p20",
+    "train_score_p30",
+    "train_score_p40",
+    "train_score_p50",
+    "train_score_p60",
+    "train_score_p70",
+    "train_score_p80",
+    "train_score_p90",
+    "train_score_max",
+    "test_episode_count",
+]
+
+PREFERRED_ORDER = [
+    "never_trigger",
+    "combined_logistic",
+    "combined_logistic_rate_10",
+    "combined_logistic_rate_20",
+    "combined_logistic_rate_30",
+    "combined_logistic_rate_40",
+    "combined_logistic_rate_50",
+    "combined_logistic_rate_60",
+    "rule_trigger",
+    "always_trigger",
+    "oracle",
 ]
 
 
@@ -234,6 +290,285 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str]) -> Non
         writer.writerows(rows)
 
 
+def _detector_label(detector: str) -> str:
+    if detector == "never_trigger":
+        return "Never Trigger"
+    if detector == "always_trigger":
+        return "Always Trigger"
+    if detector == "oracle":
+        return "Oracle"
+    if detector == "rule_trigger":
+        return "Rule Trigger"
+    if detector == "combined_logistic":
+        return "Combined Logistic"
+    prefix = "combined_logistic_rate_"
+    if detector.startswith(prefix):
+        return f"Logistic @{detector[len(prefix):]}%"
+    if detector == "max_risk_score":
+        return "Max Risk Score"
+    return detector
+
+
+def _target_trigger_rate(detector: str) -> float | None:
+    prefix = "combined_logistic_rate_"
+    if detector.startswith(prefix):
+        try:
+            return int(detector[len(prefix) :]) / 100.0
+        except Exception:
+            return None
+    if detector == "never_trigger":
+        return 0.0
+    if detector == "always_trigger":
+        return 1.0
+    return None
+
+
+def _is_logistic_rate_detector(detector: str) -> bool:
+    return detector.startswith("combined_logistic_rate_")
+
+
+def _actual_trigger(row: dict[str, Any]) -> float | None:
+    value = _num(row.get("overall_trigger_rate"))
+    return value if value is not None else _num(row.get("Trigger Rate"))
+
+
+def _bfcl_acc(row: dict[str, Any]) -> float | None:
+    return _num(row.get("BFCL Acc"))
+
+
+def _preferred_index(detector: str) -> int:
+    try:
+        return PREFERRED_ORDER.index(detector)
+    except ValueError:
+        return len(PREFERRED_ORDER)
+
+
+def _pareto_rows(summary_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    pareto_source: list[dict[str, Any]] = []
+    for row in summary_rows:
+        detector = str(row.get("Detector") or "")
+        acc = _bfcl_acc(row)
+        trigger = _actual_trigger(row)
+        total = int(row.get("total_examples") or 0)
+        correct = int(row.get("total_correct") or 0)
+        pareto_source.append(
+            {
+                "detector": detector,
+                "label": _detector_label(detector),
+                "target_trigger_rate": _target_trigger_rate(detector),
+                "actual_trigger_rate": trigger,
+                "bfcl_accuracy": acc,
+                "bfcl_fold_std": _num(row.get("BFCL Fold Std")),
+                "correct": correct,
+                "total": total,
+            }
+        )
+
+    for point in pareto_source:
+        acc = point["bfcl_accuracy"]
+        trigger = point["actual_trigger_rate"]
+        dominated = False
+        if acc is not None and trigger is not None:
+            for other in pareto_source:
+                if other is point:
+                    continue
+                other_acc = other["bfcl_accuracy"]
+                other_trigger = other["actual_trigger_rate"]
+                if other_acc is None or other_trigger is None:
+                    continue
+                if other_trigger < trigger and other_acc >= acc:
+                    dominated = True
+                    break
+        point["pareto"] = not dominated
+
+    rows = []
+    for point in sorted(
+        pareto_source,
+        key=lambda item: (_preferred_index(item["detector"]), item["detector"]),
+    ):
+        rows.append(
+            {
+                "Detector / Operating Point": point["label"],
+                "Target Trigger Rate": point["target_trigger_rate"],
+                "Actual Trigger Rate": point["actual_trigger_rate"],
+                "BFCL Accuracy": point["bfcl_accuracy"],
+                "BFCL Fold Std": point["bfcl_fold_std"],
+                "Correct / 52": (
+                    f"{point['correct']}/{point['total']}" if point["total"] else ""
+                ),
+                "Pareto Frontier": point["pareto"],
+            }
+        )
+
+    oracle = next(
+        (point for point in pareto_source if point["detector"] == "oracle"),
+        None,
+    )
+    oracle_acc = oracle["bfcl_accuracy"] if oracle else None
+
+    def best_for(frac: float) -> dict[str, Any] | None:
+        if oracle_acc is None:
+            return None
+        target = oracle_acc * frac
+        candidates = [
+            point
+            for point in pareto_source
+            if point["bfcl_accuracy"] is not None
+            and point["actual_trigger_rate"] is not None
+            and point["bfcl_accuracy"] >= target
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda item: (
+                item["actual_trigger_rate"],
+                -item["bfcl_accuracy"],
+                _preferred_index(item["detector"]),
+            ),
+        )
+
+    frontier = [
+        point
+        for point in sorted(
+            pareto_source,
+            key=lambda item: (
+                float("inf")
+                if item["actual_trigger_rate"] is None
+                else item["actual_trigger_rate"],
+                -1.0 if item["bfcl_accuracy"] is None else -item["bfcl_accuracy"],
+            ),
+        )
+        if point["pareto"]
+    ]
+    payload = {
+        "oracle_acc": oracle_acc,
+        "oracle_70pct_target": oracle_acc * 0.70 if oracle_acc is not None else None,
+        "oracle_95pct_target": oracle_acc * 0.95 if oracle_acc is not None else None,
+        "best_70pct_oracle_point": best_for(0.70),
+        "best_95pct_oracle_point": best_for(0.95),
+        "pareto_frontier": frontier,
+    }
+    return rows, payload
+
+
+def _bfcl_trigger_summary_rows(
+    summary_rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    rows = []
+    for row in sorted(
+        summary_rows,
+        key=lambda item: (
+            _preferred_index(str(item.get("Detector") or "")),
+            str(item.get("Detector") or ""),
+        ),
+    ):
+        total = int(row.get("total_examples") or 0)
+        correct = int(row.get("total_correct") or 0)
+        rows.append(
+            {
+                "Detector": _detector_label(str(row.get("Detector") or "")),
+                "BFCL Acc": row.get("BFCL Acc"),
+                "Trigger Rate": _actual_trigger(row),
+                "BFCL Fold Std": row.get("BFCL Fold Std"),
+                "Correct / 52": f"{correct}/{total}" if total else "",
+            }
+        )
+    return rows
+
+
+def _sanity_checks(summary_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_detector = {str(row.get("Detector")): row for row in summary_rows}
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, passed: bool, detail: str = "") -> None:
+        checks.append({"name": name, "passed": bool(passed), "detail": detail})
+
+    never = by_detector.get("never_trigger")
+    if never is not None:
+        trigger = _actual_trigger(never)
+        add(
+            "never_trigger_rate_zero",
+            trigger is not None and abs(trigger) < 1e-9,
+            f"actual_trigger_rate={trigger}",
+        )
+
+    always = by_detector.get("always_trigger")
+    if always is not None:
+        trigger = _actual_trigger(always)
+        add(
+            "always_trigger_rate_one",
+            trigger is not None and abs(trigger - 1.0) < 1e-9,
+            f"actual_trigger_rate={trigger}",
+        )
+
+    oracle = by_detector.get("oracle")
+    if oracle is not None:
+        precision = _num(oracle.get("overall_precision"))
+        recall = _num(oracle.get("overall_recall"))
+        fpr = _num(oracle.get("overall_fpr"))
+        add(
+            "oracle_precision_one",
+            precision is not None and abs(precision - 1.0) < 1e-9,
+            f"overall_precision={precision}",
+        )
+        add(
+            "oracle_recall_one",
+            recall is not None and abs(recall - 1.0) < 1e-9,
+            f"overall_recall={recall}",
+        )
+        add(
+            "oracle_fpr_zero",
+            fpr is not None and abs(fpr) < 1e-9,
+            f"overall_fpr={fpr}",
+        )
+
+    failed = [check for check in checks if not check["passed"]]
+    return {
+        "checks": checks,
+        "passed": not failed,
+        "failed": failed,
+    }
+
+
+def _logistic_diagnostic_row(
+    *,
+    detector: str,
+    fold: int,
+    detail_row: dict[str, Any],
+    thresholds: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not _is_logistic_rate_detector(detector):
+        return None
+    return {
+        "detector": detector,
+        "fold": fold,
+        "target_trigger_rate": thresholds.get("target_trigger_rate")
+        if thresholds.get("target_trigger_rate") is not None
+        else _target_trigger_rate(detector),
+        "threshold": thresholds.get(detector) or detail_row.get("threshold"),
+        "train_actual_trigger_rate": thresholds.get(
+            "train_trigger_rate_at_threshold"
+        ),
+        "train_reference_drift_rate": thresholds.get("train_reference_drift_rate"),
+        "online_actual_trigger_rate": detail_row.get("trigger_rate"),
+        "train_score_count": thresholds.get("train_score_count"),
+        "train_score_num_unique": thresholds.get("train_score_num_unique"),
+        "train_score_min": thresholds.get("train_score_min"),
+        "train_score_p10": thresholds.get("train_score_p10"),
+        "train_score_p20": thresholds.get("train_score_p20"),
+        "train_score_p30": thresholds.get("train_score_p30"),
+        "train_score_p40": thresholds.get("train_score_p40"),
+        "train_score_p50": thresholds.get("train_score_p50"),
+        "train_score_p60": thresholds.get("train_score_p60"),
+        "train_score_p70": thresholds.get("train_score_p70"),
+        "train_score_p80": thresholds.get("train_score_p80"),
+        "train_score_p90": thresholds.get("train_score_p90"),
+        "train_score_max": thresholds.get("train_score_max"),
+        "test_episode_count": detail_row.get("test_episode_count"),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", required=True)
@@ -244,11 +579,17 @@ def main() -> None:
     run_root = Path(args.run_root)
     detectors = [item.strip() for item in args.detectors.split(",") if item.strip()]
     detail_rows: list[dict[str, Any]] = []
+    logistic_diagnostics: list[dict[str, Any]] = []
     for detector in detectors:
         for fold in range(args.folds):
             fold_root = run_root / f"detector_{detector}" / f"fold_{fold}"
             row = _summarize_fold(fold_root, detector, fold)
-            cv_dir = run_root / "detector_cv" / f"fold_{fold}"
+            detector_cv_dir = run_root / "detector_cv" / detector / f"fold_{fold}"
+            cv_dir = (
+                detector_cv_dir
+                if detector_cv_dir.exists()
+                else run_root / "detector_cv" / f"fold_{fold}"
+            )
             thresholds = _read_json(cv_dir / "thresholds.json")
             row["train_episode_count"] = len(thresholds.get("train_episode_ids") or [])
             row["calibration_episode_count"] = len(
@@ -256,6 +597,14 @@ def main() -> None:
             )
             row["test_episode_count"] = len(thresholds.get("test_episode_ids") or [])
             detail_rows.append(row)
+            diagnostic = _logistic_diagnostic_row(
+                detector=detector,
+                fold=fold,
+                detail_row=row,
+                thresholds=thresholds,
+            )
+            if diagnostic is not None:
+                logistic_diagnostics.append(diagnostic)
 
     summary_rows = [
         _aggregate(detector, [row for row in detail_rows if row["detector"] == detector])
@@ -267,6 +616,18 @@ def main() -> None:
             row["Detector"],
         )
     )
+    pareto_rows, pareto_payload = _pareto_rows(summary_rows)
+    bfcl_trigger_rows = _bfcl_trigger_summary_rows(summary_rows)
+    sanity = _sanity_checks(summary_rows)
+    if not sanity["passed"]:
+        (run_root / "detector_online_5fold_sanity.json").write_text(
+            json.dumps(sanity, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        raise RuntimeError(
+            "detector online 5-fold sanity checks failed: "
+            + json.dumps(sanity["failed"], ensure_ascii=False)
+        )
     _write_csv(
         run_root / "detector_online_5fold_details.csv",
         detail_rows,
@@ -277,11 +638,37 @@ def main() -> None:
         summary_rows,
         SUMMARY_FIELDS,
     )
+    _write_csv(
+        run_root / "detector_trigger_bfcl_pareto.csv",
+        pareto_rows,
+        PARETO_FIELDS,
+    )
+    _write_csv(
+        run_root / "detector_bfcl_trigger_summary.csv",
+        bfcl_trigger_rows,
+        BFCL_TRIGGER_SUMMARY_FIELDS,
+    )
+    _write_csv(
+        run_root / "detector_logistic_trigger_diagnostics.csv",
+        logistic_diagnostics,
+        LOGISTIC_DIAGNOSTIC_FIELDS,
+    )
     (run_root / "detector_online_5fold_summary.json").write_text(
         json.dumps(summary_rows, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    (run_root / "detector_trigger_bfcl_pareto.json").write_text(
+        json.dumps(pareto_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (run_root / "detector_online_5fold_sanity.json").write_text(
+        json.dumps(sanity, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     print(run_root / "detector_online_5fold_summary.csv")
+    print(run_root / "detector_trigger_bfcl_pareto.csv")
+    print(run_root / "detector_bfcl_trigger_summary.csv")
+    print(run_root / "detector_logistic_trigger_diagnostics.csv")
 
 
 if __name__ == "__main__":

@@ -11,12 +11,6 @@ from typing import Any
 
 SCALAR_DETECTORS = [
     "max_risk_score",
-    "rule_detector_max_risk",
-    "max_observation_anomaly",
-    "mean_risk_score",
-    "max_hard_error",
-    "max_generation_nll",
-    "mean_generation_nll",
 ]
 
 
@@ -153,6 +147,10 @@ def main() -> None:
         fold_dir.mkdir(parents=True, exist_ok=True)
         (fold_dir / "test_ids.txt").write_text(
             "\n".join(test_ids) + ("\n" if test_ids else ""),
+            encoding="utf-8",
+        )
+        (fold_dir / "outer_train_ids.txt").write_text(
+            "\n".join(pool_ids) + ("\n" if pool_ids else ""),
             encoding="utf-8",
         )
         (fold_dir / "train_ids.txt").write_text(
