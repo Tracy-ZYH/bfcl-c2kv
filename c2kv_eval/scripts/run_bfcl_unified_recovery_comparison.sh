@@ -29,7 +29,7 @@ C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION:-0.06}"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-4096}"
 REPAIR_EXTRACT_SOURCE="${REPAIR_EXTRACT_SOURCE:-auto}"
 
-METHODS="${METHODS:-full,c2kv,rollback_d1,rollback_d2,rollback_d4,replace_w1,replace_w2,replace_w4,replace_all,append_w2,recompute_w2,hint_only,sham_mech}"
+METHODS="${METHODS:-full,c2kv,rollback_d1,rollback_d2,rollback_d4,replace_w1,replace_w2,replace_w4,replace_all,recompute_w2,append_w2,append_w2_hint,hint_only,append_masked_w2,sham_mech}"
 
 IFS=',' read -r -a DEVICE_LIST <<< "${DEVICES}"
 IFS=',' read -r -a PORT_LIST <<< "${PORTS}"
@@ -98,6 +98,8 @@ repair_arm_for_method() {
     sham_mech) echo "d_sham_mech" ;;
     hint_only) echo "hint_only" ;;
     append_w2) echo "d_corr_w2" ;;
+    append_w2_hint) echo "d_corr_w2_hint" ;;
+    append_masked_w2) echo "append_masked_w2" ;;
     replace_w1) echo "d_corr_replace_w1" ;;
     replace_w2) echo "d_corr_replace_w2" ;;
     replace_w4) echo "d_corr_replace_w4" ;;

@@ -21,9 +21,11 @@ DEFAULT_METHODS = (
     ("Replace W2", "replace_w2"),
     ("Replace W4", "replace_w4"),
     ("Replace All", "replace_all"),
-    ("Append W2", "append_w2"),
     ("Recompute W2", "recompute_w2"),
+    ("Append W2", "append_w2"),
+    ("Append W2 + Hint", "append_w2_hint"),
     ("Hint Only", "hint_only"),
+    ("Append-Masked W2", "append_masked_w2"),
     ("Sham Mech", "sham_mech"),
 )
 
@@ -186,6 +188,15 @@ QUICK_CSV_FIELDS = [
     "Peak C2KV Pool MiB",
     "Memory Report Coverage",
     "Peak Host Checkpoint KV MiB",
+]
+
+MINIMAL_CSV_FIELDS = [
+    "Method",
+    "BFCL Acc",
+    "Reference Recovery Success",
+    "Step Exec Drift",
+    "Step State Drift",
+    "Model Calls / Committed Step",
 ]
 
 
@@ -712,6 +723,8 @@ def _write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
     md_path = run_root / "unified_recovery_comparison.md"
     quick_csv_path = run_root / "quick_recovery_comparison.csv"
     quick_md_path = run_root / "quick_recovery_comparison.md"
+    minimal_csv_path = run_root / "unified_recovery_minimal.csv"
+    minimal_md_path = run_root / "unified_recovery_minimal.md"
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
@@ -765,6 +778,28 @@ def _write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
         for row in rows:
             writer.writerow(quick_row(row))
 
+    def minimal_row(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "Method": row.get("method"),
+            "BFCL Acc": row.get("bfcl_accuracy"),
+            "Reference Recovery Success": row.get(
+                "reference_recovery_success_rate"
+            ),
+            "Step Exec Drift": row.get("step_executed_action_drift_rate"),
+            "Step State Drift": row.get("step_state_drift_rate"),
+            "Model Calls / Committed Step": row.get(
+                "model_calls_per_committed_step"
+            ),
+        }
+
+    with open(minimal_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=MINIMAL_CSV_FIELDS, extrasaction="ignore"
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(minimal_row(row))
+
     md_cols = [
         "method",
         "bfcl_accuracy",
@@ -815,6 +850,23 @@ def _write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
                 vals.append(str(value))
         quick_lines.append("| " + " | ".join(vals) + " |")
     quick_md_path.write_text("\n".join(quick_lines) + "\n", encoding="utf-8")
+
+    minimal_lines = ["# Unified Recovery Minimal Summary", ""]
+    minimal_lines.append("| " + " | ".join(MINIMAL_CSV_FIELDS) + " |")
+    minimal_lines.append("| " + " | ".join(["---"] * len(MINIMAL_CSV_FIELDS)) + " |")
+    for row in rows:
+        item = minimal_row(row)
+        vals = []
+        for col in MINIMAL_CSV_FIELDS:
+            value = item.get(col)
+            if isinstance(value, float):
+                vals.append(f"{value:.4f}")
+            elif value is None:
+                vals.append("-")
+            else:
+                vals.append(str(value))
+        minimal_lines.append("| " + " | ".join(vals) + " |")
+    minimal_md_path.write_text("\n".join(minimal_lines) + "\n", encoding="utf-8")
 
 
 def _repair_transition_diagnosis(run_root: Path, dirname: str) -> dict[str, Any]:
@@ -913,6 +965,56 @@ def _write_append_w2_diagnosis(run_root: Path) -> None:
     )
 
 
+def _assert_append_masked_matches_replace(run_root: Path) -> None:
+    replace_path = run_root / "replace_w2" / "logs" / "details.jsonl"
+    masked_path = run_root / "append_masked_w2" / "logs" / "details.jsonl"
+    if not replace_path.exists() or not masked_path.exists():
+        return
+    replace_rows = {
+        str(row.get("id")): row
+        for row in _load_jsonl(replace_path)
+        if row.get("id") is not None
+    }
+    masked_rows = {
+        str(row.get("id")): row
+        for row in _load_jsonl(masked_path)
+        if row.get("id") is not None
+    }
+    mismatches: list[dict[str, Any]] = []
+    for sample_id in sorted(set(replace_rows) | set(masked_rows)):
+        replace = replace_rows.get(sample_id)
+        masked = masked_rows.get(sample_id)
+        if replace is None or masked is None:
+            mismatches.append(
+                {
+                    "id": sample_id,
+                    "reason": "missing_sample",
+                    "replace_present": replace is not None,
+                    "append_masked_present": masked is not None,
+                }
+            )
+            continue
+        if replace.get("result") != masked.get("result"):
+            mismatches.append(
+                {
+                    "id": sample_id,
+                    "reason": "result_mismatch",
+                    "replace_result": replace.get("result"),
+                    "append_masked_result": masked.get("result"),
+                }
+            )
+    if mismatches:
+        mismatch_path = run_root / "append_masked_w2_mismatches.json"
+        mismatch_path.write_text(
+            json.dumps(mismatches, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        raise RuntimeError(
+            "Append-Masked W2 must match Replace W2 episode results exactly; "
+            f"found {len(mismatches)} mismatches. See {mismatch_path}"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", required=True)
@@ -941,6 +1043,7 @@ def main() -> None:
             rows.append({"method": label, "run_dir": dirname, "schema_version": 2})
             continue
         rows.append(summarize_method(run_root, label, dirname, args.category))
+    _assert_append_masked_matches_replace(run_root)
     _write_outputs(run_root, rows)
     _write_append_w2_diagnosis(run_root)
     print(json.dumps({"run_root": str(run_root), "rows": len(rows)}, ensure_ascii=False))

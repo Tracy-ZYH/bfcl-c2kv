@@ -853,15 +853,23 @@ class HistoryDriftRunner:
                     execution_results=execution_results,
                     history_execution_results=history_execution_results,
                     roundtrip=roundtrip,
-                    extra=(
-                        {
+                    extra={
+                        key: value
+                        for key, value in {
                             "repair_build_info": deepcopy(
                                 getattr(self, "_last_repair_build_info", {})
                             )
-                        }
-                        if getattr(self, "_last_repair_build_info", None)
-                        else None
-                    ),
+                            if getattr(self, "_last_repair_build_info", None)
+                            else None,
+                            "history_kv_decision": deepcopy(
+                                getattr(self, "_last_history_kv_decision", {})
+                            )
+                            if getattr(self, "_last_history_kv_decision", None)
+                            else None,
+                        }.items()
+                        if value is not None
+                    }
+                    or None,
                 )
                 if usage.get("kv_memory_report") is not None:
                     step_record["kv_memory_report"] = usage.get("kv_memory_report")
