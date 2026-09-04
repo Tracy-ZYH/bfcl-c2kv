@@ -6,6 +6,7 @@ import math
 import os
 import time
 import traceback
+import uuid
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from c2kv_eval.adapters.bfcl_history_drift import (
     DriftStats,
     ExtractRecord,
     HistoryDriftRunner,
+    HTTP,
     _history_units,
     _json_dumps,
     _latest_user_query_index,
@@ -52,6 +54,7 @@ RUNTIME_EVICTION_METHODS = {
 }
 
 UNSUPPORTED_RUNTIME_METHODS: set[str] = set()
+ATTENTION_SCORE_PHYSICAL_METHODS = {"h2o", "snapkv", "snapkv_persistent", "pyramidkv"}
 
 
 class RuntimeEvictionUnsupported(RuntimeError):
@@ -113,32 +116,37 @@ class HistoryKVCompressor:
         history_messages: Sequence[dict[str, Any]],
         stats: DriftStats,
     ) -> tuple[list[dict[str, Any]], HistoryKVDecision]:
+        self.runner._last_runtime_history_kv_extract = None
+        self.runner._last_physical_history_kv_eviction = None
         latest_query_index = _latest_user_query_index(history_messages)
         completed = list(history_messages[:latest_query_index])
         current = deepcopy(list(history_messages[latest_query_index:]))
         units = _history_units(completed)
         raw_tokens_by_unit = [_token_count(self.runner.tokenizer, unit) for unit in units]
-        raw_history_tokens = sum(raw_tokens_by_unit)
+        unit_raw_history_tokens = sum(raw_tokens_by_unit)
+        canonical_history_tokens = self._canonical_history_token_count(completed)
 
         if self.method == "full":
-            stats.original_history_tokens += raw_history_tokens
-            stats.effective_history_tokens += raw_history_tokens
-            stats.canonical_full_history_tokens += raw_history_tokens
-            stats.physical_history_kv_tokens += raw_history_tokens
+            stats.original_history_tokens += canonical_history_tokens
+            stats.effective_history_tokens += canonical_history_tokens
+            stats.canonical_full_history_tokens += canonical_history_tokens
+            stats.physical_history_kv_tokens += canonical_history_tokens
             return deepcopy(list(history_messages)), HistoryKVDecision(
                 method=self.method,
-                raw_history_tokens=raw_history_tokens,
-                active_history_kv_tokens=raw_history_tokens,
+                raw_history_tokens=canonical_history_tokens,
+                active_history_kv_tokens=canonical_history_tokens,
                 retained_units=list(range(len(units))),
                 dropped_units=[],
             )
 
         if self.method == "c2kv":
             messages, active_tokens = self._build_c2kv_units(units, stats)
+            stats.original_history_tokens += canonical_history_tokens
+            stats.canonical_full_history_tokens += canonical_history_tokens
             messages.extend(current)
             return messages, HistoryKVDecision(
                 method=self.method,
-                raw_history_tokens=raw_history_tokens,
+                raw_history_tokens=canonical_history_tokens,
                 active_history_kv_tokens=active_tokens,
                 retained_units=list(range(len(units))),
                 dropped_units=[],
@@ -151,12 +159,54 @@ class HistoryKVCompressor:
             "snapkv_persistent",
             "pyramidkv",
         }:
+            if self.runner.runtime_history_kv_backend == "physical_eviction":
+                # Retention=1 is a correctness identity test. Do not route it
+                # through the multi-round eviction scheduler: even a no-op
+                # round changes request bookkeeping and cannot prove that the
+                # compressor preserves the ordinary Full serving path.
+                target_tokens = self._budget(canonical_history_tokens)
+                if target_tokens >= canonical_history_tokens:
+                    stats.original_history_tokens += canonical_history_tokens
+                    stats.canonical_full_history_tokens += canonical_history_tokens
+                    stats.effective_history_tokens += canonical_history_tokens
+                    stats.physical_history_kv_tokens += canonical_history_tokens
+                    return deepcopy(list(history_messages)), HistoryKVDecision(
+                        method=self.method,
+                        raw_history_tokens=canonical_history_tokens,
+                        active_history_kv_tokens=canonical_history_tokens,
+                        retained_units=list(range(len(units))),
+                        dropped_units=[],
+                        runtime_eviction_required=False,
+                        runtime_eviction_available=True,
+                        notes=[
+                            "retention=1 identity path: ordinary Full serving; "
+                            "no physical eviction requested"
+                        ],
+                    )
+                messages, active_tokens = self._build_physical_eviction_history_kv(
+                    completed, current, canonical_history_tokens, stats
+                )
+                return messages, HistoryKVDecision(
+                    method=self.method,
+                    raw_history_tokens=canonical_history_tokens,
+                    active_history_kv_tokens=active_tokens,
+                    retained_units=[],
+                    dropped_units=[],
+                    runtime_eviction_required=True,
+                    runtime_eviction_available=True,
+                    notes=[
+                        "physical history-KV baseline: SGLang full-prefills "
+                        "completed history, physically compacts surviving KV "
+                        "slots at the history/current boundary, and frees "
+                        "dropped slots before current-query prefill"
+                    ],
+                )
             messages, active_tokens = self._build_runtime_history_kv(
-                completed, current, raw_history_tokens, stats
+                completed, current, canonical_history_tokens, stats
             )
             return messages, HistoryKVDecision(
                 method=self.method,
-                raw_history_tokens=raw_history_tokens,
+                raw_history_tokens=canonical_history_tokens,
                 active_history_kv_tokens=active_tokens,
                 retained_units=[],
                 dropped_units=[],
@@ -175,7 +225,7 @@ class HistoryKVCompressor:
             )
             return messages, HistoryKVDecision(
                 method=self.method,
-                raw_history_tokens=raw_history_tokens,
+                raw_history_tokens=unit_raw_history_tokens,
                 active_history_kv_tokens=active_tokens,
                 retained_units=retained,
                 dropped_units=dropped,
@@ -207,8 +257,6 @@ class HistoryKVCompressor:
             text = _render_history_unit(unit)
             full_tokens = _token_count(self.runner.tokenizer, [{"role": "user", "content": text}])
             record = self.runner._extract_history_unit(text, stats)
-            stats.original_history_tokens += int(record.original_seq_len or full_tokens)
-            stats.canonical_full_history_tokens += int(record.original_seq_len or full_tokens)
             if record.success and record.key_hash:
                 gist_len = int(record.gist_len or record.original_seq_len or full_tokens)
                 stats.effective_history_tokens += gist_len
@@ -291,6 +339,39 @@ class HistoryKVCompressor:
         if encoded and isinstance(encoded[0], Mapping) and "input_ids" in encoded[0]:
             encoded = encoded[0]["input_ids"]
         return [int(x) for x in encoded]
+
+    def _canonical_history_token_count(
+        self,
+        completed: Sequence[dict[str, Any]],
+    ) -> int:
+        if not completed:
+            return 0
+        tools = getattr(self.runner, "_active_tools", [])
+        full_ids = self._chat_template_ids(completed, tools=tools)
+        history_ids = self._chat_template_ids(completed, tools=None)
+        span_start = self._find_subsequence(full_ids, history_ids)
+        if span_start < 0:
+            raise RuntimeError(
+                "Cannot isolate completed-history token span inside the "
+                "tools+history prompt. Refusing to mix history-token accounting "
+                "with tool/system prompt tokens."
+            )
+        return len(history_ids)
+
+    def _history_span_in_full_prompt(
+        self,
+        completed: Sequence[dict[str, Any]],
+    ) -> tuple[list[int], int, int]:
+        tools = getattr(self.runner, "_active_tools", [])
+        full_ids = self._chat_template_ids(completed, tools=tools)
+        history_ids = self._chat_template_ids(completed, tools=None)
+        span_start = self._find_subsequence(full_ids, history_ids)
+        if span_start < 0:
+            raise RuntimeError(
+                "Cannot isolate completed-history token span inside the "
+                "tools+history prompt. Refusing physical history KV eviction."
+            )
+        return full_ids, span_start, span_start + len(history_ids)
 
     def _chat_template_ids(
         self,
@@ -408,6 +489,47 @@ class HistoryKVCompressor:
         }
         return [carrier, *deepcopy(list(current))], selected
 
+    def _build_physical_eviction_history_kv(
+        self,
+        completed: Sequence[dict[str, Any]],
+        current: Sequence[dict[str, Any]],
+        canonical_history_tokens: int,
+        stats: DriftStats,
+    ) -> tuple[list[dict[str, Any]], int]:
+        if not completed or canonical_history_tokens <= 0:
+            return deepcopy(list(current)), 0
+        method = "snapkv_persistent" if self.method == "snapkv" else self.method
+        target_tokens = self._budget(canonical_history_tokens)
+
+        stats.original_history_tokens += canonical_history_tokens
+        stats.canonical_full_history_tokens += canonical_history_tokens
+        stats.effective_history_tokens += target_tokens
+        stats.physical_history_kv_tokens += target_tokens
+        self.runner._last_runtime_history_kv_extract = {
+            "history_kv_method": method,
+            "extract_source": "physical_eviction",
+            "history_span_tokens": canonical_history_tokens,
+            "target_tokens": target_tokens,
+        }
+        self.runner._last_physical_history_kv_eviction = {
+            "method": method,
+            # Token offsets must be resolved by SGLang after its own OpenAI
+            # chat-template rendering. The local tokenizer's output is useful
+            # for accounting but is not a safe coordinate system for a server
+            # request (tool-template variants may differ).
+            "history_message_count": len(completed),
+            "target_tokens": target_tokens,
+            "retention_ratio": self.runner.history_kv_retention_ratio,
+            "history_kv_recent_window": self.runner.history_kv_recent_window,
+            "history_kv_kernel_size": self.runner.history_kv_kernel_size,
+            "history_kv_pooling": self.runner.history_kv_pooling,
+            "history_kv_h2o_recent_fraction": self.runner.history_kv_h2o_recent_fraction,
+            "persistent_session": bool(
+                self.runner.persistent_history_kv_session
+            ),
+        }
+        return deepcopy(list(completed)) + deepcopy(list(current)), target_tokens
+
 
 class HistoryKVBaselineRunner(HistoryDriftRunner):
     def __init__(self, args: argparse.Namespace) -> None:
@@ -423,13 +545,67 @@ class HistoryKVBaselineRunner(HistoryDriftRunner):
         self.history_kv_kernel_size = args.history_kv_kernel_size
         self.history_kv_pooling = args.history_kv_pooling
         self.history_kv_h2o_recent_fraction = args.history_kv_h2o_recent_fraction
+        self.runtime_history_kv_backend = args.runtime_history_kv_backend
+        self.persistent_history_kv_session = bool(
+            args.persistent_history_kv_session
+        )
         self._history_kv_compressor = HistoryKVCompressor(self)
         self._active_tools: list[dict[str, Any]] = []
         self._last_runtime_history_kv_extract: dict[str, Any] | None = None
+        self._last_physical_history_kv_eviction: dict[str, Any] | None = None
+        self._persistent_history_session_id: str | None = None
+
+    def _persistent_session_enabled(self) -> bool:
+        return bool(
+            self.persistent_history_kv_session
+            and self.runtime_history_kv_backend == "physical_eviction"
+            and self.history_kv_method in RUNTIME_EVICTION_METHODS
+        )
+
+    def _open_persistent_history_session(self, sample_id: str) -> None:
+        session_id = f"bfcl-history-{sample_id}-{uuid.uuid4().hex}"
+        response = HTTP.post(
+            f"{self.base_url.rstrip('/')}/open_session",
+            json={
+                "capacity_of_str_len": 0,
+                "session_id": session_id,
+                "streaming": True,
+                "timeout": float(self.timeout),
+            },
+            timeout=self.timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                "PERSISTENT_HISTORY_SESSION_OPEN_FAILED: " + response.text[:1000]
+            )
+        returned = response.json()
+        if returned != session_id:
+            raise RuntimeError(
+                "PERSISTENT_HISTORY_SESSION_OPEN_INVALID_RESPONSE: "
+                f"expected={session_id!r}, got={returned!r}"
+            )
+        self._persistent_history_session_id = session_id
+
+    def _close_persistent_history_session(self) -> None:
+        session_id = self._persistent_history_session_id
+        self._persistent_history_session_id = None
+        if not session_id:
+            return
+        response = HTTP.post(
+            f"{self.base_url.rstrip('/')}/close_session",
+            json={"session_id": session_id},
+            timeout=self.timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                "PERSISTENT_HISTORY_SESSION_CLOSE_FAILED: " + response.text[:1000]
+            )
 
     def run_sample(self, test_case: dict[str, Any]) -> dict[str, Any]:
         stats = DriftStats(test_case["id"], self.mode, self.ratio)
         self._active_tools = _tool_payload(test_case["function"])
+        if self._persistent_session_enabled():
+            self._open_persistent_history_session(test_case["id"])
         try:
             result, metadata = self._run_sample_impl(test_case, stats)
         except Exception as exc:
@@ -439,6 +615,7 @@ class HistoryKVBaselineRunner(HistoryDriftRunner):
             metadata = {"traceback": traceback.format_exc()}
             stats.errors.append(str(exc))
         finally:
+            self._close_persistent_history_session()
             self._active_tools = []
         metadata["c2kv_drift_metrics"] = stats.as_dict()
         return {"id": test_case["id"], "result": result, **metadata}
@@ -453,6 +630,7 @@ class HistoryKVBaselineRunner(HistoryDriftRunner):
     ) -> list[dict[str, Any]]:
         messages, decision = self._history_kv_compressor.build(history_messages, stats)
         self._last_history_kv_decision = decision.as_dict()
+        physical_eviction = getattr(self, "_last_physical_history_kv_eviction", None)
         self._last_kv_memory_hint = {
             "full_equivalent_history_tokens": decision.raw_history_tokens,
             "active_history_kv_tokens": decision.active_history_kv_tokens,
@@ -467,6 +645,12 @@ class HistoryKVBaselineRunner(HistoryDriftRunner):
             "history_kv_method": self.history_kv_method,
             "estimated": True,
         }
+        if isinstance(physical_eviction, dict):
+            self._last_kv_memory_hint["history_kv_eviction"] = deepcopy(physical_eviction)
+        if self._persistent_history_session_id:
+            self._last_kv_memory_hint["persistent_history_session"] = {
+                "enabled": True,
+            }
         runtime_extract = getattr(self, "_last_runtime_history_kv_extract", None)
         if isinstance(runtime_extract, dict):
             self._last_history_kv_decision["runtime_extract"] = deepcopy(runtime_extract)
@@ -536,6 +720,7 @@ def run(args: argparse.Namespace) -> None:
         "allow_client_fallback": args.allow_client_fallback,
         "history_kv_retention_ratio": args.history_kv_retention_ratio,
         "history_kv_target_compression": args.history_kv_target_compression,
+        "runtime_history_kv_backend": args.runtime_history_kv_backend,
         "errors": sum(
             1
             for row in details_rows
@@ -561,6 +746,11 @@ def run(args: argparse.Namespace) -> None:
         if summary["physical_history_kv_tokens"]
         else None
     )
+    summary["estimated_weighted_history_kv_retention_ratio"] = (
+        summary["physical_history_kv_tokens"] / summary["canonical_full_history_tokens"]
+        if summary["canonical_full_history_tokens"]
+        else None
+    )
     Path(args.summary_path).parent.mkdir(parents=True, exist_ok=True)
     Path(args.summary_path).write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
@@ -577,7 +767,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--history-kv-kernel-size", type=int, default=5)
     parser.add_argument("--history-kv-pooling", default="avgpool")
     parser.add_argument("--history-kv-h2o-recent-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--runtime-history-kv-backend",
+        choices=["repair_extract", "physical_eviction"],
+        default="repair_extract",
+    )
     parser.add_argument("--strict-runtime-eviction", action="store_true")
+    parser.add_argument("--persistent-history-kv-session", action="store_true")
     parser.add_argument("--allow-client-fallback", action="store_true")
     parser.add_argument("--category", default="multi_turn_base")
     parser.add_argument("--max-examples", type=int, default=200)

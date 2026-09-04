@@ -29,8 +29,11 @@ CSV_FIELDS = [
     "Candidate Action Drift",
     "Executed Action Drift",
     "State Drift",
+    "Avg Full History KV",
     "Avg Active History KV",
+    "Estimated Weighted History-KV Retention",
     "Estimated Weighted History-KV Compression",
+    "Measured Weighted History-KV Retention",
     "Measured Weighted History-KV Compression",
     "Memory Report Coverage",
     "Model Calls / Committed Step",
@@ -132,6 +135,8 @@ def _turn_joint(details: list[dict[str, Any]]) -> float | None:
 def _compression(steps: list[dict[str, Any]]) -> dict[str, Any]:
     estimated_pairs: list[tuple[float, float]] = []
     measured_pairs: list[tuple[float, float]] = []
+    measured_reported_steps = 0
+    history_bearing_reported_steps = 0
     for step in steps:
         decision = step.get("history_kv_decision")
         if isinstance(decision, dict):
@@ -143,22 +148,119 @@ def _compression(steps: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(report, dict):
             full = _num(report.get("full_equivalent_history_tokens"))
             active = _num(report.get("active_history_kv_tokens"))
-            if full is not None and active is not None and active > 0:
+            # C2KV's legacy report is explicitly a client-side estimate. It
+            # must never be promoted into the measured/runtime column.
+            measured = report.get("estimated") is False
+            # A zero-history decision is a valid runtime report, but it does
+            # not contribute to a history-KV compression ratio (0 / 0).
+            if full is not None and full > 0:
+                history_bearing_reported_steps += 1
+            # A no-history step needs no history layout measurement. Count it
+            # toward coverage so physical runs are not penalized before their
+            # first completed history unit exists.
+            if measured or not full:
+                measured_reported_steps += 1
+            if (
+                measured
+                and full is not None
+                and active is not None
+                and full > 0
+                and active > 0
+            ):
                 measured_pairs.append((full, active))
     def weighted(pairs: list[tuple[float, float]]) -> float | None:
         full = sum(a for a, _ in pairs)
         active = sum(b for _, b in pairs)
         return _rate(full, active)
+    def retention(pairs: list[tuple[float, float]]) -> float | None:
+        full = sum(a for a, _ in pairs)
+        active = sum(b for _, b in pairs)
+        return _rate(active, full)
     return {
+        "avg_full": (
+            sum(full for full, _ in estimated_pairs) / len(estimated_pairs)
+            if estimated_pairs
+            else None
+        ),
         "avg_active": (
             sum(active for _, active in estimated_pairs) / len(estimated_pairs)
             if estimated_pairs
             else None
         ),
+        "estimated_retention": retention(estimated_pairs),
         "estimated_weighted": weighted(estimated_pairs),
+        "measured_retention": retention(measured_pairs),
         "measured_weighted": weighted(measured_pairs),
-        "coverage": _rate(len(measured_pairs), len(steps)),
+        # Coverage measures actual runtime layout, not transport of a
+        # client-side estimate. Zero-history steps are valid by construction.
+        "coverage": _rate(measured_reported_steps, len(steps)),
+        "history_bearing_coverage": _rate(
+            len(measured_pairs), history_bearing_reported_steps
+        ),
     }
+
+
+def _identity_signature(row: dict[str, Any]) -> dict[str, Any]:
+    """Return the deterministic closed-loop surface for identity sanity runs."""
+    return {
+        "result": row.get("result"),
+        "steps": [
+            {
+                "candidate_raw_text": step.get("candidate_raw_text"),
+                "candidate_action": step.get("candidate_action"),
+                "executed_action": step.get("executed_action"),
+                "state": step.get("state"),
+            }
+            for step in row.get("drift_steps") or []
+            if isinstance(step, dict)
+        ],
+    }
+
+
+def assert_identity_against_full(run_root: Path, methods: list[str]) -> None:
+    """Fail fast when retention=1 diverges from ordinary Full serving."""
+    full_rows = {
+        str(row.get("id")): _identity_signature(row)
+        for row in _load_jsonl(run_root / "full" / "logs" / "details.jsonl")
+        if row.get("id") is not None
+    }
+    if not full_rows:
+        raise RuntimeError("identity assertion requires full/logs/details.jsonl")
+
+    failures: list[str] = []
+    for method in methods:
+        if method == "full":
+            continue
+        rows = _load_jsonl(run_root / method / "logs" / "details.jsonl")
+        seen = {str(row.get("id")) for row in rows if row.get("id") is not None}
+        missing = sorted(set(full_rows) - seen)
+        extra = sorted(seen - set(full_rows))
+        if missing or extra:
+            failures.append(
+                f"{method}: episode set mismatch missing={missing} extra={extra}"
+            )
+        for row in rows:
+            sample_id = str(row.get("id"))
+            expected = full_rows.get(sample_id)
+            if expected is None:
+                continue
+            if _identity_signature(row) != expected:
+                failures.append(f"{method}: retention=1 differs from Full for {sample_id}")
+    if failures:
+        raise RuntimeError("History-KV identity failure:\n" + "\n".join(failures))
+
+
+def _summary_estimated_ratios(summary: dict[str, Any]) -> tuple[float | None, float | None]:
+    retention = _num(summary.get("estimated_weighted_history_kv_retention_ratio"))
+    compression = _num(summary.get("estimated_weighted_history_kv_compression"))
+    if retention is None and compression is not None and 0 < compression < 1:
+        # Compatibility with early runs that wrote active/full under a
+        # compression-ratio field name.
+        retention = compression
+        compression = 1.0 / retention
+    if compression is None and retention is not None and retention > 0:
+        compression = 1.0 / retention
+    return retention, compression
 
 
 def summarize_method(run_root: Path, method: str) -> dict[str, Any]:
@@ -176,15 +278,27 @@ def summarize_method(run_root: Path, method: str) -> dict[str, Any]:
     chat_calls = sum(int(row.get("chat_calls") or 0) for row in metrics)
     prefill = sum(int(row.get("chat_recomputed_prompt_tokens") or 0) for row in metrics)
     comp = _compression(steps)
-    status = "ok"
+    summary_full = _num(summary.get("canonical_full_history_tokens"))
+    summary_active = _num(summary.get("physical_history_kv_tokens"))
+    summary_steps = _num(summary.get("chat_calls")) or len(steps)
+    summary_avg_full = _rate(summary_full, summary_steps)
+    summary_avg_active = _rate(summary_active, summary_steps)
+    summary_weighted = _rate(summary_full, summary_active)
+    summary_retention = _rate(summary_active, summary_full)
+    named_summary_retention, named_summary_compression = _summary_estimated_ratios(summary)
+    runtime_statuses = {
+        str(step.get("kv_memory_report", {}).get("history_kv_runtime_status"))
+        for step in steps
+        if isinstance(step.get("kv_memory_report"), dict)
+        and step["kv_memory_report"].get("history_kv_runtime_status")
+    }
+    status = ",".join(sorted(runtime_statuses)) if runtime_statuses else "ok"
+    if comp["coverage"] is not None and comp["coverage"] < 1.0:
+        status = f"{status},memory_report_incomplete"
     if not root.exists():
         status = "missing"
     elif int(summary.get("errors") or 0):
         status = "errors"
-    elif method in {"h2o", "snapkv", "snapkv_persistent", "pyramidkv"} and not summary.get(
-        "allow_client_fallback"
-    ):
-        status = "runtime_eviction_unimplemented"
     return {
         "Method": METHOD_LABELS.get(method, method),
         "BFCL Accuracy": acc,
@@ -198,9 +312,16 @@ def summarize_method(run_root: Path, method: str) -> dict[str, Any]:
             steps, "executed_action_drift", "executed_action_matches_reference"
         ),
         "State Drift": _step_rate(steps, "state_drift", "state_matches_reference"),
-        "Avg Active History KV": comp["avg_active"],
-        "Estimated Weighted History-KV Compression": comp["estimated_weighted"]
+        "Avg Full History KV": summary_avg_full or comp["avg_full"],
+        "Avg Active History KV": summary_avg_active or comp["avg_active"],
+        "Estimated Weighted History-KV Retention": summary_retention
+        or named_summary_retention
+        or comp["estimated_retention"],
+        "Estimated Weighted History-KV Compression": summary_weighted
+        or named_summary_compression
+        or comp["estimated_weighted"]
         or summary.get("estimated_weighted_history_kv_compression"),
+        "Measured Weighted History-KV Retention": comp["measured_retention"],
         "Measured Weighted History-KV Compression": comp["measured_weighted"],
         "Memory Report Coverage": comp["coverage"],
         "Model Calls / Committed Step": _rate(chat_calls, len(steps)),
@@ -240,9 +361,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", required=True)
     parser.add_argument("--methods", default="full,c2kv,streamingllm,h2o,snapkv_persistent,pyramidkv")
+    parser.add_argument(
+        "--assert-identity-against-full",
+        action="store_true",
+        help="Require each non-Full method to match Full episode-by-episode.",
+    )
     args = parser.parse_args()
     run_root = Path(args.run_root)
-    rows = [summarize_method(run_root, method) for method in args.methods.split(",") if method]
+    methods = [method for method in args.methods.split(",") if method]
+    if args.assert_identity_against_full:
+        assert_identity_against_full(run_root, methods)
+    rows = [summarize_method(run_root, method) for method in methods]
     write_outputs(run_root, rows)
     print(json.dumps({"run_root": str(run_root), "rows": len(rows)}, ensure_ascii=False))
 
