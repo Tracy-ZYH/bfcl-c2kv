@@ -17,6 +17,7 @@ METHOD_LABELS = {
     "snapkv": "SnapKV-Persistent",
     "snapkv_refresh": "SnapKV-Refresh",
     "pyramidkv": "PyramidKV",
+    "kivi": "KIVI-QDQ",
 }
 
 
@@ -33,11 +34,15 @@ CSV_FIELDS = [
     "Avg Active History KV",
     "Estimated Weighted History-KV Retention",
     "Estimated Weighted History-KV Compression",
-    "Measured Weighted History-KV Retention",
-    "Measured Weighted History-KV Compression",
+    "Measured Attention-Visible History-KV Retention",
+    "Measured Attention-Visible History-KV Compression",
+    "Estimated History-KV Byte Compression",
+    "Resident KV Storage / Committed Step",
     "Memory Report Coverage",
     "Model Calls / Committed Step",
-    "Prefill Tokens / Committed Step",
+    "Generation Prefill Tokens / Committed Step",
+    "Maintenance Prefill Tokens / Committed Step",
+    "Total Prefill Tokens / Committed Step",
     "Runtime Status",
 ]
 
@@ -200,6 +205,39 @@ def _compression(steps: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _byte_compression(steps: list[dict[str, Any]]) -> float | None:
+    weighted_num = 0.0
+    weighted_den = 0.0
+    for step in steps:
+        decision = step.get("history_kv_decision")
+        if not isinstance(decision, dict):
+            continue
+        full = _num(decision.get("history_raw_tokens"))
+        runtime = decision.get("runtime_extract")
+        if not isinstance(runtime, dict) or not full or full <= 0:
+            continue
+        byte_retention = _num(runtime.get("estimated_history_kv_byte_retention"))
+        if byte_retention is None or byte_retention <= 0:
+            continue
+        weighted_num += full
+        weighted_den += full * byte_retention
+    return _rate(weighted_num, weighted_den)
+
+
+def _resident_storage_per_step(steps: list[dict[str, Any]]) -> float | None:
+    values = []
+    for step in steps:
+        report = step.get("kv_memory_report")
+        if not isinstance(report, dict):
+            continue
+        repair = _num(report.get("active_raw_repair_tokens"))
+        recomputed = _num(report.get("active_recomputed_raw_tokens"))
+        if repair is None and recomputed is None:
+            continue
+        values.append((repair or 0.0) + (recomputed or 0.0))
+    return statistics.mean(values) if values else None
+
+
 def _identity_signature(row: dict[str, Any]) -> dict[str, Any]:
     """Return the deterministic closed-loop surface for identity sanity runs."""
     return {
@@ -276,7 +314,14 @@ def summarize_method(run_root: Path, method: str) -> dict[str, Any]:
         if isinstance(row.get("c2kv_drift_metrics"), dict)
     ]
     chat_calls = sum(int(row.get("chat_calls") or 0) for row in metrics)
-    prefill = sum(int(row.get("chat_recomputed_prompt_tokens") or 0) for row in metrics)
+    generation_prefill = sum(
+        int(row.get("chat_recomputed_prompt_tokens") or 0) for row in metrics
+    )
+    maintenance_prefill = sum(
+        int(row.get("c2kv_extract_recomputed_tokens") or 0)
+        + int(row.get("repair_extract_recomputed_tokens") or 0)
+        for row in metrics
+    )
     comp = _compression(steps)
     summary_full = _num(summary.get("canonical_full_history_tokens"))
     summary_active = _num(summary.get("physical_history_kv_tokens"))
@@ -321,11 +366,17 @@ def summarize_method(run_root: Path, method: str) -> dict[str, Any]:
         or named_summary_compression
         or comp["estimated_weighted"]
         or summary.get("estimated_weighted_history_kv_compression"),
-        "Measured Weighted History-KV Retention": comp["measured_retention"],
-        "Measured Weighted History-KV Compression": comp["measured_weighted"],
+        "Measured Attention-Visible History-KV Retention": comp["measured_retention"],
+        "Measured Attention-Visible History-KV Compression": comp["measured_weighted"],
+        "Estimated History-KV Byte Compression": _byte_compression(steps),
+        "Resident KV Storage / Committed Step": _resident_storage_per_step(steps),
         "Memory Report Coverage": comp["coverage"],
         "Model Calls / Committed Step": _rate(chat_calls, len(steps)),
-        "Prefill Tokens / Committed Step": _rate(prefill, len(steps)),
+        "Generation Prefill Tokens / Committed Step": _rate(generation_prefill, len(steps)),
+        "Maintenance Prefill Tokens / Committed Step": _rate(maintenance_prefill, len(steps)),
+        "Total Prefill Tokens / Committed Step": _rate(
+            generation_prefill + maintenance_prefill, len(steps)
+        ),
         "Runtime Status": status,
     }
 
@@ -360,7 +411,7 @@ def write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", required=True)
-    parser.add_argument("--methods", default="full,c2kv,streamingllm,h2o,snapkv_persistent,pyramidkv")
+    parser.add_argument("--methods", default="full,c2kv,streamingllm,h2o,snapkv_persistent,pyramidkv,kivi")
     parser.add_argument(
         "--assert-identity-against-full",
         action="store_true",

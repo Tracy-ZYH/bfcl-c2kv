@@ -26,7 +26,7 @@ SHARE_PLAN_MODULE="${SHARE_PLAN_MODULE:-/home/zhuyuhan/project/c2kv/share/d-kv-r
 
 DEVICES="${DEVICES:-4,5,6}"
 PORTS="${PORTS:-34200,34201,34202}"
-ARMS="${ARMS:-full,c2kv,d_sham_mech,hint_only,d_corr_w1,d_corr_w2,d_corr_w4,d_corr_w2_hint,d_corr_w2_oracle_location_hint,d_corr_replace_w2,d_corr_recompute_w2,d_corr_all,raw_all_replace}"
+ARMS="${ARMS:-full,c2kv,d_sham_mech,hint_only,d_corr_w1,d_corr_w2,d_corr_w4,d_corr_w2_hint,d_corr_w2_oracle_location_hint,d_corr_replace_w2,cacheblend_w2,d_corr_recompute_w2,d_corr_all,raw_all_replace}"
 CLEAN_OUTPUT="${CLEAN_OUTPUT:-1}"
 C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION:-0.06}"
 REPAIR_WINDOW="${REPAIR_WINDOW:-1}"

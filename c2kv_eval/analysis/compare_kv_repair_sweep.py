@@ -21,6 +21,7 @@ ARMS = (
     "d_corr_w2_hint",
     "d_corr_w2_oracle_location_hint",
     "d_corr_replace_w2",
+    "cacheblend_w2",
     "d_corr_recompute",
     "d_corr_recompute_w2",
     "d_corr_all",

@@ -43,6 +43,7 @@ HISTORY_KV_METHODS = {
     "snapkv_persistent",
     "snapkv_refresh",
     "pyramidkv",
+    "kivi",
 }
 
 RUNTIME_EVICTION_METHODS = {
@@ -158,6 +159,7 @@ class HistoryKVCompressor:
             "snapkv",
             "snapkv_persistent",
             "pyramidkv",
+            "kivi",
         }:
             if self.runner.runtime_history_kv_backend == "physical_eviction":
                 # Retention=1 is a correctness identity test. Do not route it
@@ -429,6 +431,8 @@ class HistoryKVCompressor:
         if span_tokens <= 0:
             return deepcopy(list(current)), 0
         target_tokens = self._budget(span_tokens)
+        if method == "kivi":
+            target_tokens = span_tokens
         repair_mode = f"history_kv_{method}"
         payload = {
             "input_ids": full_ids,
@@ -487,6 +491,26 @@ class HistoryKVCompressor:
             "key_hash": result["key_hash"],
             "extract_seconds": elapsed,
         }
+        if method == "kivi":
+            residual = min(span_tokens, self.runner.kivi_residual_length)
+            quantized = max(0, span_tokens - residual)
+            bit_retention = (
+                (quantized * self.runner.kivi_bits + residual * 16)
+                / float(span_tokens * 16)
+                if span_tokens
+                else None
+            )
+            self.runner._last_runtime_history_kv_extract.update(
+                {
+                    "kivi_bits": self.runner.kivi_bits,
+                    "kivi_group_size": self.runner.kivi_group_size,
+                    "kivi_residual_length": self.runner.kivi_residual_length,
+                    "estimated_history_kv_byte_retention": bit_retention,
+                    "estimated_history_kv_byte_compression": (
+                        1.0 / bit_retention if bit_retention else None
+                    ),
+                }
+            )
         return [carrier, *deepcopy(list(current))], selected
 
     def _build_physical_eviction_history_kv(
@@ -545,6 +569,10 @@ class HistoryKVBaselineRunner(HistoryDriftRunner):
         self.history_kv_kernel_size = args.history_kv_kernel_size
         self.history_kv_pooling = args.history_kv_pooling
         self.history_kv_h2o_recent_fraction = args.history_kv_h2o_recent_fraction
+        self.history_kv_pyramid_budget_scale = args.history_kv_pyramid_budget_scale
+        self.kivi_bits = args.kivi_bits
+        self.kivi_group_size = args.kivi_group_size
+        self.kivi_residual_length = args.kivi_residual_length
         self.runtime_history_kv_backend = args.runtime_history_kv_backend
         if self.runtime_history_kv_backend != "repair_extract":
             raise RuntimeEvictionUnsupported(
@@ -659,9 +687,14 @@ class HistoryKVBaselineRunner(HistoryDriftRunner):
         runtime_extract = getattr(self, "_last_runtime_history_kv_extract", None)
         if isinstance(runtime_extract, dict):
             self._last_history_kv_decision["runtime_extract"] = deepcopy(runtime_extract)
-            self._last_kv_memory_hint["active_raw_repair_tokens"] = (
-                decision.active_history_kv_tokens
-            )
+            # The SGLang injection path adds the actual attention-visible
+            # repair tokens into kv_memory_report.  Pre-filling active tokens
+            # here double-counts runtime reinjection as both a client estimate
+            # and a server-observed active KV entry.
+            self._last_kv_memory_hint["active_history_kv_tokens"] = 0
+            self._last_kv_memory_hint["active_full_raw_tokens"] = 0
+            self._last_kv_memory_hint["active_c2kv_gist_tokens"] = 0
+            self._last_kv_memory_hint["active_raw_repair_tokens"] = 0
             self._last_kv_memory_hint["estimated"] = False
         return messages
 
@@ -725,6 +758,10 @@ def run(args: argparse.Namespace) -> None:
         "allow_client_fallback": args.allow_client_fallback,
         "history_kv_retention_ratio": args.history_kv_retention_ratio,
         "history_kv_target_compression": args.history_kv_target_compression,
+        "history_kv_pyramid_budget_scale": args.history_kv_pyramid_budget_scale,
+        "kivi_bits": args.kivi_bits,
+        "kivi_group_size": args.kivi_group_size,
+        "kivi_residual_length": args.kivi_residual_length,
         "runtime_history_kv_backend": args.runtime_history_kv_backend,
         "errors": sum(
             1
@@ -772,6 +809,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--history-kv-kernel-size", type=int, default=5)
     parser.add_argument("--history-kv-pooling", default="avgpool")
     parser.add_argument("--history-kv-h2o-recent-fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--history-kv-pyramid-budget-scale",
+        type=float,
+        default=float(os.environ.get("PYRAMIDKV_BUDGET_SCALE", "0.66")),
+        help=(
+            "Internal PyramidKV per-layer budget scale used before union. "
+            "The default calibrates the union-based approximation to about "
+            "0.31-0.32 retained history tokens when the shared target is 0.312."
+        ),
+    )
+    parser.add_argument("--kivi-bits", type=int, default=2)
+    parser.add_argument("--kivi-group-size", type=int, default=32)
+    parser.add_argument("--kivi-residual-length", type=int, default=32)
     parser.add_argument(
         "--runtime-history-kv-backend",
         choices=["repair_extract", "physical_eviction"],

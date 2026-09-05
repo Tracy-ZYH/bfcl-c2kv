@@ -23,11 +23,15 @@ HISTORY_KV_RECENT_WINDOW="${HISTORY_KV_RECENT_WINDOW:-64}"
 HISTORY_KV_KERNEL_SIZE="${HISTORY_KV_KERNEL_SIZE:-5}"
 HISTORY_KV_POOLING="${HISTORY_KV_POOLING:-avgpool}"
 HISTORY_KV_H2O_RECENT_FRACTION="${HISTORY_KV_H2O_RECENT_FRACTION:-0.5}"
+PYRAMIDKV_BUDGET_SCALE="${PYRAMIDKV_BUDGET_SCALE:-0.66}"
+KIVI_BITS="${KIVI_BITS:-2}"
+KIVI_GROUP_SIZE="${KIVI_GROUP_SIZE:-32}"
+KIVI_RESIDUAL_LENGTH="${KIVI_RESIDUAL_LENGTH:-32}"
 RUNTIME_HISTORY_KV_BACKEND="${RUNTIME_HISTORY_KV_BACKEND:-repair_extract}"
 TEMPERATURE="${TEMPERATURE:-0}"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-4096}"
 
-METHODS="${METHODS:-full,c2kv,streamingllm,h2o,snapkv_persistent,pyramidkv}"
+METHODS="${METHODS:-full,c2kv,streamingllm,h2o,snapkv_persistent,pyramidkv,kivi}"
 DEVICES="${DEVICES:-4,5,6,7}"
 PORTS="${PORTS:-34740,34750,34760,34770}"
 RUN_ROOT="${RUN_ROOT:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_kv_baselines_stable52_$(date +%Y%m%d_%H%M%S)}"
@@ -153,6 +157,10 @@ manifest = {
     "history_kv_kernel_size": int("${HISTORY_KV_KERNEL_SIZE}"),
     "history_kv_pooling": "${HISTORY_KV_POOLING}",
     "history_kv_h2o_recent_fraction": float("${HISTORY_KV_H2O_RECENT_FRACTION}"),
+    "pyramidkv_budget_scale": float("${PYRAMIDKV_BUDGET_SCALE}"),
+    "kivi_bits": int("${KIVI_BITS}"),
+    "kivi_group_size": int("${KIVI_GROUP_SIZE}"),
+    "kivi_residual_length": int("${KIVI_RESIDUAL_LENGTH}"),
     "runtime_history_kv_backend": "${RUNTIME_HISTORY_KV_BACKEND}",
     "persistent_history_kv_session": "${PERSISTENT_HISTORY_KV_SESSION}" == "1",
     "page_size": "${PAGE_SIZE}",
@@ -183,6 +191,10 @@ start_server() {
     export no_proxy='*' NO_PROXY='*'
     export http_proxy='' https_proxy='' HTTP_PROXY='' HTTPS_PROXY=''
     export ASCEND_RT_VISIBLE_DEVICES="${device}"
+    export C2KV_PYRAMIDKV_BUDGET_SCALE="${PYRAMIDKV_BUDGET_SCALE}"
+    export C2KV_KIVI_BITS="${KIVI_BITS}"
+    export C2KV_KIVI_GROUP_SIZE="${KIVI_GROUP_SIZE}"
+    export C2KV_KIVI_RESIDUAL_LENGTH="${KIVI_RESIDUAL_LENGTH}"
     server_args=(
       "${SGLANG_PYTHON}" -m sglang.launch_server
       --model-path "${MODEL_PATH}"
@@ -249,6 +261,10 @@ run_method() {
       --history-kv-kernel-size "${HISTORY_KV_KERNEL_SIZE}"
       --history-kv-pooling "${HISTORY_KV_POOLING}"
       --history-kv-h2o-recent-fraction "${HISTORY_KV_H2O_RECENT_FRACTION}"
+      --history-kv-pyramid-budget-scale "${PYRAMIDKV_BUDGET_SCALE}"
+      --kivi-bits "${KIVI_BITS}"
+      --kivi-group-size "${KIVI_GROUP_SIZE}"
+      --kivi-residual-length "${KIVI_RESIDUAL_LENGTH}"
       --runtime-history-kv-backend "${RUNTIME_HISTORY_KV_BACKEND}"
       --category "${CATEGORY}"
       --max-examples "${MAX_EXAMPLES}"

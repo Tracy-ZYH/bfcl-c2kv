@@ -75,6 +75,7 @@ REPAIR_ARMS = {
     "d_corr_replace_w4",
     "d_corr_replace_all",
     "append_masked_w2",
+    "cacheblend_w2",
     "d_corr_recompute",
     "d_corr_recompute_w2",
     "d_corr_all",
@@ -1900,6 +1901,13 @@ class KVRepairRunner(HistoryDriftRunner):
                 "repair_kind": "raw",
                 "window": "2",
             })
+        elif effective_arm == "cacheblend_w2":
+            config.update({
+                "operation": "cacheblend",
+                "repair_kind": "raw",
+                "window": "2",
+                "cacheblend_downstream_fraction": 0.15,
+            })
         elif effective_arm == "d_corr_replace_w4":
             config.update({
                 "operation": "replace",
@@ -2177,6 +2185,8 @@ class KVRepairRunner(HistoryDriftRunner):
                 return False
             if config["operation"] == "append_masked" and index in target_set:
                 return False
+            if config["operation"] == "cacheblend" and index == anchor_index:
+                return False
             if config["operation"] == "recompute" and index >= anchor_index:
                 return False
             return True
@@ -2311,6 +2321,8 @@ class KVRepairRunner(HistoryDriftRunner):
             for index in target_indices:
                 build_repair_for_index(index)
         elif config["operation"] == "recompute":
+            build_repair_for_index(anchor_index)
+        elif config["operation"] == "cacheblend":
             build_repair_for_index(anchor_index)
 
         for index, (unit, text, ids) in enumerate(zip(units, texts, doc_ids)):
@@ -2460,6 +2472,90 @@ class KVRepairRunner(HistoryDriftRunner):
                 stats.repair_kv_tokens += repair_tokens
                 local_physical_history_tokens += repair_tokens
 
+        if config["operation"] == "cacheblend" and anchor_index + 1 < len(units):
+            downstream_start = starts[anchor_index + 1]
+            downstream_end = ends[-1]
+            downstream_len = max(0, downstream_end - downstream_start)
+            selective_len = int(math.ceil(
+                downstream_len
+                * float(config.get("cacheblend_downstream_fraction") or 0.15)
+            ))
+            selective_len = max(0, min(downstream_len, selective_len))
+            if selective_len > 0:
+                selective_end = downstream_start + selective_len
+                repair = self._extract_repair(
+                    input_ids=full_prompt_ids[:selective_end],
+                    span_start=downstream_start,
+                    span_end=selective_end,
+                    position_offset=0,
+                    repair_mode=effective_arm,
+                    source_doc_index=None,
+                    stats=stats,
+                    extract_source=self._repair_extract_source_for(effective_arm, "raw"),
+                )
+                token_len = int(repair["token_len"])
+                if token_len != selective_len:
+                    raise RuntimeError(
+                        "cacheblend selective recompute length mismatch: "
+                        f"requested={selective_len}, injected={token_len}"
+                    )
+                stats.effective_history_tokens += token_len
+                stats.physical_history_kv_tokens += token_len
+                stats.repair_kv_tokens += token_len
+                stats.recomputed_raw_tokens += token_len
+                local_physical_history_tokens += token_len
+                repair_tokens += token_len
+                append_repair_keys.append(repair["key_hash"])
+                repair_metadata.append(
+                    {
+                        "history_index": None,
+                        "roles": ["downstream_selective"],
+                        "raw_token_count": token_len,
+                        "native_position_start": downstream_start,
+                        "native_position_end": selective_end,
+                        "absolute_position_start": int(
+                            repair.get("position_start", downstream_start)
+                        ),
+                        "absolute_position_end": int(
+                            repair.get("position_end", selective_end)
+                        ),
+                        "cacheblend_downstream_fraction": float(
+                            config.get("cacheblend_downstream_fraction") or 0.15
+                        ),
+                    }
+                )
+                target_message = None
+                for message in reversed(messages):
+                    if message.get("c2kv_key_hash"):
+                        target_message = message
+                        break
+                if target_message is None:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "",
+                            "c2kv_repair_only_key_hashes": [repair["key_hash"]],
+                            "c2kv_use_gist_projection": True,
+                        }
+                    )
+                else:
+                    target_message.setdefault("c2kv_repair_key_hashes", []).append(
+                        repair["key_hash"]
+                    )
+                history_layout_debug.append(
+                    {
+                        "history_index": "downstream_selective",
+                        "mode": "cacheblend_recomputed_raw",
+                        "logical_token_range": [downstream_start, selective_end],
+                        "native_position_range": [downstream_start, selective_end],
+                        "absolute_rope_position_range": [downstream_start, selective_end],
+                        "raw_tokens": token_len,
+                        "cacheblend_downstream_fraction": float(
+                            config.get("cacheblend_downstream_fraction") or 0.15
+                        ),
+                    }
+                )
+
         if config["operation"] == "recompute" and anchor_index + 1 < len(units):
             recomputed_total = sum(doc_lens[anchor_index + 1 :])
             if recomputed_total <= 0:
@@ -2492,6 +2588,9 @@ class KVRepairRunner(HistoryDriftRunner):
             ),
             "repair_window": config["window"],
             "repair_operation": config["operation"],
+            "cacheblend_downstream_fraction": config.get(
+                "cacheblend_downstream_fraction"
+            ),
             "uses_oracle_error_location": bool(config["oracle_location_hint"]),
             "repair_target_indices": target_indices,
             "repair_target_roles": [
@@ -2550,6 +2649,7 @@ class KVRepairRunner(HistoryDriftRunner):
             "d_corr_replace_w4",
             "d_corr_replace_all",
             "append_masked_w2",
+            "cacheblend_w2",
             "d_corr_recompute",
             "d_corr_recompute_w2",
             "d_corr_all",
