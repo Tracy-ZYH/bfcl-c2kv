@@ -66,3 +66,12 @@ SnapKV baseline.
 Measured runtime compression and estimated client-side compression are kept in
 separate columns. Missing SGLang runtime reports are never silently used as
 measured compression.
+
+## Runtime backend
+
+The BFCL baseline comparison intentionally uses `repair_extract` followed by
+method-specific selection and reinjection. Persistent sessions and physical
+`req_to_token` compaction are not part of these baseline results. The SGLang
+physical-eviction implementation remains in the server tree for later work,
+but the baseline runner rejects `--runtime-history-kv-backend physical_eviction`
+so results cannot accidentally mix the two execution models.

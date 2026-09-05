@@ -546,6 +546,11 @@ class HistoryKVBaselineRunner(HistoryDriftRunner):
         self.history_kv_pooling = args.history_kv_pooling
         self.history_kv_h2o_recent_fraction = args.history_kv_h2o_recent_fraction
         self.runtime_history_kv_backend = args.runtime_history_kv_backend
+        if self.runtime_history_kv_backend != "repair_extract":
+            raise RuntimeEvictionUnsupported(
+                "physical history-KV eviction is disabled for the baseline "
+                "benchmark; use repair_extract selection and reinjection"
+            )
         self.persistent_history_kv_session = bool(
             args.persistent_history_kv_session
         )

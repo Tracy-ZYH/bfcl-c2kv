@@ -524,9 +524,6 @@ class HistoryDriftRunner:
         memory_hint = getattr(self, "_last_kv_memory_hint", None)
         if isinstance(memory_hint, dict):
             payload["c2kv_kv_memory_hint"] = memory_hint
-        persistent_session_id = getattr(self, "_persistent_history_session_id", None)
-        if persistent_session_id:
-            payload["session_params"] = {"id": persistent_session_id}
         start = time.perf_counter()
         data = _post_json(self.base_url, "/v1/chat/completions", payload, self.timeout)
         elapsed = time.perf_counter() - start

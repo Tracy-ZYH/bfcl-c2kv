@@ -41,6 +41,12 @@ ALLOW_CLIENT_FALLBACK="${ALLOW_CLIENT_FALLBACK:-0}"
 # Set explicitly to 0 only for the legacy per-request diagnostic path.
 PERSISTENT_HISTORY_KV_SESSION="${PERSISTENT_HISTORY_KV_SESSION:-}"
 
+if [ "${RUNTIME_HISTORY_KV_BACKEND}" != "repair_extract" ]; then
+  echo "Physical history-KV eviction is disabled; set RUNTIME_HISTORY_KV_BACKEND=repair_extract."
+  exit 1
+fi
+PERSISTENT_HISTORY_KV_SESSION=0
+
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.55}"
 C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION:-0.06}"
 PAGE_SIZE="${PAGE_SIZE:-}"
@@ -169,13 +175,14 @@ start_server() {
   log_info "server start device=${device} port=${port}"
   (
     cd "${SGLANG_ROOT}"
-    SGLANG_DEBUG_MEMORY_POOL=1 \
-    SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0 \
-    SGLANG_EMPTY_CACHE_INTERVAL=1 \
-    ASCEND_LAUNCH_BLOCKING=1 \
-    TASK_QUEUE_ENABLE=1 \
-    no_proxy='*' NO_PROXY='*' http_proxy='' https_proxy='' HTTP_PROXY='' HTTPS_PROXY='' \
-    ASCEND_RT_VISIBLE_DEVICES="${device}" \
+    export SGLANG_DEBUG_MEMORY_POOL=1
+    export SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
+    export SGLANG_EMPTY_CACHE_INTERVAL=1
+    export ASCEND_LAUNCH_BLOCKING=1
+    export TASK_QUEUE_ENABLE=1
+    export no_proxy='*' NO_PROXY='*'
+    export http_proxy='' https_proxy='' HTTP_PROXY='' HTTPS_PROXY=''
+    export ASCEND_RT_VISIBLE_DEVICES="${device}"
     server_args=(
       "${SGLANG_PYTHON}" -m sglang.launch_server
       --model-path "${MODEL_PATH}"
