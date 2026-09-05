@@ -1,0 +1,12 @@
+{
+  "mode": "full_reference",
+  "episodes": 200,
+  "turns": 734,
+  "avg_turns": 3.67,
+  "total_committed_steps": 1091,
+  "bfcl_task_accuracy": 0.26,
+  "correct_count": 52,
+  "task_error_rate": 0.4877384196185286,
+  "task_state_failure_rate": 0.4196185286103542,
+  "task_required_result_failure_rate": 0.3801089918256131
+}

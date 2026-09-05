@@ -17,6 +17,12 @@ RATIO="${RATIO:-4}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-4}"
 IDS_PATH="${IDS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_temp0_stability_20260819_172725/frozen_reference/correct_ids.txt}"
 REFERENCE_DETAILS_PATH="${REFERENCE_DETAILS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_temp0_stability_20260819_172725/frozen_reference/details.jsonl}"
+if [ "${IDS_PATH}" = "__NONE__" ]; then
+  IDS_PATH=""
+fi
+if [ "${REFERENCE_DETAILS_PATH}" = "__NONE__" ]; then
+  REFERENCE_DETAILS_PATH=""
+fi
 RUN_ROOT="${RUN_ROOT:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_kv_repair_stable52_$(date +%Y%m%d_%H%M%S)}"
 PLAN_PATH="${PLAN_PATH:-}"
 USE_REPAIR_PLAN="${USE_REPAIR_PLAN:-0}"
@@ -32,6 +38,8 @@ C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION:-0.06}"
 REPAIR_WINDOW="${REPAIR_WINDOW:-1}"
 REPAIR_TRIGGER="${REPAIR_TRIGGER:-oracle}"
 REPAIR_EXTRACT_SOURCE="${REPAIR_EXTRACT_SOURCE:-auto}"
+REPAIR_LOCATOR="${REPAIR_LOCATOR:-recent}"
+WITNESS_CORE_PATH="${WITNESS_CORE_PATH:-/home/zhuyuhan/project/c2kv/share/d-kv-repair/d_witness_core.py}"
 C2KV_APPEND_POSITION_FRAME="${C2KV_APPEND_POSITION_FRAME:-wrapper}"
 C2KV_DEBUG_POSITION_FRAME="${C2KV_DEBUG_POSITION_FRAME:-0}"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-4096}"
@@ -197,6 +205,8 @@ run_arm() {
       --ratio "${RATIO}" \
       --checkpoint-interval "${CHECKPOINT_INTERVAL}" \
       --repair-window "${REPAIR_WINDOW}" \
+      --repair-locator "${REPAIR_LOCATOR}" \
+      --witness-core-path "${WITNESS_CORE_PATH}" \
       --repair-extract-source "${REPAIR_EXTRACT_SOURCE}" \
       --c2kv-append-position-frame "${C2KV_APPEND_POSITION_FRAME}" \
       --repair-trigger "${REPAIR_TRIGGER}" \
@@ -323,6 +333,8 @@ log_info "MAX_COMPLETION_TOKENS=${MAX_COMPLETION_TOKENS}"
 log_info "FLUSH_CACHE_BETWEEN_ARMS=${FLUSH_CACHE_BETWEEN_ARMS}"
 log_info "IDS_PATH=${IDS_PATH}"
 log_info "PLAN_PATH=${PLAN_PATH}"
+log_info "REPAIR_LOCATOR=${REPAIR_LOCATOR}"
+log_info "WITNESS_CORE_PATH=${WITNESS_CORE_PATH}"
 
 source_env_file /usr/local/Ascend/cann-8.5.0/set_env.sh
 source_env_file /usr/local/Ascend/nnal/atb/set_env.sh

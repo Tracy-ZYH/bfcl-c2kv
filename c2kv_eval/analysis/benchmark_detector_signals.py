@@ -137,7 +137,7 @@ def _feature_row(row: dict[str, Any], rule_detector_threshold: float) -> dict[st
         rule_reason = reconstructed_reason
     features.update(
         {
-            "id": row.get("id"),
+            "id": row.get("id") or row.get("sample_id"),
             "checkpoint_id": row.get("checkpoint_id"),
             "turn": row.get("turn"),
             "segment_start_step": row.get("segment_start_step"),

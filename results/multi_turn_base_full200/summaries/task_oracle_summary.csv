@@ -1,0 +1,2 @@
+avg_turns,bfcl_task_accuracy,correct_count,episodes,mode,reference_drift_0_task_error_0,reference_drift_0_task_error_1,reference_drift_1_task_error_0,reference_drift_1_task_error_1,reference_drift_differs_from_task_error,task_error_rate,task_required_result_failure_rate,task_state_failure_rate,total_committed_steps,turn_count,turns
+3.67,0.26,52,200,full_reference,376,358,0,0,358,0.4877384196185286,0.3801089918256131,0.4196185286103542,1091,734,734

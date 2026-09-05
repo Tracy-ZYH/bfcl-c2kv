@@ -20,6 +20,9 @@ ARMS = (
     "d_corr_w4",
     "d_corr_w2_hint",
     "d_corr_w2_oracle_location_hint",
+    "d_corr_replace_w1",
+    "d_corr_replace_w1_first",
+    "d_corr_replace_w1_witness",
     "d_corr_replace_w2",
     "cacheblend_w2",
     "d_corr_recompute",
@@ -275,6 +278,15 @@ def summarize(run_root: Path, arms: list[str]) -> list[dict[str, Any]]:
             int(row.get("repair_changed_first_token_count") or 0)
             for row in metrics
         )
+        witness_attempt_count = sum(
+            int(row.get("witness_attempt_count") or 0) for row in metrics
+        )
+        witness_found_count = sum(
+            int(row.get("witness_found_count") or 0) for row in metrics
+        )
+        witness_equals_recent_count = sum(
+            int(row.get("witness_equals_recent_count") or 0) for row in metrics
+        )
         repair_success_start_correct_num = 0.0
         repair_success_start_correct_den = 0
         repair_success_start_drifted_num = 0.0
@@ -337,6 +349,19 @@ def summarize(run_root: Path, arms: list[str]) -> list[dict[str, Any]]:
             "repair_changed_first_token_rate": (
                 repair_changed_first_token_count / repaired_step_count
                 if repaired_step_count
+                else None
+            ),
+            "witness_attempt_count": witness_attempt_count,
+            "witness_found_count": witness_found_count,
+            "witness_coverage": (
+                witness_found_count / witness_attempt_count
+                if witness_attempt_count
+                else None
+            ),
+            "witness_equals_recent_count": witness_equals_recent_count,
+            "witness_equals_recent_rate": (
+                witness_equals_recent_count / witness_found_count
+                if witness_found_count
                 else None
             ),
             "repair_success_when_start_state_correct": (
@@ -497,6 +522,29 @@ def write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+    witness_fields = [
+        "method",
+        "bfcl_accuracy",
+        "repair_segment_success_rate",
+        "executed_action_drift_rate",
+        "state_drift_rate",
+        "detector_trigger_rate",
+        "model_calls_per_step",
+        "witness_coverage",
+        "witness_equals_recent_rate",
+    ]
+    witness_rows = []
+    for row in rows:
+        item = {key: row.get(key) for key in witness_fields}
+        steps = int(row.get("detail_step_rows") or 0)
+        chats = int(row.get("chat_calls") or 0)
+        item["model_calls_per_step"] = chats / steps if steps else None
+        witness_rows.append(item)
+    with open(run_root / "kv_repair_witness_summary.csv", "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=witness_fields)
+        writer.writeheader()
+        writer.writerows(witness_rows)
 
     md_path = run_root / "kv_repair_report.md"
     lines = [

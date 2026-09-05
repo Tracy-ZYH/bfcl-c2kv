@@ -1,0 +1,5 @@
+# BFCL History KV Baselines
+
+| Method | BFCL Accuracy | Correct | Total | Turn Joint | Candidate Action Drift | Executed Action Drift | State Drift | Avg Full History KV | Avg Active History KV | Estimated Weighted History-KV Retention | Estimated Weighted History-KV Compression | Measured Attention-Visible History-KV Retention | Measured Attention-Visible History-KV Compression | Estimated History-KV Byte Compression | Resident KV Storage / Committed Step | Memory Report Coverage | Model Calls / Committed Step | Generation Prefill Tokens / Committed Step | Maintenance Prefill Tokens / Committed Step | Total Prefill Tokens / Committed Step | Runtime Status |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Full | 0.2600 | 52 | 200 | 0.0436 | 0.5978 | 0.5978 | 0.0000 | 321.1518 | 321.1518 | 1.0000 | 1.0000 | - | - | - | 0.0000 | 0.3025 | 1.0000 | 122.6981 | 0.0000 | 122.6981 | ok,memory_report_incomplete |

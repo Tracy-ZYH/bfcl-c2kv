@@ -1,0 +1,31 @@
+{
+  "bfcl_git_commit": "aabda6c3639a1092d7bf86ba8d5f8dad1317cdf7",
+  "sglang_git_commit": "d42ce815f179719f59d0d983092114809d7bda56",
+  "c2kv_git_commit": "775a6a30901725bf4536466d77d053a1734cff5c",
+  "model_path": "/home/zhuyuhan/project/c2kv/checkpoints/qwen3-4b-agent-history-c2kv-toolcall-npu-v2/checkpoint-1088",
+  "tokenizer_path": "/home/zhuyuhan/project/c2kv/models/Qwen3-4B-Instruct-2507",
+  "ids_path": "",
+  "reference_details_path": "",
+  "category": "multi_turn_base",
+  "temperature": 0.0,
+  "c2kv_ratio": 4,
+  "history_kv_retention_ratio": 0.312,
+  "history_kv_target_compression": 0.0,
+  "history_kv_recent_window": 64,
+  "history_kv_kernel_size": 5,
+  "history_kv_pooling": "avgpool",
+  "history_kv_h2o_recent_fraction": 0.5,
+  "pyramidkv_budget_scale": 0.66,
+  "kivi_bits": 2,
+  "kivi_group_size": 32,
+  "kivi_residual_length": 32,
+  "runtime_history_kv_backend": "repair_extract",
+  "persistent_history_kv_session": false,
+  "page_size": "",
+  "disable_radix_cache": false,
+  "methods": [
+    "full"
+  ],
+  "strict_runtime_eviction": true,
+  "allow_client_fallback": false
+}

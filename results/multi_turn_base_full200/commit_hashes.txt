@@ -1,0 +1,3 @@
+bfcl_git_commit=aabda6c3639a1092d7bf86ba8d5f8dad1317cdf7
+sglang_git_commit=d42ce815f179719f59d0d983092114809d7bda56
+c2kv_git_commit=775a6a30901725bf4536466d77d053a1734cff5c

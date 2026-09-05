@@ -15,6 +15,12 @@ CATEGORY="${CATEGORY:-multi_turn_base}"
 MAX_EXAMPLES="${MAX_EXAMPLES:-52}"
 IDS_PATH="${IDS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_temp0_stability_20260819_172725/frozen_reference/correct_ids.txt}"
 REFERENCE_DETAILS_PATH="${REFERENCE_DETAILS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_temp0_stability_20260819_172725/frozen_reference/details.jsonl}"
+if [ "${IDS_PATH}" = "__NONE__" ]; then
+  IDS_PATH=""
+fi
+if [ "${REFERENCE_DETAILS_PATH}" = "__NONE__" ]; then
+  REFERENCE_DETAILS_PATH=""
+fi
 
 RATIO="${RATIO:-4}"
 HISTORY_KV_RETENTION_RATIO="${HISTORY_KV_RETENTION_RATIO:-0.312}"

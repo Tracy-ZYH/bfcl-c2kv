@@ -21,6 +21,12 @@ CLEAN_OUTPUT="${CLEAN_OUTPUT:-1}"
 
 IDS_PATH="${IDS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_temp0_stability_20260819_172725/frozen_reference/correct_ids.txt}"
 REFERENCE_DETAILS="${REFERENCE_DETAILS:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_temp0_stability_20260819_172725/frozen_reference/details.jsonl}"
+if [ "${IDS_PATH}" = "__NONE__" ]; then
+  IDS_PATH=""
+fi
+if [ "${REFERENCE_DETAILS}" = "__NONE__" ]; then
+  REFERENCE_DETAILS=""
+fi
 
 log_info() {
   echo "[$(date '+%F %T')] $*"

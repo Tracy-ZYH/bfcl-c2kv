@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import json
 import math
 import os
@@ -40,6 +41,7 @@ from c2kv_eval.adapters.bfcl_history_drift import (
     is_empty_execute_response,
 )
 from c2kv_eval.adapters.history_step_common import (
+    _first_tool_call,
     action_matches,
     build_step_record,
     decode_candidate,
@@ -71,6 +73,8 @@ REPAIR_ARMS = {
     "d_corr_w2_hint",
     "d_corr_w2_oracle_location_hint",
     "d_corr_replace_w1",
+    "d_corr_replace_w1_first",
+    "d_corr_replace_w1_witness",
     "d_corr_replace_w2",
     "d_corr_replace_w4",
     "d_corr_replace_all",
@@ -95,6 +99,7 @@ DETECTOR_ARMS = {
     "combined_logistic_rate_40",
     "combined_logistic_rate_50",
     "combined_logistic_rate_60",
+    "combined_logistic_v2",
     "max_risk_score",
     "rule_detector_max_risk",
     "max_observation_anomaly",
@@ -193,6 +198,11 @@ class KVRepairRunner(HistoryDriftRunner):
         self.detector_cv_output_dir = str(
             getattr(args, "detector_cv_output_dir", "") or ""
         )
+        self.logistic_v2_model = (
+            self._load_logistic_v2_model(getattr(args, "logistic_v2_model_json", ""))
+            if self.detector_arm == "combined_logistic_v2"
+            else None
+        )
         self.logistic_detector_model = (
             self._train_logistic_detector(
                 getattr(args, "logistic_detector_features_csv", ""),
@@ -215,6 +225,8 @@ class KVRepairRunner(HistoryDriftRunner):
             or self._logistic_trigger_rate is not None
             else None
         )
+        if self.detector_arm == "combined_logistic_v2":
+            self.collect_candidate_detector_signals = True
         self.checkpoint_interval = max(1, int(args.checkpoint_interval))
         self.require_plan = False
         self.plan = self._load_plan(args.plan_path)
@@ -223,6 +235,20 @@ class KVRepairRunner(HistoryDriftRunner):
         self._repair_enabled_for_current_step = True
         self._repair_target_history_index: int | None = None
         self._repair_window_arg = args.repair_window
+        self.repair_locator = str(getattr(args, "repair_locator", "recent") or "recent")
+        if self.arm.endswith("_first"):
+            self.repair_locator = "first"
+        elif self.arm.endswith("_witness"):
+            self.repair_locator = "witness"
+        self.witness_core_path = str(
+            getattr(
+                args,
+                "witness_core_path",
+                "/home/zhuyuhan/project/c2kv/share/d-kv-repair/d_witness_core.py",
+            )
+            or ""
+        )
+        self._witness_core: Any | None = None
         self.repair_extract_source = getattr(args, "repair_extract_source", "auto")
         self.c2kv_debug_position_frame = bool(
             getattr(args, "c2kv_debug_position_frame", False)
@@ -344,6 +370,20 @@ class KVRepairRunner(HistoryDriftRunner):
             return "serving_cache"
         return "model_prefill"
 
+    def _load_witness_core(self) -> Any:
+        if self._witness_core is not None:
+            return self._witness_core
+        path = Path(self.witness_core_path)
+        if not path.exists():
+            raise RuntimeError(f"Witness core file does not exist: {path}")
+        spec = importlib.util.spec_from_file_location("d_witness_core_frozen", path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Cannot import Witness core from {path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self._witness_core = module
+        return module
+
     def run_sample(self, test_case: dict[str, Any]) -> dict[str, Any]:
         self._active_tools = _tool_payload(test_case["function"])
         try:
@@ -393,6 +433,19 @@ class KVRepairRunner(HistoryDriftRunner):
         repaired_steps = sum(
             int(seg.get("segment_length") or 0) for seg in triggered
         )
+        witness_triggered = [
+            seg
+            for seg in triggered
+            if seg.get("repair_locator") == "witness"
+        ]
+        witness_found = [
+            seg for seg in witness_triggered if seg.get("witness_found") is True
+        ]
+        witness_equals_recent = [
+            seg
+            for seg in witness_found
+            if seg.get("witness_equals_recent") is True
+        ]
         return {
             "repair_segments": total,
             "oracle_harmful_segments": len(harmful),
@@ -461,6 +514,19 @@ class KVRepairRunner(HistoryDriftRunner):
             ),
             "false_negative_count": sum(
                 int(bool(seg.get("detector_fn"))) for seg in segments
+            ),
+            "witness_attempt_count": len(witness_triggered),
+            "witness_found_count": len(witness_found),
+            "witness_coverage": (
+                len(witness_found) / len(witness_triggered)
+                if witness_triggered
+                else None
+            ),
+            "witness_equals_recent_count": len(witness_equals_recent),
+            "witness_equals_recent_rate": (
+                len(witness_equals_recent) / len(witness_found)
+                if witness_found
+                else None
             ),
         }
 
@@ -1256,6 +1322,91 @@ class KVRepairRunner(HistoryDriftRunner):
             "detector_signal_threshold": threshold,
         }
 
+    @staticmethod
+    def _load_logistic_v2_model(path: str) -> dict[str, Any]:
+        if not path:
+            raise ValueError(
+                "detector_arm=combined_logistic_v2 requires "
+                "--logistic-v2-model-json"
+            )
+        with open(path, encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            raise ValueError(f"invalid combined_logistic_v2 model JSON: {path}")
+        required = {"feature_names", "means", "scales", "coef", "intercept"}
+        missing = sorted(required - set(payload))
+        if missing:
+            raise ValueError(
+                f"combined_logistic_v2 model JSON missing fields {missing}: {path}"
+            )
+        return payload
+
+    def _logistic_v2_detector(
+        self,
+        segment_infos: Sequence[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if self.logistic_v2_model is None:
+            raise RuntimeError("combined_logistic_v2 model is not initialized")
+        model = self.logistic_v2_model
+        row = self._segment_detector_feature_row(segment_infos)
+        feature_names = list(model["feature_names"])
+        means = model.get("means") or {}
+        scales = model.get("scales") or {}
+        coef = list(model.get("coef") or [])
+        if len(coef) != len(feature_names):
+            raise RuntimeError(
+                "combined_logistic_v2 coef/feature length mismatch: "
+                f"{len(coef)} != {len(feature_names)}"
+            )
+        unavailable: list[str] = []
+        z_values: list[float] = []
+        for name in feature_names:
+            value = self._detector_score_for_feature(name, row.get(name))
+            if value is None:
+                unavailable.append(name)
+                value = _as_float((model.get("impute_values") or {}).get(name))
+                if value is None:
+                    value = _as_float(means.get(name))
+                if value is None:
+                    value = 0.0
+            mean = float(means.get(name, 0.0))
+            scale = float(scales.get(name, 1.0)) or 1.0
+            z_values.append((float(value) - mean) / scale)
+        logit = float(model.get("intercept") or 0.0) + sum(
+            float(w) * value for w, value in zip(coef, z_values)
+        )
+        score = self._sigmoid(logit)
+        threshold = (
+            float(self.logistic_detector_threshold)
+            if self.logistic_detector_threshold >= 0.0
+            else float(model.get("threshold", 0.5))
+        )
+        triggered = score >= threshold
+        return {
+            "detector": "combined_logistic_v2",
+            "detector_trigger": triggered,
+            "detector_reason": (
+                "logistic_v2_score_threshold" if triggered else "logistic_v2_safe"
+            ),
+            "detector_threshold": threshold,
+            "threshold_selection_rule": model.get("threshold_selection_rule"),
+            "logistic_detector_score": score,
+            "logistic_detector_threshold": threshold,
+            "logistic_detector_feature_count": len(feature_names),
+            "logistic_detector_features": feature_names,
+            "logistic_detector_train_rows": model.get("train_rows"),
+            "detector_train_episode_ids": model.get("train_episode_ids") or [],
+            "detector_test_episode_ids": model.get("test_episode_ids") or [],
+            "logistic_detector_kfold": model.get("fold"),
+            "logistic_detector_feature_set": "combined_logistic_v2_causal",
+            "detector_evaluation_mode": "nested_episode_5fold_closed_loop",
+            "combined_logistic_v2_selected_C": model.get("selected_C"),
+            "combined_logistic_v2_selected_l1_ratio": model.get("selected_l1_ratio"),
+            "combined_logistic_v2_label_mode": model.get("label_mode"),
+            "combined_logistic_v2_label_fallback": model.get("label_fallback"),
+            "combined_logistic_v2_feature_unavailable": sorted(set(unavailable)),
+        }
+
     def _segment_detector(self, segment_infos: Sequence[dict[str, Any]]) -> dict[str, Any]:
         sample_id = None
         if segment_infos:
@@ -1272,6 +1423,8 @@ class KVRepairRunner(HistoryDriftRunner):
             return {"detector": "oracle", "detector_trigger": triggered}
         if self.detector_arm == "rule_trigger":
             return self._rule_detector(segment_infos)
+        if self.detector_arm == "combined_logistic_v2":
+            return self._logistic_v2_detector(segment_infos)
         if self.detector_arm in {
             "combined_logistic_best_f1",
             "combined_logistic_high_recall",
@@ -1399,6 +1552,117 @@ class KVRepairRunner(HistoryDriftRunner):
         completed = list(history_messages[:latest_query_index])
         units = _history_units(completed)
         return len(units) - 1 if units else None
+
+    def _select_repair_locator_target(
+        self,
+        *,
+        snapshot: dict[str, Any],
+        segment_infos: Sequence[dict[str, Any]],
+        harmful_step_indices: Sequence[int],
+    ) -> dict[str, Any]:
+        messages = snapshot.get("messages") or []
+        latest_query_index = _latest_user_query_index(messages)
+        completed = list(messages[:latest_query_index])
+        units = _history_units(completed)
+        num_units = len(units)
+        recent_index = (
+            int(snapshot["repair_target_history_index"])
+            if snapshot.get("repair_target_history_index") is not None
+            else num_units - 1
+        )
+        if num_units <= 0:
+            return {
+                "repair_locator": self.repair_locator,
+                "selected_history_index": None,
+                "recent_history_index": None,
+                "witness_k_star": None,
+                "witness_found": False,
+                "witness_fallback_reason": "no_history_units",
+                "witness_target_tool_name": None,
+                "witness_target_values": [],
+                "witness_df": {},
+                "witness_scores": [],
+                "num_history_units": 0,
+                "witness_equals_recent": None,
+            }
+        recent_index = min(max(0, recent_index), num_units - 1)
+        if self.repair_locator == "recent":
+            selected = recent_index
+            reason = None
+            witness_found = False
+            k_star = None
+            values: list[str] = []
+            df: dict[str, int] = {}
+            scores: list[float] = []
+            tool_name = None
+        elif self.repair_locator == "first":
+            selected = 0
+            reason = None
+            witness_found = False
+            k_star = None
+            values = []
+            df = {}
+            scores = []
+            tool_name = None
+        elif self.repair_locator == "witness":
+            selected = recent_index
+            reason = None
+            witness_found = False
+            k_star = None
+            values = []
+            df = {}
+            scores = []
+            tool_name = None
+            if not harmful_step_indices:
+                reason = "no_harmful_step"
+            else:
+                bad_idx = int(harmful_step_indices[0])
+                step_record = (
+                    segment_infos[bad_idx].get("step_record")
+                    if 0 <= bad_idx < len(segment_infos)
+                    else {}
+                ) or {}
+                if step_record.get("alignment_status") != "matched":
+                    reason = "synthetic_or_missing_reference"
+                reference_action = step_record.get("reference_action") or []
+                if reason is None:
+                    tool_name, arguments = _first_tool_call(reference_action)
+                    if not tool_name:
+                        reason = "empty_or_unparseable_reference_action"
+                    else:
+                        witness = self._load_witness_core()
+                        texts = [_render_history_unit(unit) for unit in units]
+                        values = list(witness.target_values(tool_name, arguments))
+                        if not values:
+                            reason = "empty_witness_values"
+                        else:
+                            df, scores = witness.witness_scores(texts, values)
+                            k_star = witness.select_k_star(texts, values)
+                            if k_star is None:
+                                reason = "no_literal_witness"
+                            else:
+                                selected = min(max(0, int(k_star)), num_units - 1)
+                                witness_found = True
+            if reason is None and not witness_found:
+                reason = "fallback_recent"
+        else:
+            raise RuntimeError(f"Unsupported repair locator: {self.repair_locator}")
+        return {
+            "repair_locator": self.repair_locator,
+            "selected_history_index": selected,
+            "recent_history_index": recent_index,
+            "witness_k_star": k_star,
+            "witness_found": witness_found,
+            "witness_fallback_reason": reason,
+            "witness_target_tool_name": tool_name,
+            "witness_target_values": values,
+            "witness_df": df,
+            "witness_scores": scores,
+            "num_history_units": num_units,
+            "witness_equals_recent": (
+                bool(k_star == recent_index) if k_star is not None else None
+            ),
+        }
 
     def _unit_token_ids(self, text: str) -> list[int]:
         rendered = self.tokenizer.apply_chat_template(
@@ -1883,7 +2147,11 @@ class KVRepairRunner(HistoryDriftRunner):
             config.update({"repair_kind": "raw", "window": "4"})
         elif effective_arm == "d_corr_all":
             config.update({"repair_kind": "raw", "window": "all"})
-        elif effective_arm == "d_corr_replace_w1":
+        elif effective_arm in {
+            "d_corr_replace_w1",
+            "d_corr_replace_w1_first",
+            "d_corr_replace_w1_witness",
+        }:
             config.update({
                 "operation": "replace",
                 "repair_kind": "raw",
@@ -2645,6 +2913,8 @@ class KVRepairRunner(HistoryDriftRunner):
             "d_corr_w2_hint",
             "d_corr_w2_oracle_location_hint",
             "d_corr_replace_w1",
+            "d_corr_replace_w1_first",
+            "d_corr_replace_w1_witness",
             "d_corr_replace_w2",
             "d_corr_replace_w4",
             "d_corr_replace_all",
@@ -3128,6 +3398,11 @@ class KVRepairRunner(HistoryDriftRunner):
                     harmful_reason = "state_drift"
                 else:
                     harmful_reason = "none"
+                locator_debug = self._select_repair_locator_target(
+                    snapshot=segment_checkpoint,
+                    segment_infos=segment_infos,
+                    harmful_step_indices=harmful_step_indices,
+                )
                 repair_segment = {
                     "sample_id": test_entry_id,
                     "turn": turn_idx,
@@ -3179,6 +3454,26 @@ class KVRepairRunner(HistoryDriftRunner):
                     "repair_mode": self.arm if repair_triggered else "c2kv",
                     "repair_target_history_index": segment_checkpoint.get(
                         "repair_target_history_index"
+                    ),
+                    "repair_locator": locator_debug.get("repair_locator"),
+                    "selected_history_index": locator_debug.get("selected_history_index"),
+                    "recent_history_index": locator_debug.get("recent_history_index"),
+                    "witness_k_star": locator_debug.get("witness_k_star"),
+                    "witness_found": locator_debug.get("witness_found"),
+                    "witness_fallback_reason": locator_debug.get(
+                        "witness_fallback_reason"
+                    ),
+                    "witness_target_tool_name": locator_debug.get(
+                        "witness_target_tool_name"
+                    ),
+                    "witness_target_values": locator_debug.get(
+                        "witness_target_values"
+                    ),
+                    "witness_df": locator_debug.get("witness_df"),
+                    "witness_scores": locator_debug.get("witness_scores"),
+                    "num_history_units": locator_debug.get("num_history_units"),
+                    "witness_equals_recent": locator_debug.get(
+                        "witness_equals_recent"
                     ),
                     "candidate_action_drift_per_step": [
                         bool(info["step_record"].get("candidate_action_drift"))
@@ -3241,6 +3536,12 @@ class KVRepairRunner(HistoryDriftRunner):
                 ) = self._restore_snapshot(
                     test_entry_id=test_entry_id,
                     snapshot=segment_checkpoint,
+                )
+                self._repair_target_history_index = locator_debug.get(
+                    "selected_history_index"
+                )
+                repair_segment["repair_target_history_index"] = (
+                    self._repair_target_history_index
                 )
                 count = segment_start_count
                 repaired_records: list[dict[str, Any]] = []
@@ -3384,6 +3685,7 @@ def run(args: argparse.Namespace) -> None:
         "rule_detector_threshold": args.rule_detector_threshold,
         "detector_signal_threshold": args.detector_signal_threshold,
         "logistic_detector_features_csv": args.logistic_detector_features_csv,
+        "logistic_v2_model_json": args.logistic_v2_model_json,
         "logistic_detector_kfolds": args.logistic_detector_kfolds,
         "logistic_detector_feature_set": args.logistic_detector_feature_set,
         "request_candidate_logprobs": args.request_candidate_logprobs,
@@ -3494,6 +3796,15 @@ def run(args: argparse.Namespace) -> None:
         "false_negative_count": sum(
             int(row.get("false_negative_count") or 0) for row in metric_rows
         ),
+        "witness_attempt_count": sum(
+            int(row.get("witness_attempt_count") or 0) for row in metric_rows
+        ),
+        "witness_found_count": sum(
+            int(row.get("witness_found_count") or 0) for row in metric_rows
+        ),
+        "witness_equals_recent_count": sum(
+            int(row.get("witness_equals_recent_count") or 0) for row in metric_rows
+        ),
     }
     summary["extract_success_rate"] = (
         summary["extract_success"] / summary["extract_calls"]
@@ -3542,6 +3853,16 @@ def run(args: argparse.Namespace) -> None:
         if total_actual_pos
         else None
     )
+    summary["witness_coverage"] = (
+        summary["witness_found_count"] / summary["witness_attempt_count"]
+        if summary["witness_attempt_count"]
+        else None
+    )
+    summary["witness_equals_recent_rate"] = (
+        summary["witness_equals_recent_count"] / summary["witness_found_count"]
+        if summary["witness_found_count"]
+        else None
+    )
     Path(args.summary_path).parent.mkdir(parents=True, exist_ok=True)
     Path(args.summary_path).write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
@@ -3580,6 +3901,21 @@ def parse_args() -> argparse.Namespace:
         default="1",
         choices=["1", "2", "4", "all"],
         help="Recent-W history units to restore for generic repair arms.",
+    )
+    parser.add_argument(
+        "--repair-locator",
+        default="recent",
+        choices=["recent", "first", "witness"],
+        help=(
+            "History-block locator for W1 repair. recent keeps the existing "
+            "latest-history-unit policy; first selects H0; witness uses the "
+            "frozen PR3 Witness-IDF oracle locator."
+        ),
+    )
+    parser.add_argument(
+        "--witness-core-path",
+        default="/home/zhuyuhan/project/c2kv/share/d-kv-repair/d_witness_core.py",
+        help="Path to frozen PR3 Witness-IDF implementation.",
     )
     parser.add_argument(
         "--repair-extract-source",
@@ -3652,6 +3988,15 @@ def parse_args() -> argparse.Namespace:
         "--logistic-detector-features-csv",
         default="",
         help="Episode-split detector_features.csv for combined logistic detector.",
+    )
+    parser.add_argument(
+        "--logistic-v2-model-json",
+        default="",
+        help=(
+            "Fold-specific JSON artifact for combined_logistic_v2. The file "
+            "contains causal feature names, StandardScaler statistics, "
+            "elastic-net logistic coefficients, and a frozen threshold."
+        ),
     )
     parser.add_argument(
         "--logistic-detector-kfolds",

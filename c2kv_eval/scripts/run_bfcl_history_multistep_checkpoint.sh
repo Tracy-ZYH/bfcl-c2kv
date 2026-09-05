@@ -37,6 +37,12 @@ DEVICE="${DEVICE:-3}"
 PORT="${PORT:-33400}"
 IDS_PATH="${IDS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_closed_loop_multi_turn_base_200/correct_ids.txt}"
 REFERENCE_DETAILS="${REFERENCE_DETAILS:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_closed_loop_multi_turn_base_200/history_full_closed_loop/logs/details.jsonl}"
+if [ "${IDS_PATH}" = "__NONE__" ]; then
+  IDS_PATH=""
+fi
+if [ "${REFERENCE_DETAILS}" = "__NONE__" ]; then
+  REFERENCE_DETAILS=""
+fi
 RUN_ROOT="${RUN_ROOT:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_multistep_checkpoint_full_success_54}"
 CLEAN_OUTPUT="${CLEAN_OUTPUT:-1}"
 MODE="${MODE:-multistep_i${CHECKPOINT_INTERVAL}_${VERIFIER}_${RECOVERY_MODE}}"

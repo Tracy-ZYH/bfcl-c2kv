@@ -1,0 +1,21 @@
+{
+  "bfcl_git_commit": "aabda6c3639a1092d7bf86ba8d5f8dad1317cdf7",
+  "sglang_git_commit": "d42ce815f179719f59d0d983092114809d7bda56",
+  "c2kv_git_commit": "775a6a30901725bf4536466d77d053a1734cff5c",
+  "category": "multi_turn_base",
+  "max_examples": 200,
+  "model_id": "Qwen/Qwen3-4B-Instruct-2507-FC",
+  "model_path": "/home/zhuyuhan/project/c2kv/checkpoints/qwen3-4b-agent-history-c2kv-toolcall-npu-v2/checkpoint-1088",
+  "tokenizer_path": "/home/zhuyuhan/project/c2kv/models/Qwen3-4B-Instruct-2507",
+  "ids_path": "",
+  "reference_details_path": "",
+  "temperature": 0.0,
+  "stable52_filtering": false,
+  "full_success_only": false,
+  "episode_count": 200,
+  "uses_stable52_filter": false,
+  "ground_truth_cache_path": "/home/zhuyuhan/project/gorilla/berkeley-function-call-leaderboard/results/multi_turn_base_full200/ground_truth",
+  "full_reference_details_path": "/home/zhuyuhan/project/gorilla/berkeley-function-call-leaderboard/results/multi_turn_base_full200/full_reference/full/logs/details.jsonl",
+  "full_reference_result_dir": "",
+  "full_reference_path": "/home/zhuyuhan/project/gorilla/berkeley-function-call-leaderboard/results/multi_turn_base_full200/full_reference"
+}

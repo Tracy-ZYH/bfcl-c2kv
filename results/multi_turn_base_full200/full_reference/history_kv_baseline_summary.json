@@ -1,0 +1,26 @@
+[
+  {
+    "Method": "Full",
+    "BFCL Accuracy": 0.26,
+    "Correct": 52,
+    "Total": 200,
+    "Turn Joint": 0.043596730245231606,
+    "Candidate Action Drift": 0.5978082191780822,
+    "Executed Action Drift": 0.5978082191780822,
+    "State Drift": 0.0,
+    "Avg Full History KV": 321.1517808219178,
+    "Avg Active History KV": 321.1517808219178,
+    "Estimated Weighted History-KV Retention": 1.0,
+    "Estimated Weighted History-KV Compression": 1.0,
+    "Measured Attention-Visible History-KV Retention": null,
+    "Measured Attention-Visible History-KV Compression": null,
+    "Estimated History-KV Byte Compression": null,
+    "Resident KV Storage / Committed Step": 0.0,
+    "Memory Report Coverage": 0.30246575342465754,
+    "Model Calls / Committed Step": 1.0,
+    "Generation Prefill Tokens / Committed Step": 122.69808219178083,
+    "Maintenance Prefill Tokens / Committed Step": 0.0,
+    "Total Prefill Tokens / Committed Step": 122.69808219178083,
+    "Runtime Status": "ok,memory_report_incomplete"
+  }
+]

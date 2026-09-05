@@ -1,0 +1,7 @@
+{
+  "category": "multi_turn_base",
+  "episode_count": 200,
+  "turn_count": 734,
+  "episode_ids_path": "/home/zhuyuhan/project/gorilla/berkeley-function-call-leaderboard/results/multi_turn_base_full200/ground_truth/episode_ids.txt",
+  "turns_path": "/home/zhuyuhan/project/gorilla/berkeley-function-call-leaderboard/results/multi_turn_base_full200/ground_truth/ground_truth_turns.jsonl"
+}
