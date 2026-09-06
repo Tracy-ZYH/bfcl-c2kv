@@ -49,6 +49,7 @@ from c2kv_eval.adapters.history_step_common import (
     serialization_roundtrip,
     stringify_mapping_keys,
 )
+from c2kv_eval.adapters.sglang_tool_schema import normalize_tools_for_sglang
 
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507-FC"
@@ -62,10 +63,12 @@ def _json_dumps(value: Any) -> str:
 
 
 def _tool_payload(functions: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    return convert_to_tool(
-        list(functions),
-        GORILLA_TO_OPENAPI,
-        ModelStyle.OPENAI_COMPLETIONS,
+    return normalize_tools_for_sglang(
+        convert_to_tool(
+            list(functions),
+            GORILLA_TO_OPENAPI,
+            ModelStyle.OPENAI_COMPLETIONS,
+        )
     )
 
 
