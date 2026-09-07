@@ -100,6 +100,7 @@ DETECTOR_ARMS = {
     "combined_logistic_rate_50",
     "combined_logistic_rate_60",
     "combined_logistic_v2",
+    "combined_logistic_v3",
     "max_risk_score",
     "rule_detector_max_risk",
     "max_observation_anomaly",
@@ -200,7 +201,7 @@ class KVRepairRunner(HistoryDriftRunner):
         )
         self.logistic_v2_model = (
             self._load_logistic_v2_model(getattr(args, "logistic_v2_model_json", ""))
-            if self.detector_arm == "combined_logistic_v2"
+            if self.detector_arm in {"combined_logistic_v2", "combined_logistic_v3"}
             else None
         )
         self.logistic_detector_model = (
@@ -225,7 +226,7 @@ class KVRepairRunner(HistoryDriftRunner):
             or self._logistic_trigger_rate is not None
             else None
         )
-        if self.detector_arm == "combined_logistic_v2":
+        if self.detector_arm in {"combined_logistic_v2", "combined_logistic_v3"}:
             self.collect_candidate_detector_signals = True
         self.checkpoint_interval = max(1, int(args.checkpoint_interval))
         self.require_plan = False
@@ -1382,11 +1383,14 @@ class KVRepairRunner(HistoryDriftRunner):
             else float(model.get("threshold", 0.5))
         )
         triggered = score >= threshold
+        detector_version = str(model.get("version") or "combined_logistic_v2")
+        is_v3 = detector_version == "combined_logistic_v3"
         return {
-            "detector": "combined_logistic_v2",
+            "detector": detector_version,
             "detector_trigger": triggered,
             "detector_reason": (
-                "logistic_v2_score_threshold" if triggered else "logistic_v2_safe"
+                f"{detector_version}_score_threshold"
+                if triggered else f"{detector_version}_safe"
             ),
             "detector_threshold": threshold,
             "threshold_selection_rule": model.get("threshold_selection_rule"),
@@ -1398,13 +1402,23 @@ class KVRepairRunner(HistoryDriftRunner):
             "detector_train_episode_ids": model.get("train_episode_ids") or [],
             "detector_test_episode_ids": model.get("test_episode_ids") or [],
             "logistic_detector_kfold": model.get("fold"),
-            "logistic_detector_feature_set": "combined_logistic_v2_causal",
-            "detector_evaluation_mode": "nested_episode_5fold_closed_loop",
+            "logistic_detector_feature_set": (
+                "combined_logistic_v3_causal" if is_v3 else "combined_logistic_v2_causal"
+            ),
+            "detector_evaluation_mode": (
+                "episode_disjoint_model_train_calibration_test_closed_loop"
+                if is_v3 else "nested_episode_5fold_closed_loop"
+            ),
             "combined_logistic_v2_selected_C": model.get("selected_C"),
             "combined_logistic_v2_selected_l1_ratio": model.get("selected_l1_ratio"),
             "combined_logistic_v2_label_mode": model.get("label_mode"),
             "combined_logistic_v2_label_fallback": model.get("label_fallback"),
             "combined_logistic_v2_feature_unavailable": sorted(set(unavailable)),
+            "logistic_detector_missing_features": sorted(set(unavailable)),
+            "logistic_detector_imputed_feature_count": len(set(unavailable)),
+            "logistic_detector_imputation_rate": (
+                len(set(unavailable)) / len(feature_names) if feature_names else 0.0
+            ),
         }
 
     def _segment_detector(self, segment_infos: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -1423,7 +1437,7 @@ class KVRepairRunner(HistoryDriftRunner):
             return {"detector": "oracle", "detector_trigger": triggered}
         if self.detector_arm == "rule_trigger":
             return self._rule_detector(segment_infos)
-        if self.detector_arm == "combined_logistic_v2":
+        if self.detector_arm in {"combined_logistic_v2", "combined_logistic_v3"}:
             return self._logistic_v2_detector(segment_infos)
         if self.detector_arm in {
             "combined_logistic_best_f1",
@@ -3433,6 +3447,15 @@ class KVRepairRunner(HistoryDriftRunner):
                     ),
                     "logistic_detector_threshold": detector_debug.get(
                         "logistic_detector_threshold"
+                    ),
+                    "logistic_detector_missing_features": detector_debug.get(
+                        "logistic_detector_missing_features"
+                    ),
+                    "logistic_detector_imputed_feature_count": detector_debug.get(
+                        "logistic_detector_imputed_feature_count"
+                    ),
+                    "logistic_detector_imputation_rate": detector_debug.get(
+                        "logistic_detector_imputation_rate"
                     ),
                     "threshold_selection_rule": detector_debug.get(
                         "threshold_selection_rule"

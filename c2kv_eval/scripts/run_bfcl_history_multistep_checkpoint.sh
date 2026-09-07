@@ -2,10 +2,10 @@
 set -Ee -o pipefail
 set +u
 
-ROOT="/home/zhuyuhan/project/gorilla/berkeley-function-call-leaderboard"
-SGLANG_ROOT="/home/zhuyuhan/project/kvoffload-sglang"
-BFCL_PYTHON="/home/zhuyuhan/miniconda3/envs/bfcl/bin/python"
-SGLANG_PYTHON="/home/zhuyuhan/miniconda3/envs/sglang/bin/python"
+ROOT="${ROOT:-/home/zhuyuhan/project/gorilla/berkeley-function-call-leaderboard}"
+SGLANG_ROOT="${SGLANG_ROOT:-/home/zhuyuhan/project/kvoffload-sglang}"
+BFCL_PYTHON="${BFCL_PYTHON:-/home/zhuyuhan/miniconda3/envs/bfcl/bin/python}"
+SGLANG_PYTHON="${SGLANG_PYTHON:-/home/zhuyuhan/miniconda3/envs/sglang/bin/python}"
 
 MODEL_PATH="${MODEL_PATH:-/home/zhuyuhan/project/c2kv/checkpoints/qwen3-4b-agent-history-c2kv-toolcall-npu-v2/checkpoint-1088}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-/home/zhuyuhan/project/c2kv/models/Qwen3-4B-Instruct-2507}"
@@ -149,7 +149,8 @@ start_server() {
       --enable-cache-report \
       "${hicache_args[@]}" \
       --host 127.0.0.1 \
-      --port "${PORT}"
+      --port "${PORT}" \
+      ${SGLANG_EXTRA_ARGS:-}
   ) > "${log}" 2>&1 &
   SERVER_PID="$!"
   log_info "[server] device=${DEVICE} port=${PORT} pid=${SERVER_PID} log=${log}"

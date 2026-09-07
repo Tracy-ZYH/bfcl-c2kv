@@ -189,6 +189,7 @@ start_server() {
   log_info "server start device=${device} port=${port}"
   (
     cd "${SGLANG_ROOT}"
+    export PYTHONPATH="${SGLANG_ROOT}/python:${ROOT}:${PYTHONPATH:-}"
     export SGLANG_DEBUG_MEMORY_POOL=1
     export SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
     export SGLANG_EMPTY_CACHE_INTERVAL=1
@@ -224,6 +225,10 @@ start_server() {
     fi
     if [ "${PERSISTENT_HISTORY_KV_SESSION}" = "1" ]; then
       server_args+=(--enable-streaming-session)
+    fi
+    if [ -n "${SGLANG_EXTRA_ARGS:-}" ]; then
+      read -r -a extra_args <<< "${SGLANG_EXTRA_ARGS}"
+      server_args+=("${extra_args[@]}")
     fi
     exec "${server_args[@]}"
   ) >"${log}" 2>&1 &

@@ -16,6 +16,9 @@ CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-4}"
 TEMPERATURE="${TEMPERATURE:-0}"
 DEVICES="${DEVICES:-5,6,7}"
 PORTS="${PORTS:-35050,35060,35070}"
+COMPRESSION_METHODS="${COMPRESSION_METHODS:-full,c2kv,streamingllm,h2o,snapkv_persistent,pyramidkv,kivi}"
+ROLLBACK_DEPTHS="${ROLLBACK_DEPTHS:-2}"
+RECOVERY_ARMS="${RECOVERY_ARMS:-d_corr_replace_w2,d_corr_w2,d_corr_w2_hint}"
 
 FULL_REFERENCE_DETAILS="${FULL_REFERENCE_DETAILS:-${OUTPUT_ROOT}/full_reference/full/logs/details.jsonl}"
 if [ ! -s "${FULL_REFERENCE_DETAILS}" ]; then
@@ -48,7 +51,7 @@ config.update({
 path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 PY
 
-METHODS=full,c2kv,streamingllm,h2o,snapkv_persistent,pyramidkv,kivi \
+METHODS="${COMPRESSION_METHODS}" \
 CATEGORY="${CATEGORY}" \
 MAX_EXAMPLES="${MAX_EXAMPLES}" \
 IDS_PATH="__NONE__" \
@@ -66,7 +69,7 @@ TOKENIZER_PATH="${TOKENIZER_PATH}" \
 bash "${ROOT}/c2kv_eval/scripts/run_bfcl_history_kv_baselines.sh"
 
 VERIFIERS=oracle \
-ROLLBACK_DEPTHS=1,2,4 \
+ROLLBACK_DEPTHS="${ROLLBACK_DEPTHS}" \
 ROLLBACK_POLICY=fixed_depth \
 ROLLBACK_BACKEND=kv_restore_strict \
 CATEGORY="${CATEGORY}" \
@@ -81,7 +84,7 @@ RUN_ROOT="${OUTPUT_ROOT}/recovery_reference_oracle/rollback" \
 CLEAN_OUTPUT=1 \
 bash "${ROOT}/c2kv_eval/scripts/run_bfcl_fixed_depth_sweep.sh"
 
-ARMS=d_corr_replace_w1,d_corr_replace_w2,d_corr_replace_w4,d_corr_replace_all,d_corr_recompute_w2,d_corr_w2,cacheblend_w2 \
+ARMS="${RECOVERY_ARMS}" \
 REPAIR_TRIGGER=oracle \
 CATEGORY="${CATEGORY}" \
 MAX_EXAMPLES="${MAX_EXAMPLES}" \
@@ -111,15 +114,9 @@ bash "${ROOT}/c2kv_eval/scripts/run_bfcl_kv_repair_sweep.sh"
   "SnapKV:snapkv_persistent:${OUTPUT_ROOT}/compression_baselines/snapkv_persistent" \
   "PyramidKV:pyramidkv:${OUTPUT_ROOT}/compression_baselines/pyramidkv" \
   "KIVI-QDQ:kivi:${OUTPUT_ROOT}/compression_baselines/kivi" \
-  "Rollback D1:rollback_d1:${OUTPUT_ROOT}/recovery_reference_oracle/rollback/fixed_depth_i${CHECKPOINT_INTERVAL}_oracle_d1_kv_restore_strict" \
   "Rollback D2:rollback_d2:${OUTPUT_ROOT}/recovery_reference_oracle/rollback/fixed_depth_i${CHECKPOINT_INTERVAL}_oracle_d2_kv_restore_strict" \
-  "Rollback D4:rollback_d4:${OUTPUT_ROOT}/recovery_reference_oracle/rollback/fixed_depth_i${CHECKPOINT_INTERVAL}_oracle_d4_kv_restore_strict" \
-  "Replace W1:d_corr_replace_w1:${OUTPUT_ROOT}/recovery_reference_oracle/kv_repair/d_corr_replace_w1" \
   "Replace W2:d_corr_replace_w2:${OUTPUT_ROOT}/recovery_reference_oracle/kv_repair/d_corr_replace_w2" \
-  "Replace W4:d_corr_replace_w4:${OUTPUT_ROOT}/recovery_reference_oracle/kv_repair/d_corr_replace_w4" \
-  "Replace All:d_corr_replace_all:${OUTPUT_ROOT}/recovery_reference_oracle/kv_repair/d_corr_replace_all" \
-  "Recompute W2:d_corr_recompute_w2:${OUTPUT_ROOT}/recovery_reference_oracle/kv_repair/d_corr_recompute_w2" \
   "Append W2:d_corr_w2:${OUTPUT_ROOT}/recovery_reference_oracle/kv_repair/d_corr_w2" \
-  "CacheBlend 15%:cacheblend_w2:${OUTPUT_ROOT}/recovery_reference_oracle/kv_repair/cacheblend_w2"
+  "Append-Hint:d_corr_w2_hint:${OUTPUT_ROOT}/recovery_reference_oracle/kv_repair/d_corr_w2_hint"
 
 echo "Stage 2 complete: ${OUTPUT_ROOT}/unified_full200.csv"

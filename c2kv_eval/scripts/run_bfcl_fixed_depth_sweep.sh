@@ -2,7 +2,7 @@
 set -Ee -o pipefail
 set +u
 
-ROOT="/home/zhuyuhan/project/gorilla/berkeley-function-call-leaderboard"
+ROOT="${ROOT:-/home/zhuyuhan/project/bfcl-c2kv}"
 BFCL_PYTHON="${BFCL_PYTHON:-/home/zhuyuhan/miniconda3/envs/bfcl/bin/python}"
 
 CATEGORY="${CATEGORY:-multi_turn_base}"

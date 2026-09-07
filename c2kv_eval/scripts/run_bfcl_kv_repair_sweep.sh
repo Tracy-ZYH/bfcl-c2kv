@@ -154,7 +154,8 @@ start_server() {
       --dtype bfloat16 \
       --mem-fraction-static "${MEM_FRACTION_STATIC:-0.55}" \
       --host 127.0.0.1 \
-      --port "${port}"
+      --port "${port}" \
+      ${SGLANG_EXTRA_ARGS:-}
   ) >"${log}" 2>&1 &
   SERVER_PIDS+=("$!")
   log_info "server slot=${slot} device=${device} port=${port} pid=${SERVER_PIDS[-1]} log=${log}"
