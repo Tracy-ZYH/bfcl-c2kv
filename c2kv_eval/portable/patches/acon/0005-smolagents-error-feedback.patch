@@ -1,0 +1,42 @@
+diff --git a/src/productive_agents/env/smolagents/env.py b/src/productive_agents/env/smolagents/env.py
+index e529962..0877256 100644
+--- a/src/productive_agents/env/smolagents/env.py
++++ b/src/productive_agents/env/smolagents/env.py
+@@ -174,8 +174,28 @@ class SmolagentsEnv(BaseLanguageBasedEnv):
+                     "Warning to user: Code execution failed due to an unauthorized import - Consider passing said import under `additional_authorized_imports` when initializing your CodeAgent."
+                 )
+             observation += f"\nError executing code: {error_msg}"
+-            # return observation, 0.0, True, {"error": str(e)} 
+-            return observation, 0.0, False, {"error": str(e)}
++            return self._record_execution_error(action, observation, error_msg)
++
++    def _record_execution_error(
++        self, action: str, observation: str, error_msg: str
++    ) -> Tuple[str, float, bool, Dict[str, Any]]:
++        """Persist a failed code step so the agent receives its error feedback."""
++        self.observation = observation
++        self.reward = 0.0
++        self.done = False
++        self.info = {
++            "success": False,
++            "reason": "execution_error",
++            "error": error_msg,
++        }
++        self.trajectory.append({
++            "action": action,
++            "observation": self.observation,
++            "reward": self.reward,
++            "done": self.done,
++            "info": self.info,
++        })
++        return self.observation, self.reward, self.done, self.info
+     
+     def _clean_code(self, code: str) -> str:
+         code_action = parse_code_blobs(code, ("```python", "```"))
+@@ -219,4 +239,4 @@ class SmolagentsEnv(BaseLanguageBasedEnv):
+         with open(os.path.join(output_dir, "env_history.json"), 'w') as f:
+             json.dump(self.trajectory, f, indent=2)
+         
+-        self.logger.info(f"Trajectory saved to {output_dir}/env_history.json")
+\ No newline at end of file
++        self.logger.info(f"Trajectory saved to {output_dir}/env_history.json")

@@ -51,12 +51,13 @@ dependencies = [
 
 [project.scripts]
 bfcl = "bfcl_eval.__main__:cli"
+c2kv-bench = "c2kv_eval.portable.run:main"
 
 [tool.setuptools]
-include-package-data = true
+include-package-data = false
 
 [tool.setuptools.packages.find]
-include = ["bfcl_eval*"]
+include = ["bfcl_eval*", "c2kv_eval", "c2kv_eval.portable*"]
 
 [tool.setuptools.package-data]
 "bfcl_eval" = [
@@ -66,6 +67,22 @@ include = ["bfcl_eval*"]
     "./.env.example",
     "*.md",
 ]
+"c2kv_eval.portable" = [
+    "README.md",
+    "README.zh-CN.md",
+    "patches/acebench/*.patch",
+    "patches/acebench/*.md",
+    "patches/acebench/UPSTREAM_LICENSE*",
+    "patches/acon/*.patch",
+    "patches/acon/*.md",
+    "patches/acon/UPSTREAM_LICENSE*",
+    "patches/toolsandbox/*.patch",
+    "patches/toolsandbox/*.md",
+    "patches/toolsandbox/UPSTREAM_LICENSE*",
+]
+
+[tool.setuptools.exclude-package-data]
+"c2kv_eval" = ["README*.md", "*.sh", "scripts/*", "scripts/**/*"]
 
 [project.urls]
 Repository = "https://github.com/ShishirPatil/gorilla/tree/main/berkeley-function-call-leaderboard"

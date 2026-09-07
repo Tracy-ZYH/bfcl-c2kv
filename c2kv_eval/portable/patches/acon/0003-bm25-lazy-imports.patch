@@ -1,0 +1,100 @@
+diff --git a/experiments/smolagents/search/retriever_server.py b/experiments/smolagents/search/retriever_server.py
+index 924e90e..0af1575 100644
+--- a/experiments/smolagents/search/retriever_server.py
++++ b/experiments/smolagents/search/retriever_server.py
+@@ -1,19 +1,11 @@
++from __future__ import annotations
++
+ import json
+ import os
+ import warnings
+ from typing import List, Dict, Optional
+ import argparse
+ 
+-try:
+-    import faiss
+-except:
+-    print("faiss not found, try to install it via `pip install faiss-cpu` or `pip install faiss-gpu`")
+-import torch
+-import numpy as np
+-from transformers import AutoConfig, AutoTokenizer, AutoModel
+-from tqdm import tqdm
+-import datasets
+-
+ import uvicorn
+ from fastapi import FastAPI
+ from pydantic import BaseModel
+@@ -28,6 +20,8 @@ parser.add_argument("--retriever_model", type=str, default="intfloat/e5-base-v2"
+ args = parser.parse_args()
+ 
+ def load_corpus(corpus_path: str):
++    import datasets
++
+     corpus = datasets.load_dataset(
+         'json', 
+         data_files=corpus_path,
+@@ -48,6 +42,8 @@ def load_docs(corpus, doc_idxs):
+     return results
+ 
+ def load_model(model_path: str, use_fp16: bool = False):
++    from transformers import AutoConfig, AutoModel, AutoTokenizer
++
+     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+     model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
+     model.eval()
+@@ -73,6 +69,16 @@ def pooling(
+     else:
+         raise NotImplementedError("Pooling method not implemented!")
+ 
++def _torch_no_grad(function):
++    def wrapped(*args, **kwargs):
++        import torch
++
++        with torch.no_grad():
++            return function(*args, **kwargs)
++
++    return wrapped
++
++
+ class Encoder:
+     def __init__(self, model_name, model_path, pooling_method, max_length, use_fp16):
+         self.model_name = model_name
+@@ -84,8 +90,11 @@ class Encoder:
+         self.model, self.tokenizer = load_model(model_path=model_path, use_fp16=use_fp16)
+         self.model.eval()
+ 
+-    @torch.no_grad()
++    @_torch_no_grad
+     def encode(self, query_list: List[str], is_query=True) -> np.ndarray:
++        import numpy as np
++        import torch
++
+         # processing query for different encoders
+         if isinstance(query_list, str):
+             query_list = [query_list]
+@@ -218,6 +227,8 @@ class BM25Retriever(BaseRetriever):
+ 
+ class DenseRetriever(BaseRetriever):
+     def __init__(self, config):
++        import faiss
++
+         super().__init__(config)
+         self.index = faiss.read_index(self.index_path)
+         if config.faiss_gpu:
+@@ -251,6 +262,9 @@ class DenseRetriever(BaseRetriever):
+             return results
+ 
+     def _batch_search(self, query_list: List[str], num: int = None, return_score: bool = False):
++        import torch
++        from tqdm import tqdm
++
+         if isinstance(query_list, str):
+             query_list = [query_list]
+         if num is None:
+@@ -390,4 +404,4 @@ def retrieve_endpoint(request: QueryRequest):
+ 
+ if __name__ == "__main__":
+     # 3) Launch the server. By default, it listens on http://127.0.0.1:8000
+-    uvicorn.run(app, host="0.0.0.0", port=8005)
+\ No newline at end of file
++    uvicorn.run(app, host="0.0.0.0", port=8005)

@@ -1,0 +1,61 @@
+diff --git a/tool_sandbox/roles/openai_api_agent.py b/tool_sandbox/roles/openai_api_agent.py
+index 1d1e8d0..e10915b 100644
+--- a/tool_sandbox/roles/openai_api_agent.py
++++ b/tool_sandbox/roles/openai_api_agent.py
+@@ -2,6 +2,7 @@
+ # Copyright (C) 2024 Apple Inc. All Rights Reserved.
+ """Agent role for any model that conforms to OpenAI tool use API"""
+ 
++import os
+ from typing import Any, Iterable, List, Literal, Optional, Union, cast
+ 
+ from openai import NOT_GIVEN, NotGiven, OpenAI
+@@ -36,10 +37,10 @@ class OpenAIAPIAgent(BaseRole):
+     model_name: str
+ 
+     def __init__(self) -> None:
+-        # We set the `base_url` explicitly here to avoid picking up the
+-        # `OPENAI_BASE_URL` environment variable that may be set for serving models as
+-        # OpenAI API compatible servers.
+-        self.openai_client: OpenAI = OpenAI(base_url="https://api.openai.com/v1")
++        # C2KV bench: the AGENT rides the arm proxy via OPENAI_BASE_URL.
++        self.openai_client: OpenAI = OpenAI(
++            base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
++        )
+ 
+     def respond(self, ending_index: Optional[int] = None) -> None:
+         """Reads a List of messages and attempt to respond with a Message
+diff --git a/tool_sandbox/roles/openai_api_user.py b/tool_sandbox/roles/openai_api_user.py
+index d82e15c..b2af725 100644
+--- a/tool_sandbox/roles/openai_api_user.py
++++ b/tool_sandbox/roles/openai_api_user.py
+@@ -3,6 +3,7 @@
+ """Simulated user role for any model that conforms to OpenAI tool use API"""
+ 
+ from logging import getLogger
++import os
+ from typing import Dict, Iterable, List, Literal, Optional, Union, cast
+ 
+ from openai import NOT_GIVEN, NotGiven, OpenAI
+@@ -32,10 +33,17 @@ class OpenAIAPIUser(BaseRole):
+     model_name: str
+ 
+     def __init__(self) -> None:
+-        # We set the `base_url` explicitly here to avoid picking up the
+-        # `OPENAI_BASE_URL` environment variable that may be set for serving models as
+-        # OpenAI API compatible servers.
+-        self.openai_client: OpenAI = OpenAI(base_url="https://api.openai.com/v1")
++        # C2KV bench: the USER SIMULATOR gets its own variable and defaults
++        # to the agent endpoint only for standalone use - routing it through
++        # the arm proxy made every historical TS number an agent+user joint
++        # degradation.  The benchmark adapter exports the raw upstream
++        # endpoint here.
++        self.openai_client: OpenAI = OpenAI(
++            base_url=os.environ.get(
++                "TOOLSANDBOX_USER_BASE_URL",
++                os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
++            )
++        )
+ 
+     def respond(self, ending_index: Optional[int] = None) -> None:
+         """Reads a List of messages and attempt to respond with a Message
