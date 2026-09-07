@@ -1,0 +1,167 @@
+diff --git a/model_inference/apimodel_inference.py b/model_inference/apimodel_inference.py
+index 091d470..3202ea1 100644
+--- a/model_inference/apimodel_inference.py
++++ b/model_inference/apimodel_inference.py
+@@ -37 +37,6 @@ class APIModelInference(BaseHandler):
+-        if "gpt" in self.model_name:
++        if os.getenv("ACEBENCH_AGENT_BASE_URL"):
++            # C2KV bench: single-turn inference is the evaluated agent too,
++            # so it rides the arm proxy (benchmarks/adapters/acebench_adapter.py)
++            api_key = os.getenv("ACEBENCH_AGENT_API_KEY", "EMPTY")
++            base_url = os.getenv("ACEBENCH_AGENT_BASE_URL")
++        elif "gpt" in self.model_name:
+@@ -155 +160,4 @@ class APIModelInference(BaseHandler):
+-                    current_message = agent.respond(inference_message)
++                    agent_history = (message_history if
++                                     os.getenv("ACEBENCH_ROLE_HISTORY_V1") == "1"
++                                     else inference_message)
++                    current_message = agent.respond(agent_history)
+@@ -202 +210,4 @@ class APIModelInference(BaseHandler):
+-                    current_message = agent.respond(inference_message)
++                    agent_history = (message_history if
++                                     os.getenv("ACEBENCH_ROLE_HISTORY_V1") == "1"
++                                     else inference_message)
++                    current_message = agent.respond(agent_history)
+diff --git a/model_inference/inference_map.py b/model_inference/inference_map.py
+index 942202b..139a9b3 100644
+--- a/model_inference/inference_map.py
++++ b/model_inference/inference_map.py
+@@ -1,2 +1,7 @@
+-from model_inference.common_inference import CommonInference
++import os
+ from model_inference.apimodel_inference import APIModelInference
++
++def _lazy_common_inference(*args, **kwargs):
++    from model_inference.common_inference import CommonInference
++    return CommonInference(*args, **kwargs)
++
+@@ -36 +41 @@ inference_map_groups = {
+-    CommonInference: [
++    _lazy_common_inference: [
+@@ -58,0 +64,8 @@ inference_map = {model: handler for handler, models in inference_map_groups.item
++
++# C2KV bench: model names served by an OpenAI-compatible endpoint (the arm
++# proxy) are registered from the environment instead of this list, so the
++# served model name is not baked into the harness
++# (benchmarks/adapters/acebench_adapter.py exports ACEBENCH_API_MODELS).
++for _name in os.environ.get("ACEBENCH_API_MODELS", "").split(","):
++    if _name.strip():
++        inference_map.setdefault(_name.strip(), APIModelInference)
+diff --git a/model_inference/multi_step/APIModel_agent.py b/model_inference/multi_step/APIModel_agent.py
+index 604575a..b45de8f 100644
+--- a/model_inference/multi_step/APIModel_agent.py
++++ b/model_inference/multi_step/APIModel_agent.py
+@@ -4,0 +5 @@ import re
++from model_inference.role_history import agent_messages
+@@ -68 +69,6 @@ class APIAgent_step():
+-        if "gpt" in self.model_name:
++        if os.getenv("ACEBENCH_AGENT_BASE_URL"):
++            # C2KV bench: the AGENT rides the arm proxy regardless of its
++            # served model name (benchmarks/adapters/acebench_adapter.py)
++            api_key = os.getenv("ACEBENCH_AGENT_API_KEY", "EMPTY")
++            base_url = os.getenv("ACEBENCH_AGENT_BASE_URL")
++        elif "gpt" in self.model_name:
+@@ -102 +108,12 @@ class APIAgent_step():
+-        if "o1" not in self.model_name:
++        if isinstance(history, list):
++            message = agent_messages(system_prompt, self.functions, history,
++                                     language=self.language)
++            response = self.client.chat.completions.create(
++                messages=message,
++                model=self.model_name,
++                temperature=self.temperature,
++                max_tokens=self.max_tokens,
++                top_p=self.top_p,
++            )
++            response = response.choices[0].message.content
++        elif "o1" not in self.model_name:
+@@ -144 +161 @@ class APIAgent_step():
+-        return current_message
+\ No newline at end of file
++        return current_message
+diff --git a/model_inference/multi_turn/APIModel_agent.py b/model_inference/multi_turn/APIModel_agent.py
+index d1ecfa9..27057a4 100644
+--- a/model_inference/multi_turn/APIModel_agent.py
++++ b/model_inference/multi_turn/APIModel_agent.py
+@@ -6,0 +7 @@ from model_inference.prompt_zh import TRAVEL_PROMPT_ZH, BASE_PROMPT_ZH
++from model_inference.role_history import agent_messages
+@@ -49 +50,6 @@ class APIAgent_turn():
+-        if "gpt" in self.model_name:
++        if os.getenv("ACEBENCH_AGENT_BASE_URL"):
++            # C2KV bench: the AGENT rides the arm proxy regardless of its
++            # served model name (benchmarks/adapters/acebench_adapter.py)
++            api_key = os.getenv("ACEBENCH_AGENT_API_KEY", "EMPTY")
++            base_url = os.getenv("ACEBENCH_AGENT_BASE_URL")
++        elif "gpt" in self.model_name:
+@@ -206 +212,12 @@ class APIAgent_turn():
+-        if "o1" not in self.model_name:
++        if isinstance(history, list):
++            message = agent_messages(system_prompt, self.functions, history,
++                                     language=self.language)
++            response = self.client.chat.completions.create(
++                messages=message,
++                model=self.model_name,
++                temperature=self.temperature,
++                max_tokens=self.max_tokens,
++                top_p=self.top_p,
++            )
++            response = response.choices[0].message.content
++        elif "o1" not in self.model_name:
+@@ -252 +269 @@ class APIAgent_turn():
+-        return current_message
+\ No newline at end of file
++        return current_message
+diff --git a/model_inference/multi_turn/APIModel_user.py b/model_inference/multi_turn/APIModel_user.py
+index cf32599..ce9199e 100644
+--- a/model_inference/multi_turn/APIModel_user.py
++++ b/model_inference/multi_turn/APIModel_user.py
+@@ -82 +82,7 @@ class APIUSER():
+-        if "gpt" in self.model_name:
++        if os.getenv("ACEBENCH_USER_BASE_URL"):
++            # C2KV bench: the USER SIMULATOR gets its own endpoint (the raw
++            # upstream, full mode) - routing it through the arm proxy would
++            # make every number an agent+user joint degradation
++            api_key = os.getenv("ACEBENCH_USER_API_KEY", "EMPTY")
++            base_url = os.getenv("ACEBENCH_USER_BASE_URL")
++        elif "gpt" in self.model_name:
+diff --git a/model_inference/role_history.py b/model_inference/role_history.py
+new file mode 100644
+index 0000000..a11b876
+--- /dev/null
++++ b/model_inference/role_history.py
+@@ -0,0 +1,35 @@
++"""Role-preserving OpenAI messages for ACEBench agent clients."""
++
++import json
++
++
++def _content(value):
++    if isinstance(value, str):
++        return value
++    return json.dumps(value, ensure_ascii=False)
++
++
++def agent_messages(system_prompt, functions, history, language="en"):
++    """Convert the scene's structured history without parsing transcript text."""
++    if not isinstance(history, list):
++        raise TypeError("ACEBench role history must be a list")
++    if language == "zh":
++        api_heading = "下面是你可使用的 API 列表："
++    else:
++        api_heading = "Below is the list of APIs you can use:"
++    messages = [{
++        "role": "system",
++        "content": system_prompt.rstrip() + "\n\n" + api_heading + "\n" + _content(functions),
++    }]
++    roles = {"user": "user", "agent": "assistant", "execution": "tool"}
++    for index, entry in enumerate(history):
++        sender = entry.get("sender")
++        if sender not in roles:
++            raise ValueError(f"unknown ACEBench dialogue sender: {sender!r}")
++        message = {"role": roles[sender], "content": _content(entry.get("message"))}
++        if sender == "execution":
++            # The C2KV proxy consumes this identifier while normalizing tool
++            # observations to the checkpoint's user-message training dialect.
++            message["tool_call_id"] = f"acebench-execution-{index}"
++        messages.append(message)
++    return messages

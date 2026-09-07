@@ -1,0 +1,24 @@
+diff --git a/tool_sandbox/roles/openai_api_agent.py b/tool_sandbox/roles/openai_api_agent.py
+--- a/tool_sandbox/roles/openai_api_agent.py
++++ b/tool_sandbox/roles/openai_api_agent.py
+@@ -94,7 +94,7 @@ class OpenAIAPIAgent(BaseRole):
+         # Parse response
+         openai_response_message = response.choices[0].message
+         # Message contains no tool call, aka addressed to user
+-        if openai_response_message.tool_calls is None:
++        if not openai_response_message.tool_calls:
+             assert openai_response_message.content is not None
+             response_messages = [
+                 Message(
+diff --git a/tool_sandbox/roles/openai_api_user.py b/tool_sandbox/roles/openai_api_user.py
+--- a/tool_sandbox/roles/openai_api_user.py
++++ b/tool_sandbox/roles/openai_api_user.py
+@@ -100,7 +100,7 @@ class OpenAIAPIUser(BaseRole):
+         openai_response_message = response.choices[0].message
+ 
+         # Message contains no tool call, aka addressed to agent
+-        if openai_response_message.tool_calls is None:
++        if not openai_response_message.tool_calls:
+             # Not sure why the content field `ChatCompletionMessage` has a type of
+             # `str | None`.
+             assert openai_response_message.content is not None

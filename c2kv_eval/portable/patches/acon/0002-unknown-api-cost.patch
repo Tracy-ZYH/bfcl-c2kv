@@ -1,0 +1,89 @@
+diff --git a/src/productive_agents/llm.py b/src/productive_agents/llm.py
+--- a/src/productive_agents/llm.py
++++ b/src/productive_agents/llm.py
+@@ -106,7 +106,7 @@
+     'o4-mini': {'input': 1.10, 'output': 4.40},
+ }
+ 
+-def calculate_api_cost(model_name: str, input_tokens: int, output_tokens: int) -> float:
++def calculate_api_cost(model_name: str, input_tokens: int, output_tokens: int) -> float | None:
+     """
+     Calculate the API cost for given token usage.
+     
+@@ -126,9 +126,9 @@
+             break
+     
+     if pricing is None:
+-        # Default to gpt-4o pricing if model not found
+-        logger.warning(f"No pricing found for model {model_name}, using gpt-4o pricing")
+-        pricing = MODEL_PRICING['gpt-4o']
++        # Local endpoints have no declared API tariff. Unknown is not free.
++        logger.info(f"API pricing unavailable for model {model_name}")
++        return None
+     
+     # Calculate cost (pricing is per 1M tokens)
+     input_cost = (input_tokens / 1_000_000) * pricing['input']
+diff --git a/experiments/appworld/run.py b/experiments/appworld/run.py
+--- a/experiments/appworld/run.py
++++ b/experiments/appworld/run.py
+@@ -187,9 +187,12 @@
+         print(f"Output Tokens: {token_summary.get('total_output_tokens', 0):,}")
+         print(f"Total Tokens: {token_summary.get('total_tokens', 0):,}")
+         print("-" * 30)
+-        print(f"Input Cost: ${token_summary.get('input_cost_usd', 0):.6f}")
+-        print(f"Output Cost: ${token_summary.get('output_cost_usd', 0):.6f}")
+-        print(f"TOTAL COST: ${token_summary.get('total_cost_usd', 0):.6f}")
++        if token_summary.get('total_cost_usd') is not None:
++            print(f"Input Cost: ${token_summary.get('input_cost_usd', 0):.6f}")
++            print(f"Output Cost: ${token_summary.get('output_cost_usd', 0):.6f}")
++            print(f"TOTAL COST: ${token_summary.get('total_cost_usd', 0):.6f}")
++        else:
++            print("API cost unavailable for this model")
+         print("="*50)
+     
+     # Print results summary
+diff --git a/experiments/appworld/run_all.py b/experiments/appworld/run_all.py
+--- a/experiments/appworld/run_all.py
++++ b/experiments/appworld/run_all.py
+@@ -208,9 +208,9 @@
+             # Collect cost information
+             if 'token_usage' in result and result['token_usage']:
+                 token_info = result['token_usage']
+-                task_cost = token_info.get('total_cost_usd', 0.0)
++                task_cost = token_info.get('total_cost_usd')
+                 task_costs[task_id] = task_cost
+-                total_cost += task_cost
++                total_cost = (total_cost + task_cost if total_cost is not None and task_cost is not None else None)
+                 total_input_tokens += token_info.get('total_input_tokens', 0)
+                 total_output_tokens += token_info.get('total_output_tokens', 0)
+                 total_requests += token_info.get('total_requests', 0)
+@@ -263,9 +263,9 @@
+                 # Collect cost information
+                 if 'token_usage' in result and result['token_usage']:
+                     token_info = result['token_usage']
+-                    task_cost = token_info.get('total_cost_usd', 0.0)
++                    task_cost = token_info.get('total_cost_usd')
+                     task_costs[task_id] = task_cost
+-                    total_cost += task_cost
++                    total_cost = (total_cost + task_cost if total_cost is not None and task_cost is not None else None)
+                     total_input_tokens += token_info.get('total_input_tokens', 0)
+                     total_output_tokens += token_info.get('total_output_tokens', 0)
+                     total_requests += token_info.get('total_requests', 0)
+@@ -302,7 +302,7 @@
+     print(f"{'='*60}")
+     
+     # Print cost summary
+-    if total_cost > 0:
++    if total_cost is not None and total_cost > 0:
+         print(f"TOKEN USAGE AND COST SUMMARY")
+         print(f"{'='*60}")
+         print(f"Total Requests: {total_requests:,}")
+@@ -334,7 +334,7 @@
+             'total_output_tokens': total_output_tokens,
+             'total_tokens': total_input_tokens + total_output_tokens,
+             'total_requests': total_requests,
+-            'average_cost_per_task': total_cost / len(task_list) if len(task_list) > 0 else 0,
++            'average_cost_per_task': total_cost / len(task_list) if total_cost is not None and task_list else None,
+             'task_costs': task_costs
+         }
+     }

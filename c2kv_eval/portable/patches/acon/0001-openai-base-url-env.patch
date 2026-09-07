@@ -1,0 +1,19 @@
+diff --git a/src/productive_agents/llm.py b/src/productive_agents/llm.py
+index 7281e68..16589ab 100644
+--- a/src/productive_agents/llm.py
++++ b/src/productive_agents/llm.py
+@@ -470,9 +470,12 @@ class vLLM(BaseLLMModel):
+     def __init__(self, model_name, system_message=None, log_file=None, log_level=logging.INFO, lora_name=None):
+         super().__init__(model_name, system_message, log_file, log_level)
+         
++        # C2KV bench: the agent LLM rides the arm proxy; the endpoint comes
++        # from the environment instead of the hard-coded local vLLM port
++        # (benchmarks/adapters/acon_adapter.py exports both variables).
+         self.client = OpenAI(
+-            base_url="http://localhost:8000/v1",
+-            api_key="token-abc",
++            base_url=os.environ.get("ACON_OPENAI_BASE_URL", "http://localhost:8000/v1"),
++            api_key=os.environ.get("ACON_OPENAI_API_KEY", "token-abc"),
+         )
+         self.lora_name = lora_name
+         if self.lora_name and "=" in self.lora_name:

@@ -1,0 +1,11 @@
+diff --git a/pyserini/search/lucene/__init__.py b/pyserini/search/lucene/__init__.py
+index 047791d..440ca45 100644
+--- a/pyserini/search/lucene/__init__.py
++++ b/pyserini/search/lucene/__init__.py
+@@ -24,6 +24,4 @@ JBagOfWordsQueryGenerator = autoclass('io.anserini.search.query.BagOfWordsQueryG
+ JDisjunctionMaxQueryGenerator = autoclass('io.anserini.search.query.DisjunctionMaxQueryGenerator')
+ JCovid19QueryGenerator = autoclass('io.anserini.search.query.Covid19QueryGenerator')
+ 
+-from ._impact_searcher import LuceneImpactSearcher, SlimSearcher
+ from ._searcher import LuceneSearcher, LuceneFusionSearcher, LuceneSimilarities
+-from ._hnsw_searcher import LuceneHnswDenseSearcher, LuceneFlatDenseSearcher
