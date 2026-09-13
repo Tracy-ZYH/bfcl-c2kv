@@ -179,7 +179,8 @@ class SglangBackend(Backend):
     def repair_extract_messages(self, messages: List[Dict[str, Any]],
                                 target_index: int,
                                 tools: Optional[List[Dict[str, Any]]],
-                                source_doc_index: int) -> Dict[str, Any]:
+                                source_doc_index: int,
+                                target_end_index: Optional[int] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "messages": [
                 {"role": m.get("role") or "user", "content": m.get("content") or ""}
@@ -196,6 +197,8 @@ class SglangBackend(Backend):
         }
         if tools:
             payload["tools"] = tools
+        if target_end_index is not None:
+            payload["target_end_index"] = int(target_end_index)
         result = self._post_json("/v1/c2kv/repair_extract", payload, 600)
         if not result.get("success", True) or not result.get("key_hash"):
             raise BackendError(
@@ -251,6 +254,15 @@ class SglangBackend(Backend):
             payload["history_kv_target_tokens"] = int(spec["target_tokens"])
         else:
             payload["history_kv_retention_ratio"] = float(spec["retention_ratio"])
+        if spec.get("recovery_mode"):
+            payload["history_kv_recovery_mode"] = str(spec["recovery_mode"])
+            char_range = spec.get("recovery_char_range") or []
+            if len(char_range) != 2:
+                raise BackendError(
+                    "history_kv_recovery_failed",
+                    "generic history recovery requires one [start,end] char range")
+            payload["history_kv_recovery_char_start"] = int(char_range[0])
+            payload["history_kv_recovery_char_end"] = int(char_range[1])
         if tools:
             payload["tools"] = tools
         result = self._post_json("/v1/c2kv/repair_extract", payload, 600)
@@ -270,6 +282,28 @@ class SglangBackend(Backend):
                 f"server did not apply history_kv_method={method!r} "
                 f"(echoed {echoed!r}); refusing to report an uncompressed "
                 "request as a history-KV baseline")
+        if spec.get("recovery_mode"):
+            recovery_meta = result.get("history_selection_metadata") or {}
+            if recovery_meta.get("recovery_mode") != spec["recovery_mode"]:
+                raise BackendError(
+                    "history_kv_recovery_failed",
+                    "server did not acknowledge generic history recovery; "
+                    "refusing to report a compression-only response as recovery")
+            if recovery_meta.get("duplicate_raw_token_count") != 0:
+                raise BackendError(
+                    "history_kv_recovery_failed",
+                    "server reported duplicate raw KV tokens in generic recovery")
+            required = (
+                "before_recovery_active_tokens",
+                "after_recovery_active_tokens",
+                "recovered_segment_size",
+                "restored_raw_token_count",
+            )
+            missing = [key for key in required if recovery_meta.get(key) is None]
+            if missing:
+                raise BackendError(
+                    "history_kv_recovery_failed",
+                    f"server omitted recovery accounting fields: {missing}")
         return result
 
     def open_history_session(self, session_id: str, timeout: int = 600) -> str:
@@ -395,6 +429,19 @@ class SglangBackend(Backend):
             "history_kv_selected_token_count": kept,
             "history_selection_metadata": record.get("history_selection_metadata"),
         }
+        if spec.get("recovery_mode"):
+            recovery_meta = record.get("history_selection_metadata") or {}
+            hint.update({
+                "history_kv_recovery_mode": spec.get("recovery_mode"),
+                "history_kv_recovery_window": spec.get("recovery_window"),
+                "history_kv_restored_raw_tokens": recovery_meta.get(
+                    "restored_raw_token_count"),
+                "history_kv_before_recovery_active_tokens": recovery_meta.get(
+                    "before_recovery_active_tokens"),
+                "history_kv_after_recovery_active_tokens": kept,
+                "history_kv_recovered_segment_size": recovery_meta.get(
+                    "recovered_segment_size"),
+            })
         return out, hint, session_id
 
     # ---- KV reuse (CacheBlend) request shaping ----
@@ -616,14 +663,21 @@ class SglangBackend(Backend):
             placement = str(repair_plan.get("placement") or "append_keep_ledger")
             key_hash = repair_plan["repair_key_hash"]
             index = repair_plan.get("target_out_index", repair_plan.get("message_index"))
+            end_index = repair_plan.get("target_end_out_index", index)
             if index is None or not 0 <= index < len(messages):
                 raise BackendError(
                     "repair_failed",
                     f"repair plan target index {index!r} out of range")
             if placement == "in_place":
-                # the raw span REPLACES the target doc's gist: the message
-                # becomes repair-only (no gist), the server re-anchors the
-                # query to the span's absolute end
+                # The raw span replaces every gist in the selected contiguous
+                # window.  Keep one carrier at the first position and remove
+                # the remaining gist carriers, otherwise W2 would leave the
+                # second document represented twice.
+                if (not isinstance(end_index, int) or end_index < index
+                        or end_index >= len(messages)):
+                    raise BackendError(
+                        "repair_failed",
+                        f"repair plan end index {end_index!r} out of range")
                 message = dict(messages[index])
                 if not message.get("c2kv_key_hash"):
                     raise BackendError(
@@ -633,6 +687,9 @@ class SglangBackend(Backend):
                 message["c2kv_repair_only_key_hashes"] = [key_hash]
                 message["c2kv_repair_placement"] = placement
                 messages[index] = message
+                for remove_index in range(end_index, index, -1):
+                    if messages[remove_index].get("c2kv_key_hash"):
+                        del messages[remove_index]
             elif placement in ("append_keep_ledger", "append_tail"):
                 # the raw span is appended to the end of history (after all
                 # gists and the raw hybrid tail, before the current turn) as a
@@ -682,6 +739,15 @@ class SglangBackend(Backend):
             "history_kv_span_tokens": report.get("history_kv_requested_span_tokens"),
             "history_kv_selected_tokens": report.get("history_kv_selected_token_count"),
             "history_kv_selection": report.get("history_selection_metadata"),
+            "history_kv_recovery_mode": report.get("history_kv_recovery_mode"),
+            "history_kv_recovery_window": report.get("history_kv_recovery_window"),
+            "history_kv_restored_raw_tokens": report.get("history_kv_restored_raw_tokens"),
+            "history_kv_before_recovery_active_tokens": report.get(
+                "history_kv_before_recovery_active_tokens"),
+            "history_kv_after_recovery_active_tokens": report.get(
+                "history_kv_after_recovery_active_tokens"),
+            "history_kv_recovered_segment_size": report.get(
+                "history_kv_recovered_segment_size"),
             # physical path (measured by PhysicalHistoryKVEvictor)
             "history_kv_eviction_ok": physical.get("success"),
             "history_kv_eviction_error": physical.get("error") or None,

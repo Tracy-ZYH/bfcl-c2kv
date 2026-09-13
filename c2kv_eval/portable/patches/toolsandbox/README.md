@@ -33,7 +33,7 @@ that existed nowhere in this repository):
   agent+user joint degradation. `c2kv_eval/portable/run.py` exports the raw
   upstream endpoint here (`--user-upstream`).
 
-From a pristine copy of the tested imported tree, both patches pass plain
+From a pristine copy of the tested imported tree, all patches pass plain
 `git apply --check` and sequential application; no whitespace-relaxation
 option is required.
 
@@ -43,6 +43,8 @@ git apply --check /path/to/bfcl-c2kv/c2kv_eval/portable/patches/toolsandbox/0002
 
 git apply /path/to/bfcl-c2kv/c2kv_eval/portable/patches/toolsandbox/0001-openai-base-url-env.patch
 git apply /path/to/bfcl-c2kv/c2kv_eval/portable/patches/toolsandbox/0002-empty-tool-calls.patch
+git apply /path/to/bfcl-c2kv/c2kv_eval/portable/patches/toolsandbox/0003-text-end-conversation.patch
+git apply /path/to/bfcl-c2kv/c2kv_eval/portable/patches/toolsandbox/0004-qwen-tool-result-name.patch
 ```
 
 Apply `0002-empty-tool-calls.patch` as well. OpenAI-compatible servers may
@@ -50,6 +52,21 @@ return `tool_calls: []` for a normal text reply. Both roles must treat that
 like `null`: upstream otherwise appends no messages, so its message-count
 limit never advances and the scenario loops indefinitely. The patch changes
 only this response-shape normalization; prompts and scoring remain unchanged.
+
+Apply `0003-text-end-conversation.patch` for OpenAI-compatible servers that
+occasionally render the user-only stop tool as the literal text
+`end_conversation` instead of a structured tool call. The normalization is
+deliberately limited to the exact tool name (with optional `()`); arbitrary
+natural-language stop requests are not rewritten.
+
+Apply `0004-qwen-tool-result-name.patch` when serving Qwen with its bundled
+chat template, and set `TOOLSANDBOX_QWEN_TOOL_RESULT_COMPAT=1`.  That
+template renders a tool message's content but ignores its OpenAI `name`
+field.  The compatibility layer therefore prefixes the content with the
+function name, preventing opaque values such as a successful messaging UUID
+from being misread as a contact/person ID.  It changes only the model-facing
+serialization; ToolSandbox execution, state and official scoring are not
+modified.  The behavior is opt-in and is disabled for other model families.
 
 TS test-mode's "n=3" is ONE base scenario (`send_message_with_contact_
 content_cellular_off`) plus two perturbations (distractor tools / scrambled

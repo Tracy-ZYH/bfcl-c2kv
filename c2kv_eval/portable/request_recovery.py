@@ -28,6 +28,7 @@ _CONTROL_KEYS = {
     "selector",
     "target_values",
     "target_index",
+    "window",
 }
 _PLACEMENTS = {
     "append": "append_keep_ledger",
@@ -45,6 +46,8 @@ class RequestRecoveryPlan:
     selector: str
     selected_index: Optional[int]
     selected_out_index: Optional[int]
+    selected_indices: tuple[int, ...]
+    selected_out_indices: tuple[int, ...]
     placement: Optional[str]
     candidate_count: int
     raw_regenerate: bool = False
@@ -63,6 +66,8 @@ class RequestRecoveryPlan:
             "selector": self.selector,
             "selected_index": self.selected_index,
             "selected_out_index": self.selected_out_index,
+            "selected_indices": list(self.selected_indices),
+            "selected_out_indices": list(self.selected_out_indices),
             "placement": self.placement,
             "candidate_count": self.candidate_count,
             "raw_regenerate": self.raw_regenerate,
@@ -81,7 +86,7 @@ def split_recovery_control(
     return wire_payload, control
 
 
-def _validated_control(control: Mapping[str, Any]) -> tuple[str, bool, str, Sequence[str], Optional[int]]:
+def _validated_control(control: Mapping[str, Any]) -> tuple[str, bool, str, Sequence[str], Optional[int], int]:
     if not isinstance(control, Mapping):
         raise TypeError("recovery control must be a mapping")
     unknown = set(control) - _CONTROL_KEYS
@@ -105,13 +110,18 @@ def _validated_control(control: Mapping[str, Any]) -> tuple[str, bool, str, Sequ
 
     has_values = "target_values" in control
     has_index = "target_index" in control
+    window = control.get("window", 1)
+    if isinstance(window, bool) or not isinstance(window, int) or window < 1:
+        raise ValueError("recovery control 'window' must be an integer >= 1")
     target_values: Sequence[str] = ()
     target_index: Optional[int] = None
 
     if operation == "retry_full":
         if selector != "first" or has_values or has_index:
             raise ValueError("retry_full does not accept a target selector or target fields")
-        return operation, triggered, selector, target_values, target_index
+        if window != 1:
+            raise ValueError("retry_full does not accept 'window'")
+        return operation, triggered, selector, target_values, target_index, window
 
     if selector == "witness":
         if not has_values:
@@ -134,7 +144,7 @@ def _validated_control(control: Mapping[str, Any]) -> tuple[str, bool, str, Sequ
     elif has_values or has_index:
         raise ValueError("first selector does not accept target fields")
 
-    return operation, triggered, selector, target_values, target_index
+    return operation, triggered, selector, target_values, target_index, window
 
 
 def _selected_out_index(record: Mapping[str, Any], selected_index: int) -> int:
@@ -155,7 +165,7 @@ def plan_request_recovery(
 ) -> RequestRecoveryPlan:
     """Validate a private control and select at most one compressed record."""
 
-    operation, triggered, selector, target_values, target_index = _validated_control(control)
+    operation, triggered, selector, target_values, target_index, window = _validated_control(control)
     if isinstance(compressed_records, (str, bytes)) or not isinstance(
         compressed_records, Sequence
     ):
@@ -168,6 +178,8 @@ def plan_request_recovery(
         *,
         selected_index: Optional[int] = None,
         selected_out_index: Optional[int] = None,
+        selected_indices: tuple[int, ...] = (),
+        selected_out_indices: tuple[int, ...] = (),
         raw_regenerate: bool = False,
     ) -> RequestRecoveryPlan:
         return RequestRecoveryPlan(
@@ -177,6 +189,8 @@ def plan_request_recovery(
             selector=selector,
             selected_index=selected_index,
             selected_out_index=selected_out_index,
+            selected_indices=selected_indices,
+            selected_out_indices=selected_out_indices,
             placement=placement,
             candidate_count=candidate_count,
             raw_regenerate=raw_regenerate,
@@ -216,13 +230,19 @@ def plan_request_recovery(
             return decision("no_literal_witness")
         selected_index = witness_index
 
-    selected_out_index = _selected_out_index(
-        compressed_records[selected_index], selected_index
+    stop = min(candidate_count, selected_index + window)
+    selected_indices = tuple(range(selected_index, stop))
+    selected_out_indices = tuple(
+        _selected_out_index(compressed_records[index], index)
+        for index in selected_indices
     )
+    selected_out_index = selected_out_indices[0]
     return decision(
         "selected",
         selected_index=selected_index,
         selected_out_index=selected_out_index,
+        selected_indices=selected_indices,
+        selected_out_indices=selected_out_indices,
     )
 
 
@@ -234,21 +254,48 @@ def apply_recovery_plan_to_arm(arm: Any, plan: RequestRecoveryPlan) -> Any:
     if not plan.selected or plan.operation not in _PLACEMENTS:
         raise ValueError("only a selected append/replace plan can derive a repair arm")
     assert plan.selected_index is not None and plan.placement is not None
+    repair = {
+        "policy": f"offset:{plan.selected_index}",
+        "placement": plan.placement,
+    }
+    if len(plan.selected_indices) > 1:
+        repair["window"] = len(plan.selected_indices)
     return replace(
         arm,
-        repair={
-            "policy": f"offset:{plan.selected_index}",
-            "placement": plan.placement,
-        },
+        repair=repair,
         recover=None,
         gold_recovery=None,
     )
+
+
+def apply_history_recovery_to_arm(arm: Any, plan: RequestRecoveryPlan) -> Any:
+    """Derive a one-request token-eviction recovery arm.
+
+    The server receives exact source-token indices for the selected W-window
+    and unions only missing raw tokens with the retained common-index cache.
+    Headwise H2O/SnapKV are rejected by ``history_kv_spec`` because a dense
+    shared slot cannot represent a different dedup mask for every KV head.
+    """
+    if not isinstance(plan, RequestRecoveryPlan):
+        raise TypeError("plan must be a RequestRecoveryPlan")
+    if plan.operation not in {"append", "replace"} or not plan.triggered:
+        raise ValueError("history recovery needs a triggered append/replace plan")
+    config = dict(getattr(arm, "history_kv", None) or {})
+    if not config:
+        raise ValueError("history recovery requires a history_kv arm")
+    config.update({
+        "recovery_mode": plan.operation,
+        "recovery_window": len(plan.selected_indices) or 1,
+        "recovery_start_doc": int(plan.selected_index or 0),
+    })
+    return replace(arm, history_kv=config)
 
 
 __all__ = [
     "RECOVERY_CONTROL_FIELD",
     "RequestRecoveryPlan",
     "apply_recovery_plan_to_arm",
+    "apply_history_recovery_to_arm",
     "plan_request_recovery",
     "split_recovery_control",
 ]

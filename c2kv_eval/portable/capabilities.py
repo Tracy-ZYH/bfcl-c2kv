@@ -234,6 +234,12 @@ def _benchmark_prerequisites(result: PreflightResult, benchmark: str,
                 "if not openai_response_message.tool_calls:",
                 "apply c2kv_eval/portable/patches/toolsandbox/0002-empty-tool-calls.patch",
             )
+        _append_marker(
+            result, "toolsandbox_user_text_end_conversation_patch",
+            root / "tool_sandbox" / "roles" / "openai_api_user.py",
+            "def _plain_end_conversation(content: str) -> bool:",
+            "apply c2kv_eval/portable/patches/toolsandbox/0003-text-end-conversation.patch",
+        )
         return
 
     if benchmark in {"acon_qa", "acon_appworld"}:

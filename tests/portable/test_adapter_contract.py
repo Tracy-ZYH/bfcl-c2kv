@@ -73,7 +73,7 @@ def test_add_arguments_registers_only_that_adapters_flags():
     import argparse
 
     owned = {
-        tau2_adapter: {"--tau2-dir", "--task-set", "--tau2-num-trials",
+        tau2_adapter: {"--tau2-dir", "--task-set", "--tau2-task-ids", "--tau2-num-trials",
                        "--tau2-max-steps", "--tau2-timeout"},
         bfcl_adapter: {
             "--bfcl-dir", "--categories", "--run-ids",
@@ -129,6 +129,21 @@ def test_tau2_run_command_forwards_bounded_smoke_knobs():
     for flag, value in (("--num-tasks", "1"), ("--num-trials", "1"),
                         ("--max-steps", "12"), ("--timeout", "300")):
         assert cmd[cmd.index(flag) + 1] == value
+
+
+def test_tau2_run_command_forwards_exact_task_ids():
+    cmd = tau2_adapter.run_command(
+        "http://p", "http://u", "airline", "m", 1, "fixed",
+        task_ids=["0", "3"], python="/py")
+    index = cmd.index("--task-ids")
+    assert cmd[index:index + 3] == ["--task-ids", "0", "3"]
+
+
+def test_tau2_harness_env_prefers_selected_checkout(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "/old/editable")
+    env = tau2_adapter.harness_env(tmp_path)
+    assert env["PYTHONPATH"].split(":") == [str(tmp_path.resolve() / "src"),
+                                               "/old/editable"]
 
 
 def test_tau2_evaluate_command_is_byte_identical(tmp_path):
@@ -249,6 +264,66 @@ def test_toolsandbox_collect_rejects_an_unexpected_scenario(tmp_path):
     }]}), encoding="utf-8")
     with pytest.raises(SystemExit, match="unexpected=unexpected"):
         toolsandbox_adapter.collect(tmp_path, expected_task_ids=["present"])
+
+
+def test_toolsandbox_collect_preserves_native_metrics(tmp_path):
+    path = tmp_path / "agent_mock" / "result_summary.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"per_scenario_results": [{
+        "name": "a", "traceback": None, "similarity": 0.75,
+        "milestone_similarity": 0.5, "minefield_similarity": 1.0,
+        "turn_count": 4,
+    }]}), encoding="utf-8")
+    trajectory = path.parent / "trajectories" / "a"
+    trajectory.mkdir(parents=True)
+    (trajectory / "execution_context.json").write_text(json.dumps({
+        "_dbs": {"SANDBOX": [
+            {"sandbox_message_index": 1, "conversation_active": True},
+            {"sandbox_message_index": 2, "sender": "EXECUTION_ENVIRONMENT",
+             "recipient": "AGENT", "openai_tool_call_id": "call_ok",
+             "conversation_active": False, "tool_trace": ["ok"],
+             "tool_call_exception": None},
+        ]}
+    }), encoding="utf-8")
+    summary = toolsandbox_adapter.collect(tmp_path, expected_task_ids=["a"])
+    assert summary["milestone_similarity_mean"] == 0.5
+    assert summary["minefield_similarity_mean"] == 1.0
+    assert summary["turn_count_mean"] == 4.0
+    assert summary["task_rows"][0]["task_id"] == "a"
+    assert summary["task_rows"][0]["normal_termination"] is True
+    assert summary["normal_termination_rate"] == 1.0
+    assert summary["premature_termination_count"] == 0
+    assert summary["tool_execution_count"] == 1
+    assert summary["tool_execution_failure_count"] == 0
+    assert summary["tool_execution_success_rate"] == 1.0
+
+
+def test_toolsandbox_tool_failures_without_trace_are_counted(tmp_path):
+    path = tmp_path / "agent_mock" / "result_summary.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"per_scenario_results": [{
+        "name": "a", "traceback": None, "similarity": 0.5,
+        "milestone_similarity": 0.5, "minefield_similarity": 0.0,
+        "turn_count": 2,
+    }]}), encoding="utf-8")
+    trajectory = path.parent / "trajectories" / "a"
+    trajectory.mkdir(parents=True)
+    (trajectory / "execution_context.json").write_text(json.dumps({
+        "_dbs": {"SANDBOX": [
+            {"sandbox_message_index": 1, "sender": "EXECUTION_ENVIRONMENT",
+             "recipient": "AGENT", "openai_tool_call_id": "call_failed",
+             "conversation_active": True, "tool_trace": None,
+             "tool_call_exception": "ConnectionError"},
+            {"sandbox_message_index": 2, "sender": "EXECUTION_ENVIRONMENT",
+             "recipient": "AGENT", "openai_tool_call_id": "call_ok",
+             "conversation_active": False, "tool_trace": ["ok"],
+             "tool_call_exception": None},
+        ]}
+    }), encoding="utf-8")
+    summary = toolsandbox_adapter.collect(tmp_path, expected_task_ids=["a"])
+    assert summary["tool_execution_count"] == 2
+    assert summary["tool_execution_failure_count"] == 1
+    assert summary["tool_execution_success_rate"] == 0.5
 
 
 # ---- acon: `run.py` / `run_all.py` / `appworld evaluate` --------------------

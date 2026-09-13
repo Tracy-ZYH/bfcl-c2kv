@@ -226,13 +226,19 @@ def build_step_record(
     reference_has_action = bool(
         reference_action and not is_empty_execute_response(reference_action)
     )
-    candidate_matches = (
-        False
-        if candidate_status in {"decode_error", "invalid_format"}
-        and reference_has_action
-        else action_matches(candidate_action, reference_action or [])
-    )
-    executed_matches = action_matches(executed_action, reference_action or [])
+    # A missing trajectory reference is not an empty-action reference.  The
+    # old fallback marked every tool-bearing Full step as drift, which made a
+    # reference-free Full run appear to have large self-drift.
+    candidate_matches = None
+    executed_matches = None
+    if reference_step is not None:
+        candidate_matches = (
+            False
+            if candidate_status in {"decode_error", "invalid_format"}
+            and reference_has_action
+            else action_matches(candidate_action, reference_action or [])
+        )
+        executed_matches = action_matches(executed_action, reference_action or [])
     state_match = state_matches(state, reference_state)
     tool_name, arguments = _first_tool_call(candidate_action)
     record = {
@@ -256,10 +262,14 @@ def build_step_record(
         "reference_action": reference_action,
         "reference_has_action": reference_has_action,
         "candidate_action_matches_reference": candidate_matches,
-        "candidate_action_drift": not candidate_matches,
+        "candidate_action_drift": (
+            None if candidate_matches is None else not candidate_matches
+        ),
         "executed_action": list(executed_action or []),
         "executed_action_matches_reference": executed_matches,
-        "executed_action_drift": not executed_matches,
+        "executed_action_drift": (
+            None if executed_matches is None else not executed_matches
+        ),
         "state": state,
         "reference_state": reference_state,
         "state_matches_reference": state_match,

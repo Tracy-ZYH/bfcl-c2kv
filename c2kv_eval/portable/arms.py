@@ -66,6 +66,11 @@ HISTORY_KV_DEFAULTS: Dict[str, Any] = {
     "pooling": "avgpool",         # --history-kv-pooling
     "h2o_recent_fraction": 0.5,   # --history-kv-h2o-recent-fraction
     "persistent_session": False,  # --persistent-history-kv-session
+    # Controlled compression-agnostic recovery ablation.  The proxy derives
+    # this only for the retry request; the baseline arm remains unchanged.
+    "recovery_mode": None,         # replace | append (deduplicated)
+    "recovery_window": 1,          # contiguous history docs, W2 => 2
+    "recovery_start_doc": 0,
 }
 
 
@@ -129,6 +134,19 @@ def history_kv_spec(arm: "Arm") -> Optional[Dict[str, Any]]:
             f"arm {arm.name!r}: history_kv backend 'physical_eviction' needs an "
             "absolute target_tokens (the server has no retention_ratio on that "
             "path and the proxy has no tokenizer)")
+    recovery_mode = spec.get("recovery_mode")
+    if recovery_mode not in (None, "replace", "append"):
+        raise ValueError(
+            f"arm {arm.name!r}: history_kv recovery_mode must be replace or append")
+    if int(spec.get("recovery_window") or 0) < 1:
+        raise ValueError(f"arm {arm.name!r}: recovery_window must be >= 1")
+    if int(spec.get("recovery_start_doc") or 0) < 0:
+        raise ValueError(f"arm {arm.name!r}: recovery_start_doc must be >= 0")
+    if recovery_mode and method in {"h2o", "snapkv_persistent"}:
+        raise ValueError(
+            f"arm {arm.name!r}: exact deduplicated recovery is unavailable for "
+            f"headwise {method}; the current dense shared-slot entry does not "
+            "retain one common source-token set")
     if spec["persistent_session"] and backend != "physical_eviction":
         raise ValueError(
             f"arm {arm.name!r}: history_kv persistent_session requires backend "
@@ -611,13 +629,24 @@ ARMS: Dict[str, Arm] = {
 
 # Explicit nominal history budgets; keep historical r312 arms unchanged.
 for _method in ("h2o", "snapkv_persistent", "streamingllm", "pyramidkv"):
-    for _suffix, _retention in (("r250", 0.25), ("r125", 0.125)):
+    for _suffix, _retention in (("r25", 0.25), ("r125", 0.125)):
         _name = f"history_kv_{_method}_{_suffix}"
         ARMS[_name] = Arm(
             name=_name, compress_history=False,
             history_kv={"method": _method, "retention_ratio": _retention},
             description=f"{_method} history KV at retention {_retention}; selection provenance must be read from server metadata",
         )
+
+# Compatibility aliases for the briefly-used per-mille spelling.  New output
+# and manifests use r25, whose meaning is unambiguously 25% retention.
+for _method in ("h2o", "snapkv_persistent", "streamingllm", "pyramidkv"):
+    _canonical = f"history_kv_{_method}_r25"
+    _alias = f"history_kv_{_method}_r250"
+    ARMS[_alias] = Arm(
+        name=_alias, compress_history=False,
+        history_kv={"method": _method, "retention_ratio": 0.25},
+        description=f"Compatibility alias of {_canonical}",
+    )
 
 
 def get_arm(name: str) -> Arm:

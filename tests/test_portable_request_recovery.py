@@ -148,6 +148,19 @@ def test_selected_operation_derives_exact_repair_placement(
     assert derived.gold_recovery is None
 
 
+def test_w2_selects_two_contiguous_records_and_marks_repair_window() -> None:
+    plan = plan_request_recovery(
+        {"operation": "replace", "triggered": True, "window": 2},
+        _records("zero", "one", "two"),
+    )
+    derived = apply_recovery_plan_to_arm(_Arm(), plan)
+
+    assert plan.selected_indices == (0, 1)
+    assert plan.selected_out_indices == (3, 4)
+    assert derived.repair == {
+        "policy": "offset:0", "placement": "in_place", "window": 2}
+
+
 def test_retry_full_requests_raw_regeneration_without_a_repair_target() -> None:
     plan = plan_request_recovery(
         {"operation": "retry_full", "triggered": True},

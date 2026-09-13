@@ -1,0 +1,43 @@
+diff --git a/tool_sandbox/roles/openai_api_user.py b/tool_sandbox/roles/openai_api_user.py
+--- a/tool_sandbox/roles/openai_api_user.py
++++ b/tool_sandbox/roles/openai_api_user.py
+@@ -26,4 +26,10 @@ from tool_sandbox.roles.base_role import BaseRole
+ LOGGER = getLogger(__name__)
+ 
+ 
++def _plain_end_conversation(content: str) -> bool:
++    """Normalize only a literal text rendering of the user-only stop tool."""
++    normalized = content.strip().strip("`").strip().lower()
++    return normalized in {"end_conversation", "end_conversation()"}
++
++
+ class OpenAIAPIUser(BaseRole):
+@@ -100,13 +106,21 @@ class OpenAIAPIUser(BaseRole):
+             # Not sure why the content field `ChatCompletionMessage` has a type of
+             # `str | None`.
+             assert openai_response_message.content is not None
+-            response_messages = [
+-                Message(
+-                    sender=self.role_type,
+-                    recipient=RoleType.AGENT,
+-                    content=openai_response_message.content,
+-                )
+-            ]
++            if ("end_conversation" in available_tool_names
++                    and _plain_end_conversation(openai_response_message.content)):
++                response_messages = [Message(
++                    sender=self.role_type,
++                    recipient=RoleType.EXECUTION_ENVIRONMENT,
++                    content="end_conversation()",
++                )]
++            else:
++                response_messages = [
++                    Message(
++                        sender=self.role_type,
++                        recipient=RoleType.AGENT,
++                        content=openai_response_message.content,
++                    )
++                ]
+         else:
+             assert openai_tools is not NOT_GIVEN
+             for tool_call in openai_response_message.tool_calls:

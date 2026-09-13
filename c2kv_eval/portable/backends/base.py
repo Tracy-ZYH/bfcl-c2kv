@@ -67,10 +67,12 @@ class Backend:
     def repair_extract_messages(self, messages: List[Dict[str, Any]],
                                 target_index: int,
                                 tools: Optional[List[Dict[str, Any]]],
-                                source_doc_index: int) -> Dict[str, Any]:
+                                source_doc_index: int,
+                                target_end_index: Optional[int] = None) -> Dict[str, Any]:
         """FULL-CONTEXT form: the backend renders ``messages[:target_index+1]``
         like a chat request (with ``tools``) and stores the raw KV of message
-        ``target_index`` computed inside that context.  Returns the entry
+        ``target_index`` (or the inclusive range through ``target_end_index``)
+        computed inside that context.  Returns the entry
         record: key_hash, token_len, position_start, position_end,
         already_rotated."""
         raise NotImplementedError

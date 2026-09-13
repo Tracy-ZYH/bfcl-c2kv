@@ -100,6 +100,8 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "wall_p50": _pct(walls, 0.50),
         "wall_p90": _pct(walls, 0.90),
         "gist_tokens_total": gist,
+        "gist_tokens_mean": _mean(
+            r.get("gist_tokens") for r in ok if (r.get("gist_tokens") or 0) > 0),
         "original_tokens_total": original,
         "logical_over_gist": round(original / gist, 3) if gist else None,
         "kv_resident_p50": _pct([float(v) for v in kv], 0.50),
@@ -118,13 +120,99 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     summary["recovery_extract_sec_total"] = sum(float(r.get("recovery_extract_sec") or 0) for r in recovery)
     summary["recovery_events"] = len({tuple(r["event_id"]) for r in recovery
                                      if r.get("status") == "appended" and r.get("event_id")})
-    tensor_rows = [r["history_tensor_accounting"] for r in ok
-                   if isinstance(r.get("history_tensor_accounting"), dict)]
+    # Portable request-local retry is separate from BFCL gold recovery.  A
+    # successful retry means the second generation returned normally; it
+    # does not claim that an external tool/environment transaction rolled
+    # back or that task correctness improved.
+    request_recovery = [
+        r["request_recovery"] for r in ok
+        if isinstance(r.get("request_recovery"), dict)
+    ]
+    request_recovery_triggered = [
+        item for item in request_recovery if item.get("triggered") is True
+    ]
+    request_recovery_retried = [
+        item for item in request_recovery_triggered
+        if item.get("status") == "retried"
+    ]
+    summary["request_recovery_status_counts"] = dict(Counter(
+        str(item.get("status")) for item in request_recovery))
+    summary["request_recovery_trigger_rate"] = (
+        len(request_recovery_triggered) / len(ok) if ok else None)
+    summary["request_recovery_success_rate"] = (
+        len(request_recovery_retried) / len(request_recovery_triggered)
+        if request_recovery_triggered else None)
+    summary["request_recovery_applied_rate"] = (
+        len(request_recovery_retried) / len(ok) if ok else None)
+    summary["before_recovery_active_tokens_mean"] = _mean(
+        item.get("before_recovery_active_tokens")
+        for item in request_recovery_retried)
+    summary["after_recovery_active_tokens_mean"] = _mean(
+        item.get("after_recovery_active_tokens")
+        for item in request_recovery_retried)
+    summary["recovered_segment_size_mean"] = _mean(
+        item.get("recovered_segment_size") for item in request_recovery_retried)
+    summary["restored_raw_kv_tokens_mean"] = _mean(
+        item.get("restored_raw_kv_tokens") for item in request_recovery_retried)
+    summary["duplicate_raw_kv_tokens_total"] = sum(
+        int(item.get("duplicate_raw_kv_tokens") or 0)
+        for item in request_recovery_retried)
+    summary["request_recovery_scope"] = (
+        "request-local generation/KV retry; no external environment rollback")
+    summary["model_calls_per_proxy_request"] = (
+        sum(int((r.get("request_recovery") or {}).get("generation_attempts") or 1)
+            for r in ok) / len(ok) if ok else None)
+
+    # These scheduler fields also exist on C2KV requests for legacy
+    # accounting, where ``history_kv_full_equivalent_tokens`` can describe
+    # only the first injected document while active tokens are cumulative.
+    # Combining those values produced impossible retention > 1.  Restrict
+    # this metric to the explicit history-KV arms; C2KV uses the independent
+    # logical/gist and tensor-accounting metrics below.
+    history_rows = [
+        r for r in ok
+        if isinstance(r.get("history_kv"), dict)
+        and isinstance(r.get("history_kv_active_tokens"), (int, float))
+    ]
+    summary["history_kv_active_tokens_mean"] = _mean(
+        r.get("history_kv_active_tokens") for r in history_rows)
+    history_retention = [
+        float(r["history_kv_active_tokens"]) /
+        float(r["history_kv_full_equivalent_tokens"])
+        for r in history_rows
+        if isinstance(r.get("history_kv_full_equivalent_tokens"), (int, float))
+        and float(r["history_kv_full_equivalent_tokens"]) > 0
+    ]
+    summary["history_kv_retention_mean"] = _mean(history_retention)
+    summary["history_kv_compression_mean"] = _mean(
+        1.0 / value for value in history_retention if value > 0)
+    tensor_request_rows = [
+        r for r in ok if isinstance(r.get("history_tensor_accounting"), dict)
+    ]
+    tensor_rows = [r["history_tensor_accounting"] for r in tensor_request_rows]
     if tensor_rows:
         summary["history_tensor_accounting"] = {
             "n_requests": len(tensor_rows),
             "before_recovery_bytes_mean": _mean(r.get("before_recovery_bytes") for r in tensor_rows),
             "after_recovery_bytes_mean": _mean(r.get("after_recovery_bytes") for r in tensor_rows),
+            "before_recovery_tokens_mean": _mean(
+                r["history_tensor_accounting"].get("before_recovery_bytes")
+                / r.get("bytes_per_kv_token")
+                for r in tensor_request_rows
+                if isinstance(r.get("bytes_per_kv_token"), (int, float))
+                and r.get("bytes_per_kv_token") > 0
+                and isinstance(r["history_tensor_accounting"].get(
+                    "before_recovery_bytes"), (int, float))
+            ),
+            "after_recovery_tokens_mean": _mean(
+                r["history_tensor_accounting"].get("after_recovery_bytes")
+                / r.get("bytes_per_kv_token")
+                for r in tensor_request_rows
+                if isinstance(r.get("bytes_per_kv_token"), (int, float))
+                and r.get("bytes_per_kv_token") > 0
+                and isinstance(r["history_tensor_accounting"].get(
+                    "after_recovery_bytes"), (int, float))
+            ),
             "history_ratio_before_mean": _mean(r.get("history_ratio_before") for r in tensor_rows),
             "history_ratio_after_mean": _mean(r.get("history_ratio_after") for r in tensor_rows),
             "scope": tensor_rows[0]["scope"],

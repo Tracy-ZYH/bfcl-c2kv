@@ -35,8 +35,12 @@ CANDIDATE_HIDDEN_READOUT="${CANDIDATE_HIDDEN_READOUT:-0}"
 CANDIDATE_ATTENTION_SUMMARY="${CANDIDATE_ATTENTION_SUMMARY:-0}"
 DEVICE="${DEVICE:-3}"
 PORT="${PORT:-33400}"
-IDS_PATH="${IDS_PATH:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_closed_loop_multi_turn_base_200/correct_ids.txt}"
-REFERENCE_DETAILS="${REFERENCE_DETAILS:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_closed_loop_multi_turn_base_200/history_full_closed_loop/logs/details.jsonl}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.55}"
+C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION:-0.06}"
+# An explicitly empty value means "all category episodes" / "no reference".
+# Use '-' rather than ':-' so nested launchers do not reactivate legacy paths.
+IDS_PATH="${IDS_PATH-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_closed_loop_multi_turn_base_200/correct_ids.txt}"
+REFERENCE_DETAILS="${REFERENCE_DETAILS-/home/zhuyuhan/project/gorilla/bfcl_runs/history_full_closed_loop_multi_turn_base_200/history_full_closed_loop/logs/details.jsonl}"
 if [ "${IDS_PATH}" = "__NONE__" ]; then
   IDS_PATH=""
 fi
@@ -45,6 +49,11 @@ if [ "${REFERENCE_DETAILS}" = "__NONE__" ]; then
 fi
 RUN_ROOT="${RUN_ROOT:-/home/zhuyuhan/project/gorilla/bfcl_runs/history_multistep_checkpoint_full_success_54}"
 CLEAN_OUTPUT="${CLEAN_OUTPUT:-1}"
+RESUME="${RESUME:-0}"
+LOG_SUFFIX="${LOG_SUFFIX:-}"
+if [[ -z "${LOG_SUFFIX}" && ( "${RESUME}" == "1" || "${RESUME}" == "true" ) ]]; then
+  LOG_SUFFIX="_resume_$(date '+%Y%m%d_%H%M%S')"
+fi
 MODE="${MODE:-multistep_i${CHECKPOINT_INTERVAL}_${VERIFIER}_${RECOVERY_MODE}}"
 RUN_COMPARE="${RUN_COMPARE:-1}"
 
@@ -117,7 +126,7 @@ PY
 }
 
 start_server() {
-  local log="${RUN_ROOT}/${MODE}/logs/server_${DEVICE}_${PORT}.log"
+  local log="${RUN_ROOT}/${MODE}/logs/server_${DEVICE}_${PORT}${LOG_SUFFIX}.log"
   local hicache_args=()
   if [[ "${ENABLE_HICACHE}" == "1" || "${ENABLE_HICACHE}" == "true" || ( "${ENABLE_HICACHE}" == "auto" && ( "${ROLLBACK_BACKEND}" == "kv_restore" || "${ROLLBACK_BACKEND}" == "kv_restore_strict" ) ) ]]; then
     hicache_args+=(--enable-hierarchical-cache --hicache-ratio "${HICACHE_RATIO}")
@@ -144,8 +153,9 @@ start_server() {
       --attention-backend ascend \
       --tool-call-parser qwen25 \
       --enable-c2kv \
+      --c2kv-pool-fraction "${C2KV_POOL_FRACTION}" \
       --dtype bfloat16 \
-      --mem-fraction-static 0.55 \
+      --mem-fraction-static "${MEM_FRACTION_STATIC}" \
       --enable-cache-report \
       "${hicache_args[@]}" \
       --host 127.0.0.1 \
@@ -161,7 +171,7 @@ wait_health() {
   for attempt in $(seq 1 900); do
     if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
       log_info "[server] crashed; last log:"
-      tail -n 120 "${RUN_ROOT}/${MODE}/logs/server_"*"_${PORT}.log" || true
+      tail -n 120 "${RUN_ROOT}/${MODE}/logs/server_"*"_${PORT}"*.log || true
       return 1
     fi
     if curl --noproxy '*' -fsS "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
@@ -174,12 +184,16 @@ wait_health() {
     sleep 2
   done
   log_info "[server] health check timed out"
-  tail -n 120 "${RUN_ROOT}/${MODE}/logs/server_"*"_${PORT}.log" || true
+  tail -n 120 "${RUN_ROOT}/${MODE}/logs/server_"*"_${PORT}"*.log || true
   return 1
 }
 
 run_eval() {
   local detector_signal_args=()
+  local resume_args=()
+  if [[ "${RESUME}" == "1" || "${RESUME}" == "true" ]]; then
+    resume_args+=(--resume)
+  fi
   if [[ "${COLLECT_CANDIDATE_DETECTOR_SIGNALS}" == "1" || "${COLLECT_CANDIDATE_DETECTOR_SIGNALS}" == "true" ]]; then
     detector_signal_args+=(--collect-candidate-detector-signals)
   fi
@@ -221,8 +235,9 @@ run_eval() {
       --rollback-depth "${ROLLBACK_DEPTH}" \
       --rollback-backend "${ROLLBACK_BACKEND}" \
       --candidate-logprobs-top-k "${CANDIDATE_LOGPROBS_TOP_K}" \
+      "${resume_args[@]}" \
       "${detector_signal_args[@]}"
-  ) > "${RUN_ROOT}/${MODE}/logs/run.log" 2>&1
+  ) > "${RUN_ROOT}/${MODE}/logs/run${LOG_SUFFIX}.log" 2>&1
   log_info "[runner:${MODE}] done"
 }
 
@@ -235,7 +250,7 @@ evaluate_mode() {
       --result-dir "${RUN_ROOT}/${MODE}/result" \
       --score-dir "${RUN_ROOT}/${MODE}/score" \
       --partial-eval
-  ) > "${RUN_ROOT}/${MODE}/logs/eval.log" 2>&1
+  ) > "${RUN_ROOT}/${MODE}/logs/eval${LOG_SUFFIX}.log" 2>&1
   log_info "[eval:${MODE}] done"
 }
 
@@ -248,7 +263,7 @@ compare() {
       --model "${MODEL_ID}" \
       --reference-details-path "${REFERENCE_DETAILS}" \
       --modes "${MODE}"
-  ) > "${RUN_ROOT}/${MODE}/logs/compare.log" 2>&1
+  ) > "${RUN_ROOT}/${MODE}/logs/compare${LOG_SUFFIX}.log" 2>&1
   log_info "[compare:${MODE}] done"
 }
 
@@ -266,6 +281,8 @@ log_info "COLLECT_CANDIDATE_DETECTOR_SIGNALS=${COLLECT_CANDIDATE_DETECTOR_SIGNAL
 log_info "ENABLE_HICACHE=${ENABLE_HICACHE} HICACHE_RATIO=${HICACHE_RATIO}"
 log_info "DEVICE=${DEVICE} PORT=${PORT}"
 log_info "RUN_COMPARE=${RUN_COMPARE}"
+log_info "RESUME=${RESUME}"
+log_info "LOG_SUFFIX=${LOG_SUFFIX}"
 log_info "IDS_PATH=${IDS_PATH}"
 log_info "REFERENCE_DETAILS=${REFERENCE_DETAILS}"
 

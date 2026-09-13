@@ -43,3 +43,30 @@ def test_tool_registry_instance_and_unknown_protocol(tmp_path, monkeypatch, tool
     assert result['protocol_evaluable_tasks'] == int(legal is not None)
     assert result['task_rows'][0]['n_illegal_turns'] == int(legal is False)
     assert result['task_rows'][0]['n_unknown_protocol_turns'] == int(legal is None)
+    assert result['task_rows'][0]['normal_termination'] is True
+    assert result['normal_termination_rate'] == 1.0
+    assert result['premature_termination_count'] == 0
+    assert result['official_metric_kind'] == 'binary_task_success'
+
+
+def test_tau2_collect_separates_premature_zero_from_normal_wrong_zero(
+        tmp_path, monkeypatch):
+    registry_module = ModuleType('tau2.registry')
+    registry_module.registry = SimpleNamespace(
+        get_env_constructor=lambda domain: lambda: SimpleNamespace(get_tools=lambda: []))
+    parent = ModuleType('tau2')
+    parent.__path__ = []
+    monkeypatch.setitem(sys.modules, 'tau2', parent)
+    monkeypatch.setitem(sys.modules, 'tau2.registry', registry_module)
+    path = tmp_path / 'updated_results.json'
+    path.write_text(json.dumps({'simulations': [
+        {'task_id': 'normal-wrong', 'reward_info': {'reward': 0.0},
+         'termination_reason': 'user_stop', 'messages': []},
+        {'task_id': 'premature', 'reward_info': {'reward': 0.0},
+         'termination_reason': 'max_steps', 'messages': []},
+    ]}), encoding='utf-8')
+    result = tau2_adapter.collect(path)
+    assert result['official_success_rate'] == 0.0
+    assert result['normal_termination_rate'] == 0.5
+    assert result['premature_termination_count'] == 1
+    assert result['termination_counts'] == {'user_stop': 1, 'max_steps': 1}

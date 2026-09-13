@@ -167,6 +167,49 @@ def run_ts(base_url: str, out_dir: Path, test_mode: bool = True,
     return summary
 
 
+def _execution_diagnostics(summary_path: Path, scenario_name: str) -> Dict[str, Any]:
+    """Read native terminal/tool state without changing ToolSandbox scoring."""
+    path = summary_path.parent / "trajectories" / scenario_name / "execution_context.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {
+            "conversation_active": None,
+            "normal_termination": None,
+            "tool_execution_count": None,
+            "tool_execution_failure_count": None,
+            "tool_execution_success_rate": None,
+        }
+    sandbox = ((data.get("_dbs") or {}).get("SANDBOX") or [])
+    records = [row for row in sandbox if isinstance(row, dict)]
+    terminal_rows = [row for row in records
+                     if isinstance(row.get("conversation_active"), bool)]
+    terminal = max(
+        enumerate(terminal_rows),
+        key=lambda pair: (pair[1].get("sandbox_message_index", -1), pair[0]),
+        default=(None, None),
+    )[1]
+    active = terminal.get("conversation_active") if terminal else None
+    # A failed tool call has ``tool_trace=null`` in ToolSandbox, so selecting
+    # only rows with a trace silently discarded every exception and made the
+    # success rate read 100%.  Count every agent-facing execution response;
+    # user-only ``end_conversation`` rows are addressed to USER and excluded.
+    tool_rows = [row for row in records
+                 if row.get("sender") == "EXECUTION_ENVIRONMENT"
+                 and row.get("recipient") == "AGENT"
+                 and row.get("openai_tool_call_id")]
+    tool_successes = sum(not row.get("tool_call_exception") for row in tool_rows)
+    tool_failures = len(tool_rows) - tool_successes
+    return {
+        "conversation_active": active,
+        "normal_termination": (not active) if isinstance(active, bool) else None,
+        "tool_execution_count": len(tool_rows),
+        "tool_execution_failure_count": tool_failures,
+        "tool_execution_success_rate": (
+            tool_successes / len(tool_rows) if tool_rows else None),
+    }
+
+
 def collect(out_dir: Path, expected_task_ids: "list[str] | None" = None) -> Dict[str, Any]:
     summaries = sorted(out_dir.glob("agent_*/result_summary.json"))
     if not summaries:
@@ -184,8 +227,10 @@ def collect(out_dir: Path, expected_task_ids: "list[str] | None" = None) -> Dict
                 # these None rows and the upstream recorded a silent 0
                 crashed.append(str(scenario.get("name")))
                 continue
+            task_id = str(scenario.get("name"))
+            diagnostics = _execution_diagnostics(path, task_id)
             rows.append({
-                "task_id": scenario.get("name"),
+                "task_id": task_id,
                 # official semantic column: dialogue similarity to the
                 # reference (milestone-weighted); minefield = violations
                 "semantic_score": scenario.get("similarity"),
@@ -193,6 +238,7 @@ def collect(out_dir: Path, expected_task_ids: "list[str] | None" = None) -> Dict
                 "minefield_similarity": scenario.get("minefield_similarity"),
                 "turn_count": scenario.get("turn_count"),
                 "protocol_legal": None,  # TS has no tool-call legality metric
+                **diagnostics,
             })
     if crashed:
         raise SystemExit(
@@ -211,7 +257,40 @@ def collect(out_dir: Path, expected_task_ids: "list[str] | None" = None) -> Dict
                 details.append(f"unexpected={','.join(unexpected[:20])}")
             raise SystemExit(
                 "FATAL: ts terminal-state task-id check failed: " + "; ".join(details))
-    return aggregate(rows, cluster_key="task_id")
+    summary = aggregate(rows, cluster_key="task_id")
+
+    def mean(field: str):
+        values = [float(row[field]) for row in rows
+                  if isinstance(row.get(field), (int, float))
+                  and not isinstance(row.get(field), bool)]
+        return sum(values) / len(values) if values else None
+
+    # Preserve ToolSandbox's native official metrics alongside the portable
+    # semantic column.  These were previously parsed and then discarded by
+    # the common two-column aggregator.
+    summary.update({
+        "official_metric_kind": "continuous_scenario_similarity",
+        "milestone_similarity_mean": mean("milestone_similarity"),
+        "minefield_similarity_mean": mean("minefield_similarity"),
+        "turn_count_mean": mean("turn_count"),
+        "tool_execution_success_rate": mean("tool_execution_success_rate"),
+        "tool_execution_count": sum(
+            row.get("tool_execution_count") or 0 for row in rows),
+        "tool_execution_failure_count": sum(
+            row.get("tool_execution_failure_count") or 0 for row in rows),
+        "normal_termination_rate": (
+            sum(row.get("normal_termination") is True for row in rows) / len(rows)
+            if rows else None),
+        "premature_termination_count": sum(
+            row.get("normal_termination") is not True for row in rows),
+        "termination_counts": {
+            "normal": sum(row.get("normal_termination") is True for row in rows),
+            "max_messages_or_unknown": sum(
+                row.get("normal_termination") is not True for row in rows),
+        },
+        "task_rows": rows,
+    })
+    return summary
 
 
 if __name__ == "__main__":

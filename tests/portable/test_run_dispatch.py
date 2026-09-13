@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import sys
 from pathlib import Path
 
@@ -37,8 +38,11 @@ CLI_SURFACE = [
     ("--user-upstream", "", False),
     ("--proxy-port", 34100, False),
     ("--proxy-python", None, False),
+    ("--upstream-timeout", 600, False),
+    ("--max-completion-tokens", 0, False),
     ("--out", None, True),
     ("--task-set", "airline", False),
+    ("--tau2-task-ids", "", False),
     ("--tau2-num-trials", None, False),
     ("--tau2-max-steps", None, False),
     ("--tau2-timeout", None, False),
@@ -292,6 +296,7 @@ def test_tau2_dispatch_passes_run_name_and_workers(monkeypatch, tmp_path):
     monkeypatch.setattr(tau2_adapter, "collect", lambda *a, **k: {"n": 1})
     sims = tmp_path / "data" / "simulations" / "r_ab12"
     sims.mkdir(parents=True)
+    (sims / "results.json").write_text("{}", encoding="utf-8")
     (sims / "updated_results.json").write_text("{}", encoding="utf-8")
     from c2kv_eval.portable import terminal_check
 
@@ -302,12 +307,16 @@ def test_tau2_dispatch_passes_run_name_and_workers(monkeypatch, tmp_path):
 
     monkeypatch.setattr(terminal_check, "check_tau2", fake_check_tau2)
     ctx = _ctx("tau2", task_set="mock_domain", num_workers=7, max_tasks=3,
-               tau2_dir=tmp_path)
+               tau2_dir=tmp_path, bench_python="/bench312/python",
+               tau2_task_ids="")
+    ctx.out_dir = tmp_path / "portable-out"
     summary = tau2_adapter.run(ctx)
     run_cmd = seen["cmds"][0]
     assert run_cmd[run_cmd.index("--max-concurrency") + 1] == "7"
     assert run_cmd[run_cmd.index("--save-to") + 1] == "r_ab12"
     assert run_cmd[run_cmd.index("--num-tasks") + 1] == "3"
+    assert seen["cmds"][0][0] == "/bench312/python"
+    assert seen["cmds"][1][0] == "/bench312/python"
     assert seen["terminal_kwargs"]["root"] == tmp_path / "data" / "simulations"
     assert summary["cost_join"].startswith("not joinable:")
 
@@ -379,12 +388,47 @@ def test_cli_accepts_new_benchmarks():
 
 # ---- main(): proxy lifecycle + summary envelope -----------------------------
 
+
+def test_start_proxy_rejects_a_preexisting_listener(monkeypatch, tmp_path):
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    monkeypatch.setattr(
+        run.subprocess, "Popen",
+        lambda *args, **kwargs: pytest.fail("must reject before spawning"),
+    )
+    try:
+        with pytest.raises(SystemExit, match="already in use"):
+            run.start_proxy("http://up", "full", port, tmp_path)
+    finally:
+        listener.close()
+
+
+def test_start_proxy_rejects_a_child_that_exited_before_readiness(
+        monkeypatch, tmp_path):
+    class ExitedProc:
+        def poll(self):
+            return 98
+
+    monkeypatch.setattr(run.subprocess, "Popen", lambda *a, **k: ExitedProc())
+    with pytest.raises(SystemExit, match="exited before readiness"):
+        run.start_proxy("http://up", "full", 0, tmp_path)
+
 class _FakeProc:
     def __init__(self):
         self.terminated = False
+        self.killed = False
 
     def terminate(self):
         self.terminated = True
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        self.killed = True
 
 
 def _stub_run(monkeypatch, tmp_path, summary, arm="c2kv", extra_argv=()):
@@ -438,7 +482,10 @@ def test_main_writes_the_summary_envelope(monkeypatch, tmp_path):
 
 
 def test_main_sha_suffixes_run_name_and_out(monkeypatch, tmp_path):
-    seen = _stub_run(monkeypatch, tmp_path, {"n": 0})
+    seen = _stub_run(
+        monkeypatch, tmp_path, {"n": 0},
+        extra_argv=["--upstream-timeout", "321",
+                    "--max-completion-tokens", "1024"])
     ctx = seen["ctx"]
     assert ctx.run_name == "c2kv_run_ab12cd3"
     assert ctx.out_dir == tmp_path / "outdir_ab12cd3"
@@ -449,6 +496,8 @@ def test_main_sha_suffixes_run_name_and_out(monkeypatch, tmp_path):
     assert seen["start"]["upstream"] == "http://up:35000"
     assert seen["start"]["arm"] == "c2kv" and seen["start"]["port"] == 34100
     assert seen["start"]["doc_packing"] == "turn"
+    assert seen["start"]["upstream_timeout"] == 321
+    assert seen["start"]["max_completion_tokens"] == 1024
 
 
 def test_main_text_arm_adds_textarm_summary(monkeypatch, tmp_path):

@@ -89,7 +89,8 @@ from . import repair_policy, textarms
 from .arms import Arm, get_arm, history_kv_spec, kv_reuse_spec
 from .backends import BackendError, get_backend
 from .request_recovery import (
-    apply_recovery_plan_to_arm, plan_request_recovery, split_recovery_control,
+    apply_history_recovery_to_arm, apply_recovery_plan_to_arm,
+    plan_request_recovery, split_recovery_control,
 )
 
 DEFAULT_RECOVERY_CONTROL = None
@@ -99,31 +100,34 @@ WITNESS_TOKENIZER = None
 WITNESS_TOKENIZER_PATH = ""
 
 
-def _witness_texts(records):
-    """Decode the exact standalone grid rows used by /c2kv/extract."""
+def _portable_tokenizer():
     global WITNESS_TOKENIZER
     if WITNESS_TOKENIZER is None:
         if not WITNESS_TOKENIZER_PATH:
-            raise ValueError("witness selection requires --witness-tokenizer")
-        # This HTTP client only tokenizes text. It must not initialize the
-        # model server's accelerator extension or require its CANN environment.
+            raise ValueError("recovery selection requires --witness-tokenizer")
         os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
         from transformers import AutoTokenizer
         WITNESS_TOKENIZER = AutoTokenizer.from_pretrained(
             WITNESS_TOKENIZER_PATH, local_files_only=True)
+    return WITNESS_TOKENIZER
+
+
+def _witness_texts(records):
+    """Decode the exact standalone grid rows used by /c2kv/extract."""
+    tokenizer = _portable_tokenizer()
     texts = []
     for item in records:
-        rendered = WITNESS_TOKENIZER.apply_chat_template(
+        rendered = tokenizer.apply_chat_template(
             [{"role": item["role"], "content": item["content"]}],
             tokenize=False, add_generation_prompt=False, enable_thinking=False)
-        bos = WITNESS_TOKENIZER.bos_token
+        bos = tokenizer.bos_token
         if bos and rendered.startswith(bos):
             rendered = rendered[len(bos):]
-        ids = WITNESS_TOKENIZER.encode(rendered, add_special_tokens=False)
+        ids = tokenizer.encode(rendered, add_special_tokens=False)
         expected = int(item["record"]["original_seq_len"])
         if len(ids) != expected:
             raise ValueError(f"witness tokenization differs from extraction: {len(ids)} != {expected}")
-        texts.append(WITNESS_TOKENIZER.decode(ids, skip_special_tokens=False))
+        texts.append(tokenizer.decode(ids, skip_special_tokens=False))
     return texts
 
 
@@ -247,6 +251,8 @@ BACKEND = None  # set in main()
 UPSTREAM = ""
 REQUEST_LOG_PATH = ""
 _log_lock = threading.Lock()
+UPSTREAM_TIMEOUT = 600
+MAX_COMPLETION_TOKENS = 0
 
 # --doc-packing / --max-doc-length / --max-doc-num (see module docstring and
 # docs/c2kv_semantics.md).  DEFAULTS = the checkpoint-1088 training values
@@ -933,7 +939,22 @@ def _history_kv_context(out_messages: List[Dict[str, Any]],
         history_indices.append(index)
         indexed.append((index, item))
     docs = _turn_docs(indexed)
-    history_text = "\n\n".join(doc["content"] for doc in docs if doc["content"])
+    doc_texts = [doc["content"] for doc in docs if doc["content"]]
+    history_text = "\n\n".join(doc_texts)
+    recovery_indices = None
+    recovery_char_range = None
+    recovery_docs: List[int] = []
+    if spec.get("recovery_mode") and doc_texts:
+        start_doc = min(int(spec.get("recovery_start_doc") or 0), len(doc_texts) - 1)
+        end_doc = min(len(doc_texts), start_doc + int(spec["recovery_window"]))
+        recovery_docs = list(range(start_doc, end_doc))
+        char_start = sum(len(text) + 2 for text in doc_texts[:start_doc])
+        char_end = sum(len(text) + 2 for text in doc_texts[:end_doc])
+        if end_doc == len(doc_texts):
+            char_end -= 2
+        recovery_char_range = [char_start, char_end]
+        spec = dict(spec)
+        spec["recovery_char_range"] = recovery_char_range
     return {
         "spec": spec,
         "method": spec["method"],
@@ -945,6 +966,10 @@ def _history_kv_context(out_messages: List[Dict[str, Any]],
         "current_start_out_index": cutoff,
         "n_history_messages": len(history_indices),
         "n_history_docs": len(docs),
+        "history_docs": doc_texts,
+        "recovery_doc_indices": recovery_docs,
+        "recovery_relative_indices": recovery_indices,
+        "recovery_char_range": recovery_char_range,
     }
 
 
@@ -1143,6 +1168,7 @@ def plan_repair(messages: List[Dict[str, Any]], arm: Arm,
         return None
     policy = str((arm.repair or {}).get("policy") or "first")
     placement = str((arm.repair or {}).get("placement") or "append_keep_ledger")
+    window = int((arm.repair or {}).get("window") or 1)
     parsed = repair_policy.parse_policy(policy)
     records = counts.get("compressed_records") or []
     if not records:
@@ -1154,12 +1180,19 @@ def plan_repair(messages: List[Dict[str, Any]], arm: Arm,
         doc_counts, parsed["kind"], parsed["index"])
     target = records[doc_index]
     target_out_index = int(target.get("out_index", target["message_index"]))
+    end_doc_index = min(len(records) - 1, doc_index + window - 1)
+    target_end = records[end_doc_index]
+    target_end_out_index = int(
+        target_end.get("out_index", target_end["message_index"]))
     if out_messages is None:
         raise ValueError("plan_repair needs the assembled out_messages")
-    context = [_strip_c2kv_fields(m) for m in out_messages[:target_out_index + 1]]
+    context = [_strip_c2kv_fields(m)
+               for m in out_messages[:target_end_out_index + 1]]
     span = BACKEND.repair_extract_messages(
         messages=context, target_index=target_out_index, tools=tools,
-        source_doc_index=doc_index)
+        source_doc_index=doc_index,
+        target_end_index=(target_end_out_index if end_doc_index > doc_index
+                          else None))
     # proxy-side ledger expectation (frame check): system block incl. tools
     # + Σ original_seq_len of the compressed docs before the target.  The
     # prologue is measured on the ASSEMBLED list, which is what the server
@@ -1195,7 +1228,9 @@ def plan_repair(messages: List[Dict[str, Any]], arm: Arm,
     return {
         "policy": policy, "placement": placement,
         "message_index": target_out_index, "target_out_index": target_out_index,
-        "doc_index": doc_index,
+        "target_end_out_index": target_end_out_index,
+        "doc_index": doc_index, "end_doc_index": end_doc_index,
+        "window": end_doc_index - doc_index + 1,
         "current_start_out_index": int(counts.get("current_start_out_index", len(out_messages))),
         "position_offset": position_start,
         "position_start": position_start, "position_end": span.get("position_end"),
@@ -1208,15 +1243,24 @@ def plan_repair(messages: List[Dict[str, Any]], arm: Arm,
 
 
 def retry_requested_recovery(control, messages, messages_out, counts, arm,
-                             tools, data, normalized, send):
+                             tools, data, normalized, send, history_ctx=None):
     """Retry one candidate before it reaches the benchmark tool environment.
 
     The caller supplies the trigger and witness values. This function neither
     judges correctness nor rolls back an already executed tool action.
     """
-    selection = plan_request_recovery(
-        control, counts.get("compressed_records") or [],
-        lambda record: _witness_texts([record])[0])
+    if getattr(arm, "history_kv", None):
+        docs = list((history_ctx or {}).get("history_docs") or [])
+        candidates = [
+            {"out_index": index, "role": "user", "content": text}
+            for index, text in enumerate(docs)
+        ]
+        selection = plan_request_recovery(
+            control, candidates, lambda record: str(record.get("content") or ""))
+    else:
+        selection = plan_request_recovery(
+            control, counts.get("compressed_records") or [],
+            lambda record: _witness_texts([record])[0])
     metadata = selection.metadata()
     counts["request_recovery"] = metadata
     if selection.selected_index is None and not selection.raw_regenerate:
@@ -1228,6 +1272,10 @@ def retry_requested_recovery(control, messages, messages_out, counts, arm,
     if selection.raw_regenerate:
         retry_messages, retry_counts = _assemble(messages, FULL_ASSEMBLY)
         retry_arm = FULL_ASSEMBLY
+    elif getattr(arm, "history_kv", None):
+        retry_messages = messages_out
+        retry_counts = None
+        retry_arm = apply_history_recovery_to_arm(arm, selection)
     else:
         retry_messages = messages_out
         retry_counts = None
@@ -1246,7 +1294,32 @@ def retry_requested_recovery(control, messages, messages_out, counts, arm,
                      "initial_usage": initial_usage, "retry_usage": retry_usage,
                      "retry_sec": time.perf_counter() - started,
                      "environment_rollback": False,
-                     "raw_kv_source": "full_context_recompute_from_text" if plan else "full_history_prefill"})
+                     "raw_kv_source": (
+                         "history_full_context_prefill_deduplicated"
+                         if getattr(arm, "history_kv", None)
+                         else ("full_context_recompute_from_text" if plan
+                               else "full_history_prefill"))})
+    if getattr(arm, "history_kv", None):
+        cost = retry_normalized.get("cost") or {}
+        metadata.update({
+            "compression_backend": (arm.history_kv or {}).get("method"),
+            "before_recovery_active_tokens": cost.get(
+                "history_kv_before_recovery_active_tokens"),
+            "after_recovery_active_tokens": cost.get(
+                "history_kv_after_recovery_active_tokens"),
+            "recovered_segment_size": cost.get(
+                "history_kv_recovered_segment_size"),
+            "restored_raw_kv_tokens": cost.get(
+                "history_kv_restored_raw_tokens"),
+            "duplicate_raw_kv_tokens": 0,
+        })
+    elif plan is not None:
+        block_tokens = plan.get("repair_block_tokens")
+        metadata.update({
+            "recovered_segment_size": block_tokens,
+            "restored_raw_kv_tokens": block_tokens,
+            "duplicate_raw_kv_tokens": 0,
+        })
     if retry_counts is not None:
         counts.update(retry_counts)
     counts["request_recovery"] = metadata
@@ -1395,9 +1468,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if recovery_control is not None:
             try:
                 plan_request_recovery(recovery_control, [], lambda record: "")
-                if (not ARM.compress_history or ARM.repair or ARM.recover
+                if ((not ARM.compress_history and not ARM.history_kv)
+                        or ARM.repair or ARM.recover
                         or ARM.gold_recovery or oracle):
-                    raise ValueError("request recovery requires a plain C2KV arm")
+                    raise ValueError(
+                        "request recovery requires a plain C2KV or history_kv arm")
             except (TypeError, ValueError) as error:
                 self._send_json(400, {"error": str(error)})
                 return
@@ -1453,18 +1528,48 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # request fail "repair target has no c2kv_key_hash"
             staged = dict(payload)
             staged["messages"] = out_messages
+            # Some harnesses (notably tau2) omit both OpenAI generation
+            # limits.  A malformed tool turn can then decode indefinitely,
+            # outlive the harness timeout, and occupy an NPU slot for the
+            # following task.  Keep the default disabled for compatibility;
+            # matrix runners opt into a finite request-local ceiling.
+            if (MAX_COMPLETION_TOKENS > 0
+                    and staged.get("max_tokens") is None
+                    and staged.get("max_completion_tokens") is None):
+                staged["max_completion_tokens"] = MAX_COMPLETION_TOKENS
             if QUERY_PROJECTION is not None and BACKEND.name == "sglang":
                 staged["c2kv_use_gist_projection"] = QUERY_PROJECTION == "gist"
+            request_history_ctx = history_ctx
+            if (getattr(request_arm, "history_kv", None)
+                    and request_arm is not ARM):
+                request_history_ctx = _history_kv_context(
+                    out_messages, counts, request_arm)
             if getattr(BACKEND, "wants_request_context", False):
                 # only backends that asked for it (base.Backend
                 # .wants_request_context); hfserver keeps its 3-arg signature
                 out_payload = BACKEND.prepare_chat(
                     staged, request_arm, plan,
-                    context={"conversation_id": conv, "history_kv": history_ctx,
+                    context={"conversation_id": conv, "history_kv": request_history_ctx,
                              "kv_reuse": reuse_ctx})
             else:
                 out_payload = BACKEND.prepare_chat(staged, request_arm, plan)
-            return _post_json(self.path, out_payload, 600), out_payload
+            # OpenAI chat accepts a caller-provided rid in this SGLang fork.
+            # It lets us cancel exactly this request if the HTTP client times
+            # out.  Never retry a timed-out generation: doing so creates a
+            # second non-idempotent decode while the first may still run.
+            rid = str(out_payload.get("rid") or uuid.uuid4().hex)
+            out_payload["rid"] = rid
+            try:
+                return _post_json(
+                    self.path, out_payload, UPSTREAM_TIMEOUT, retries=0), out_payload
+            except UpstreamError as error:
+                if error.status == 0:
+                    try:
+                        _post_json(
+                            "/abort_request", {"rid": rid}, 15, retries=0)
+                    except UpstreamError:
+                        pass
+                raise
 
         def call_upstream(out_messages, plan, request_arm=ARM):
             data_, _ = send_upstream(out_messages, plan, request_arm)
@@ -1536,7 +1641,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             try:
                 data, normalized, repair_plan = retry_requested_recovery(
                     recovery_control, messages, messages_out, counts, ARM,
-                    payload.get("tools"), data, normalized, call_upstream)
+                    payload.get("tools"), data, normalized, call_upstream,
+                    history_ctx=history_ctx)
                 total_sec = time.perf_counter() - start
             except (UpstreamError, BackendError, RuntimeError, ValueError,
                     URLError, OSError) as error:
@@ -1633,8 +1739,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             repair_tokens = int((repair_plan or {}).get("repair_block_tokens") or 0)
             retained_gist_tokens = counts["gist_tokens"]
             if repair_plan and repair_plan.get("placement") == "in_place":
-                target = (counts.get("compressed_records") or [])[repair_plan["doc_index"]]
-                retained_gist_tokens -= int(target["record"].get("gist_len") or 0)
+                records = counts.get("compressed_records") or []
+                start_doc = int(repair_plan["doc_index"])
+                end_doc = int(repair_plan.get("end_doc_index", start_doc))
+                retained_gist_tokens -= sum(
+                    int(records[index]["record"].get("gist_len") or 0)
+                    for index in range(start_doc, end_doc + 1)
+                )
             final_history_tokens = retained_gist_tokens + repair_tokens
             counts["history_tensor_accounting"] = {
                 "bytes_per_kv_token": unit_bytes,
@@ -1696,7 +1807,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The benchmark may have enforced its own task timeout while an
+            # upstream failure was being returned.  This is not a proxy crash.
+            return
 
     def _log_request(self, request, normalized, counts, recover=None, status="ok",
                      error=None, fingerprint=None, conv=None, turn=None, plan=None):
@@ -1727,6 +1843,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "usage": (normalized or {}).get("usage"),
             "finish_reason": (normalized or {}).get("finish_reason"),
             "n_native_tool_calls": len((normalized or {}).get("tool_calls") or []) if normalized else None,
+            "proxy_upstream_timeout": UPSTREAM_TIMEOUT,
+            "proxy_max_completion_tokens": MAX_COMPLETION_TOKENS or None,
             "native_tool_names": [
                 (call.get("function") or {}).get("name")
                 for call in ((normalized or {}).get("tool_calls") or [])
@@ -1762,6 +1880,7 @@ def main(argv=None):
     global DOC_PACKING, MAX_DOC_LENGTH, MAX_DOC_NUM, QUERY_PROJECTION
     global WITNESS_TOKENIZER_PATH
     global DEFAULT_RECOVERY_CONTROL
+    global UPSTREAM_TIMEOUT, MAX_COMPLETION_TOKENS
     textarms.reset_state()  # fresh caches/state per proxy process
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--witness-tokenizer", default="")
@@ -1773,6 +1892,10 @@ def main(argv=None):
     parser.add_argument("--arm", required=True)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--request-log", default="")
+    parser.add_argument("--upstream-timeout", type=int, default=600,
+                        help="seconds for one generation request; timed-out requests are aborted, not retried")
+    parser.add_argument("--max-completion-tokens", type=int, default=0,
+                        help="inject this limit only when the harness omitted both OpenAI token limits (0 disables)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--record-reference", default="",
                         help="append a reference-trajectory row per request (full-arm run)")
@@ -1798,6 +1921,10 @@ def main(argv=None):
     MAX_DOC_LENGTH = int(args.max_doc_length)
     MAX_DOC_NUM = int(args.max_doc_num)
     QUERY_PROJECTION = args.query_projection
+    if args.upstream_timeout <= 0 or args.max_completion_tokens < 0:
+        parser.error("--upstream-timeout must be positive and --max-completion-tokens non-negative")
+    UPSTREAM_TIMEOUT = int(args.upstream_timeout)
+    MAX_COMPLETION_TOKENS = int(args.max_completion_tokens)
     ARM = get_arm(args.arm)
     UPSTREAM = args.upstream.rstrip("/")
     REQUEST_LOG_PATH = args.request_log
@@ -1812,7 +1939,9 @@ def main(argv=None):
               f"from {args.reference}", flush=True)
     server = ThreadingHTTPServer((args.host, args.port), ProxyHandler)
     print(f"proxy backend={BACKEND.name} arm={ARM.name} doc_packing={DOC_PACKING} "
-          f"max_doc_length={MAX_DOC_LENGTH} max_doc_num={MAX_DOC_NUM} listening on "
+          f"max_doc_length={MAX_DOC_LENGTH} max_doc_num={MAX_DOC_NUM} "
+          f"upstream_timeout={UPSTREAM_TIMEOUT} "
+          f"max_completion_tokens={MAX_COMPLETION_TOKENS or 'harness'} listening on "
           f"{args.host}:{args.port} -> {UPSTREAM}", flush=True)
     server.serve_forever()
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +39,8 @@ def add_arguments(parser) -> None:
         help="tau2 checkout (default: $TAU2_DIR or ~/benchmarks/tau2)",
     )
     parser.add_argument("--task-set", default="airline")
+    parser.add_argument("--tau2-task-ids", default="",
+                        help="comma-separated exact tau2 task ids; keeps every arm on the same cases")
     parser.add_argument("--tau2-num-trials", type=int, default=None,
                         help="tau2: trials per selected task (unset keeps the official default)")
     parser.add_argument("--tau2-max-steps", type=int, default=None,
@@ -52,6 +55,7 @@ def run_command(base_url: str, user_base_url: str, task_set: str, model: str,
                 num_trials: Optional[int] = None,
                 max_steps: Optional[int] = None,
                 timeout: Optional[int] = None,
+                task_ids: Optional[List[str]] = None,
                 python: Optional[str] = None) -> List[str]:
     """``tau2.cli run`` argv — PINNED: the server scripts quote these
     numbers, so any edit here changes what every historical tau2 row means.
@@ -78,6 +82,8 @@ def run_command(base_url: str, user_base_url: str, task_set: str, model: str,
     ]
     if num_trials is not None:
         cmd += ["--num-trials", str(num_trials)]
+    if task_ids:
+        cmd += ["--task-ids", *[str(task_id) for task_id in task_ids]]
     if max_tasks is not None:
         cmd += ["--num-tasks", str(max_tasks)]
     if max_steps is not None:
@@ -93,9 +99,24 @@ def evaluate_command(sims: Path, python: Optional[str] = None) -> List[str]:
             "-o", str(sims), str(sims / "results.json")]
 
 
-def harness_env() -> Dict[str, str]:
-    return {**os.environ,
-            "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
+def harness_env(tau2_dir: Optional[Path] = None) -> Dict[str, str]:
+    env = {**os.environ,
+           "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
+    if tau2_dir is not None:
+        # An existing harness environment may contain an editable tau2 from
+        # another account.  Put the explicitly selected checkout first without
+        # modifying that environment.
+        source = str((Path(tau2_dir).resolve() / "src"))
+        env["PYTHONPATH"] = os.pathsep.join(
+            filter(None, (source, env.get("PYTHONPATH"))))
+    return env
+
+
+def split_task_ids(raw: Any) -> List[str]:
+    if not raw:
+        return []
+    values = raw.split(",") if isinstance(raw, str) else raw
+    return [str(value).strip() for value in values if str(value).strip()]
 
 
 def run(ctx: RunContext) -> Dict[str, Any]:
@@ -117,33 +138,52 @@ def run(ctx: RunContext) -> Dict[str, Any]:
     tau2_dir = Path(benchmark_dir) if benchmark_dir else TAU2_DIR
     task_set = ctx.opt("task_set", "airline")
     max_tasks = ctx.opt("max_tasks")
+    task_ids = split_task_ids(ctx.opt("tau2_task_ids", ""))
+    python = ctx.opt("bench_python", sys.executable)
+    if task_ids and max_tasks is not None:
+        raise ValueError("--tau2-task-ids and --max-tasks are mutually exclusive")
 
-    env = harness_env()
+    env = harness_env(tau2_dir)
     subprocess.run(
         run_command(ctx.base_url, ctx.user_base_url, task_set, ctx.model,
                     ctx.opt("num_workers", 4), ctx.run_name,
                     max_tasks=max_tasks,
                     num_trials=ctx.opt("tau2_num_trials"),
                     max_steps=ctx.opt("tau2_max_steps"),
-                    timeout=ctx.opt("tau2_timeout")),
+                    timeout=ctx.opt("tau2_timeout"),
+                    task_ids=task_ids, python=python),
         cwd=tau2_dir, env=env, check=True)
     sims = tau2_dir / "data" / "simulations" / ctx.run_name
-    subprocess.run(evaluate_command(sims), cwd=tau2_dir, env=env, check=True)
+    subprocess.run(evaluate_command(sims, python=python),
+                   cwd=tau2_dir, env=env, check=True)
     updated = sims / "updated_results.json"
     if not updated.exists():
         raise SystemExit(f"FATAL: tau2 evaluation produced no {updated}")
+    # tau2 writes native artifacts inside its checkout.  Keep immutable copies
+    # with the portable result so an independently named run directory is
+    # self-contained even if tau2's simulations directory is later cleaned.
+    native_results_copy = ctx.out_dir / "tau2_results.json"
+    native_updated_copy = ctx.out_dir / "tau2_updated_results.json"
+    ctx.out_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(sims / "results.json", native_results_copy)
+    shutil.copy2(updated, native_updated_copy)
     # terminal-state gate via the shared checker: infra-error simulations
     # are NOT valid terminal states (the old inline len(sims) check counted
     # them as scored)
     from .. import terminal_check
 
     code = terminal_check.check_tau2(
-        ctx.run_name, max_tasks or None,
+        ctx.run_name, len(task_ids) or max_tasks or None,
+        task_ids=",".join(task_ids),
         root=tau2_dir / "data" / "simulations",
     )
     if code != 0:
         raise SystemExit(f"FATAL: tau2 terminal-state check failed (rc={code})")
     summary = collect(updated, domain=task_set.split("_")[0])
+    summary["simulation_dir"] = str(sims)
+    summary["native_results_copy"] = str(native_results_copy)
+    summary["native_updated_results_copy"] = str(native_updated_copy)
+    summary["selected_task_ids"] = task_ids or None
     summary["cost_join"] = COST_JOIN
     return summary
 
@@ -208,6 +248,8 @@ def collect(results_path: Path, domain: str = "airline") -> Dict[str, Any]:
         elif turns and all(t["protocol_legal"] is True for t in turns):
             protocol_legal = True
         reward_info = sim.get("reward_info") or {}
+        termination = sim.get("termination_reason")
+        normal_termination = termination in {"agent_stop", "user_stop"}
         rows.append(
             {
                 "task_id": str(sim.get("task_id")),
@@ -218,13 +260,32 @@ def collect(results_path: Path, domain: str = "airline") -> Dict[str, Any]:
                 "n_illegal_turns": len(first_violations),
                 "n_unknown_protocol_turns": sum(t["protocol_legal"] is None for t in turns),
                 "first_violation": first_violations[0] if first_violations else None,
-                "termination": sim.get("termination_reason"),
+                "termination": termination,
+                "normal_termination": normal_termination,
             }
         )
     from ..metrics import aggregate
 
     summary = aggregate(rows, cluster_key="task_id")
     summary["task_rows"] = rows
+    termination_counts: Dict[str, int] = {}
+    for row in rows:
+        key = str(row.get("termination") or "unknown")
+        termination_counts[key] = termination_counts.get(key, 0) + 1
+    normal_count = sum(row["normal_termination"] for row in rows)
+    rewards = [row["semantic_score"] for row in rows
+               if isinstance(row.get("semantic_score"), (int, float))]
+    binary_rewards = bool(rewards) and all(float(value) in {0.0, 1.0}
+                                           for value in rewards)
+    summary["official_metric_kind"] = (
+        "binary_task_success" if binary_rewards else "official_reward_mean")
+    summary["official_success_rate"] = (
+        sum(float(value) for value in rewards) / len(rewards)
+        if binary_rewards else None)
+    summary["normal_termination_rate"] = (
+        normal_count / len(rows) if rows else None)
+    summary["premature_termination_count"] = len(rows) - normal_count
+    summary["termination_counts"] = termination_counts
     summary["protocol_evaluable_tasks"] = sum(row["protocol_legal"] is not None for row in rows)
     summary["protocol_tool_pool_size"] = len(tools)
     return summary

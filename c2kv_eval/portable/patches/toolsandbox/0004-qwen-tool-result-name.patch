@@ -1,0 +1,33 @@
+diff --git a/tool_sandbox/roles/openai_api_agent.py b/tool_sandbox/roles/openai_api_agent.py
+--- a/tool_sandbox/roles/openai_api_agent.py
++++ b/tool_sandbox/roles/openai_api_agent.py
+@@ -31,3 +31,22 @@ from tool_sandbox.roles.base_role import BaseRole
+ 
+ 
++def _annotate_tool_results_for_qwen(openai_messages: list[dict[str, Any]]) -> None:
++    """Expose the tool name to templates that render only tool content.
++
++    Qwen3's bundled chat template ignores the OpenAI ``name`` field on a
++    ``role=tool`` message.  Without this annotation, opaque return values
++    such as message UUIDs are presented without the function that produced
++    them and are frequently mistaken for contact/person IDs.
++    """
++    enabled = os.environ.get("TOOLSANDBOX_QWEN_TOOL_RESULT_COMPAT", "")
++    if enabled.strip().lower() not in {"1", "true", "yes", "on"}:
++        return
++    for message in openai_messages:
++        if message.get("role") != "tool" or not message.get("name"):
++            continue
++        message["content"] = (
++            f"Tool {message['name']} returned:\n{message.get('content', '')}"
++        )
++
++
+ class OpenAIAPIAgent(BaseRole):
+@@ -88,5 +107,6 @@ class OpenAIAPIAgent(BaseRole):
+         current_context = get_current_context()
+         openai_messages, _ = to_openai_messages(messages)
++        _annotate_tool_results_for_qwen(openai_messages)
+         # Call model
+         response = self.model_inference(
+             openai_messages=openai_messages, openai_tools=openai_tools

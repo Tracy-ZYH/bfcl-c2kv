@@ -132,6 +132,20 @@ class TestRegistry:
             history_kv={"method": "pyramid", "retention_ratio": 0.5},
         ))["method"] == "pyramidkv"
 
+    def test_r25_names_mean_exactly_twenty_five_percent_retention(self):
+        for method in ("streamingllm", "h2o", "snapkv_persistent", "pyramidkv"):
+            spec = history_kv_spec(get_arm(f"history_kv_{method}_r25"))
+            assert spec["retention_ratio"] == 0.25
+
+    @pytest.mark.parametrize("method", ["h2o", "snapkv_persistent"])
+    def test_headwise_recovery_fails_loudly(self, method):
+        arm = Arm(
+            name="unsafe", compress_history=False,
+            history_kv={"method": method, "retention_ratio": 0.25,
+                        "recovery_mode": "replace", "recovery_window": 2})
+        with pytest.raises(ValueError, match="headwise"):
+            history_kv_spec(arm)
+
     def test_existing_arms_untouched(self):
         for name, arm in ARMS.items():
             if name.startswith("history_kv_"):
@@ -255,6 +269,18 @@ class TestRepairExtractPath:
         payload = post.calls[0]["payload"]
         assert payload["history_kv_target_tokens"] == 128
         assert "history_kv_retention_ratio" not in payload
+
+    def test_recovery_refuses_a_server_that_silently_ignored_it(self):
+        arm = Arm(
+            name="stream_restore", compress_history=False,
+            history_kv={"method": "streamingllm", "retention_ratio": 0.25,
+                        "recovery_mode": "replace", "recovery_window": 2})
+        spec = history_kv_spec(arm)
+        spec["recovery_char_range"] = [0, 4]
+        post = FakePost({"/v1/c2kv/repair_extract": _repair_extract_ok})
+        with pytest.raises(BackendError, match="did not acknowledge"):
+            SglangBackend(post).history_kv_extract(
+                "abcd-rest", "system", _tools(), spec)
 
     def test_chat_request_carries_the_upstream_carrier(self):
         arm, ctx, post, prepared = self._prepare()

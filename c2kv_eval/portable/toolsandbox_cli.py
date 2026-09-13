@@ -16,22 +16,23 @@ from tool_sandbox.roles.openai_api_agent import OpenAIAPIAgent
 from tool_sandbox.roles.openai_api_user import OpenAIAPIUser
 
 
-def _redirect_client(role_class):
+def _redirect_client(role_class, base_url_env: str):
     original_init = role_class.__init__
 
     def redirected_init(self):
         original_init(self)
         self.openai_client = OpenAI(
             api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
-            base_url=os.environ["OPENAI_BASE_URL"],
+            base_url=os.environ.get(
+                base_url_env, os.environ["OPENAI_BASE_URL"]),
             timeout=600.0,
         )
 
     role_class.__init__ = redirected_init
 
 
-_redirect_client(OpenAIAPIAgent)
-_redirect_client(OpenAIAPIUser)
+_redirect_client(OpenAIAPIAgent, "OPENAI_BASE_URL")
+_redirect_client(OpenAIAPIUser, "TOOLSANDBOX_USER_BASE_URL")
 
 
 def main() -> None:

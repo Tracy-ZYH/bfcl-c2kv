@@ -4802,9 +4802,26 @@ def run(args: argparse.Namespace) -> None:
     result_dir = Path(args.result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
     details_rows = []
-    metrics_rows = []
-    step_rows = []
-    segment_rows = []
+    if args.resume:
+        for result_json in result_dir.rglob("*_result.json"):
+            with result_json.open(encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        details_rows.append(json.loads(line))
+        completed_ids = {row.get("id") for row in details_rows}
+        entries = [entry for entry in entries if entry["id"] not in completed_ids]
+        print(
+            f"[resume] loaded {len(details_rows)} completed examples; "
+            f"running {len(entries)} remaining examples",
+            flush=True,
+        )
+    metrics_rows = [row.get("c2kv_checkpoint_metrics", {}) for row in details_rows]
+    step_rows = [step for row in details_rows for step in (row.get("checkpoint_steps") or [])]
+    segment_rows = [
+        segment
+        for row in details_rows
+        for segment in (row.get("checkpoint_segments") or [])
+    ]
     for test_case in tqdm(entries, desc=f"history_checkpoint:{args.category}", dynamic_ncols=True):
         row = runner.run_sample_checkpoint(deepcopy(test_case))
         runner.decoder.write(row, result_dir=result_dir, update_mode=False)
@@ -4882,6 +4899,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--category", default="multi_turn_base")
     parser.add_argument("--max-examples", type=int, default=200)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Keep completed result rows and run only missing episode IDs.",
+    )
     parser.add_argument("--ids-path", default="")
     parser.add_argument("--model", default=DEFAULT_MODEL_ID)
     parser.add_argument("--served-model-name", default=DEFAULT_MODEL_ID)

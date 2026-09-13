@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import subprocess
 import sys
 import time
@@ -51,7 +52,22 @@ def start_proxy(upstream: str, arm: str, port: int, log_dir: Path,
                 backend: str = "sglang", doc_packing: str = "turn",
                 max_doc_length: int = 512, max_doc_num: int = 12,
                 query_projection: str | None = None, witness_tokenizer: str = "",
-                python_bin: str | None = None, recovery_control: str = ""):
+                python_bin: str | None = None, recovery_control: str = "",
+                upstream_timeout: int = 600, max_completion_tokens: int = 0):
+    # A health probe alone cannot prove that *our* child owns the port: when a
+    # stale/concurrent proxy was already listening, the new child failed bind
+    # while run.py accepted the old proxy's /health and sent an entire harness
+    # run to the wrong arm. Reject an occupied port before spawning.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError as exc:
+        raise SystemExit(
+            f"proxy port {port} is already in use; refusing to attach the "
+            "harness to an unknown proxy") from exc
+    finally:
+        probe.close()
     log_path = log_dir / f"proxy_{arm}_{port}.jsonl"
     out_handle = open(log_dir / f"proxy_{arm}_{port}.out", "w")
     command = [
@@ -61,6 +77,8 @@ def start_proxy(upstream: str, arm: str, port: int, log_dir: Path,
         "--doc-packing", doc_packing,
         "--max-doc-length", str(max_doc_length),
         "--max-doc-num", str(max_doc_num),
+        "--upstream-timeout", str(upstream_timeout),
+        "--max-completion-tokens", str(max_completion_tokens),
     ]
     if record_reference:
         command += ["--record-reference", record_reference]
@@ -85,12 +103,24 @@ def start_proxy(upstream: str, arm: str, port: int, log_dir: Path,
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     for _ in range(100):
+        returncode = proc.poll()
+        if returncode is not None:
+            out_handle.close()
+            raise SystemExit(
+                f"proxy exited before readiness on port {port} "
+                f"(exit={returncode}; see {out_handle.name})")
         try:
             opener.open(f"http://127.0.0.1:{port}/health", timeout=2)
-            return proc, log_path
+            # Bind failures can race the first health request. Give the child
+            # one more scheduling point and verify it is still alive.
+            time.sleep(0.1)
+            if proc.poll() is None:
+                out_handle.close()
+                return proc, log_path
         except OSError:
             time.sleep(0.2)
     proc.terminate()
+    out_handle.close()
     raise SystemExit(f"proxy did not come up on port {port}")
 
 
@@ -125,6 +155,10 @@ def add_core_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--proxy-port", type=int, default=34100)
     parser.add_argument("--proxy-python", default=None,
                         help="proxy interpreter; use the serving environment for compatible checkpoint tokenizers")
+    parser.add_argument("--upstream-timeout", type=int, default=600,
+                        help="proxy-to-model generation timeout in seconds")
+    parser.add_argument("--max-completion-tokens", type=int, default=0,
+                        help="fallback generation limit when a harness omits one (0 preserves harness/server default)")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--exact-out", action="store_true",
                         help="use the supplied output directory verbatim (matrix cells)")
@@ -271,7 +305,9 @@ def main(argv=None):
         query_projection=args.query_projection,
         witness_tokenizer=str(args.tokenizer or args.checkpoint or "")
         if get_arm(args.arm).gold_recovery or args.recovery_control else "",
-        python_bin=args.proxy_python, recovery_control=args.recovery_control)
+        python_bin=args.proxy_python, recovery_control=args.recovery_control,
+        upstream_timeout=args.upstream_timeout,
+        max_completion_tokens=args.max_completion_tokens)
     try:
         # every adapter owns its own "/v1" (adapters/base.py:v1) and its own
         # cwd; run.py hands over the bare proxy URL and nothing else
@@ -281,6 +317,11 @@ def main(argv=None):
         adapter_wall_sec = time.perf_counter() - adapter_started
     finally:
         proxy_proc.terminate()
+        try:
+            proxy_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proxy_proc.kill()
+            proxy_proc.wait(timeout=10)
     summary["arm"] = args.arm
     summary["benchmark"] = args.benchmark
     summary["backend"] = args.backend
