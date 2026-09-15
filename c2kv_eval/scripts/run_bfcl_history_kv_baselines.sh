@@ -2,13 +2,13 @@
 set -Ee -o pipefail
 set +u
 
-ROOT="${ROOT:-/home/zhuyuhan/project/gorilla/berkeley-function-call-leaderboard}"
-SGLANG_ROOT="${SGLANG_ROOT:-/home/zhuyuhan/project/kvoffload-sglang}"
-BFCL_PYTHON="${BFCL_PYTHON:-/home/zhuyuhan/miniconda3/envs/bfcl/bin/python}"
-SGLANG_PYTHON="${SGLANG_PYTHON:-/home/zhuyuhan/miniconda3/envs/sglang/bin/python}"
+ROOT="${ROOT:-/home/zhuyuhan/project/bfcl-c2kv}"
+SGLANG_ROOT="${SGLANG_ROOT:-/home/zhuyuhan/project/kvoffload-sglang-c2kv}"
+BFCL_PYTHON="${BFCL_PYTHON:-/home/liuyancheng/envs/sgl/bin/python}"
+SGLANG_PYTHON="${SGLANG_PYTHON:-/home/liuyancheng/envs/sgl/bin/python}"
 
-MODEL_PATH="${MODEL_PATH:-/home/zhuyuhan/project/c2kv/checkpoints/qwen3-4b-agent-history-c2kv-toolcall-npu-v2/checkpoint-1088}"
-TOKENIZER_PATH="${TOKENIZER_PATH:-/home/zhuyuhan/project/c2kv/models/Qwen3-4B-Instruct-2507}"
+MODEL_PATH="${MODEL_PATH:-/home/zhuyuhan/project/model/checkpoints/qwen3-4b-agent-history-c2kv-toolcall-npu-v2/checkpoint-1088}"
+TOKENIZER_PATH="${TOKENIZER_PATH:-/home/zhuyuhan/project/model/models/Qwen3-4B-Instruct-2507}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-4B-Instruct-2507-FC}"
 
 CATEGORY="${CATEGORY:-multi_turn_base}"
@@ -33,7 +33,7 @@ PYRAMIDKV_BUDGET_SCALE="${PYRAMIDKV_BUDGET_SCALE:-0.66}"
 KIVI_BITS="${KIVI_BITS:-2}"
 KIVI_GROUP_SIZE="${KIVI_GROUP_SIZE:-32}"
 KIVI_RESIDUAL_LENGTH="${KIVI_RESIDUAL_LENGTH:-32}"
-RUNTIME_HISTORY_KV_BACKEND="${RUNTIME_HISTORY_KV_BACKEND:-repair_extract}"
+RUNTIME_HISTORY_KV_BACKEND="${RUNTIME_HISTORY_KV_BACKEND:-physical_eviction}"
 TEMPERATURE="${TEMPERATURE:-0}"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-4096}"
 
@@ -51,11 +51,9 @@ ALLOW_CLIENT_FALLBACK="${ALLOW_CLIENT_FALLBACK:-0}"
 # Set explicitly to 0 only for the legacy per-request diagnostic path.
 PERSISTENT_HISTORY_KV_SESSION="${PERSISTENT_HISTORY_KV_SESSION:-}"
 
-if [ "${RUNTIME_HISTORY_KV_BACKEND}" != "repair_extract" ]; then
-  echo "Physical history-KV eviction is disabled; set RUNTIME_HISTORY_KV_BACKEND=repair_extract."
-  exit 1
+if [ "${RUNTIME_HISTORY_KV_BACKEND}" = "stateless_reselect" ]; then
+  RUNTIME_HISTORY_KV_BACKEND=repair_extract
 fi
-PERSISTENT_HISTORY_KV_SESSION=0
 
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.55}"
 C2KV_POOL_FRACTION="${C2KV_POOL_FRACTION:-0.06}"
@@ -121,9 +119,23 @@ source_env_file() {
 
 cleanup() {
   local status=$?
-  for pid in "${SERVER_PIDS[@]}" "${RUNNER_PIDS[@]}"; do
+  for pid in "${RUNNER_PIDS[@]}"; do
     if kill -0 "${pid}" >/dev/null 2>&1; then
       kill "${pid}" >/dev/null 2>&1 || true
+    fi
+  done
+  for pid in "${SERVER_PIDS[@]}"; do
+    local pgid
+    pgid="$(ps -o pgid= -p "$pid" | tr -d '[:space:]')"
+    if [ "$pgid" = "$pid" ]; then
+      kill -TERM -- "-$pid" >/dev/null 2>&1 || true
+      for attempt in $(seq 1 30); do
+        kill -0 -- "-$pid" >/dev/null 2>&1 || break
+        sleep 1
+      done
+      kill -KILL -- "-$pid" >/dev/null 2>&1 || true
+    else
+      kill "$pid" >/dev/null 2>&1 || true
     fi
   done
   wait >/dev/null 2>&1 || true
@@ -186,12 +198,21 @@ start_server() {
   local device="${DEVICE_LIST[$slot]}"
   local port="${PORT_LIST[$slot]}"
   local log="${RUN_ROOT}/server_${device}_${port}.log"
+  "${BFCL_PYTHON}" - "$port" <<'PY'
+import socket, sys
+with socket.socket() as s:
+    s.bind(('127.0.0.1', int(sys.argv[1])))
+PY
   log_info "server start device=${device} port=${port}"
   (
     cd "${SGLANG_ROOT}"
     export PYTHONPATH="${SGLANG_ROOT}/python:${ROOT}:${PYTHONPATH:-}"
     export SGLANG_DEBUG_MEMORY_POOL=1
-    export SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
+    if [ "${PERSISTENT_HISTORY_KV_SESSION}" = "1" ]; then
+      export SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE="${STRICT_HISTORY_MEM_CHECK:-1}"
+    else
+      export SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
+    fi
     export SGLANG_EMPTY_CACHE_INTERVAL=1
     export ASCEND_LAUNCH_BLOCKING=1
     export TASK_QUEUE_ENABLE=1
@@ -205,6 +226,7 @@ start_server() {
     server_args=(
       "${SGLANG_PYTHON}" -m sglang.launch_server
       --model-path "${MODEL_PATH}"
+      --tokenizer-path "${TOKENIZER_PATH}"
       --served-model-name "${MODEL_ID}"
       --model-impl sglang
       --device npu
@@ -230,7 +252,7 @@ start_server() {
       read -r -a extra_args <<< "${SGLANG_EXTRA_ARGS}"
       server_args+=("${extra_args[@]}")
     fi
-    exec "${server_args[@]}"
+    exec setsid "${server_args[@]}"
   ) >"${log}" 2>&1 &
   SERVER_PIDS+=("$!")
 }
@@ -301,6 +323,8 @@ run_method() {
     fi
     if [ "${PERSISTENT_HISTORY_KV_SESSION}" = "1" ]; then
       args+=(--persistent-history-kv-session)
+    else
+      args+=(--no-persistent-history-kv-session)
     fi
     exec "${args[@]}"
   ) >"${method_root}/logs/runner.log" 2>&1
@@ -338,10 +362,14 @@ log_info "DEVICES=${DEVICES} PORTS=${PORTS}"
 source_env_file /usr/local/Ascend/cann-8.5.0/set_env.sh
 source_env_file /usr/local/Ascend/nnal/atb/set_env.sh
 
-if [ "${CLEAN_OUTPUT}" = "1" ]; then
-  rm -rf "${RUN_ROOT}"
+if [ -e "${RUN_ROOT}" ]; then
+  echo "Refusing existing RUN_ROOT; use a new output directory: ${RUN_ROOT}" >&2
+  exit 2
 fi
 mkdir -p "${RUN_ROOT}/logs"
+if [ -n "${IDS_PATH}" ]; then
+  cp "${IDS_PATH}" "${RUN_ROOT}/episode_ids.txt"
+fi
 write_manifest >"${RUN_ROOT}/logs/manifest_write.log"
 
 for slot in "${!DEVICE_LIST[@]}"; do
@@ -378,6 +406,14 @@ fi
 for method in "${METHOD_LIST[@]}"; do
   evaluate_method "${method}"
 done
+
+if [ "${RUNTIME_HISTORY_KV_BACKEND}" = physical_eviction ] && [ "${PERSISTENT_HISTORY_KV_SESSION}" = 1 ]; then
+  (
+    cd "${ROOT}"
+    "${BFCL_PYTHON}" -m c2kv_eval.analysis.check_persistent_history_lifecycle \
+      --run-root "${RUN_ROOT}" --expected-examples "${MAX_EXAMPLES}" --methods "${METHODS}"
+  ) >"${RUN_ROOT}/logs/lifecycle_check.log" 2>&1
+fi
 
 if [ "${RUN_COMPARE}" = "1" ]; then
   compare_args=(

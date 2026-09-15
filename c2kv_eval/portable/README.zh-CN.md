@@ -89,6 +89,18 @@ python -m c2kv_eval.portable.run \
 | CacheBlend，16% recompute 配置 | `cacheblend_r16` |
 | H2O / SnapKV | `history_kv_h2o_r312` / `history_kv_snapkv_r312` |
 
+CacheBlend 的 Qwen3 服务端支持跨请求 standalone chunk KV 复用：每个模型/
+worker 独立维护 CPU LRU，默认上限 256 MiB，可在启动 server 的命令中设置
+`SGLANG_CACHEBLEND_CHUNK_CACHE_BYTES`（字节数；0 禁用，用于旧路径 ablation）。
+缓存保存 pre-RoPE KV，以精确 token 内容匹配，重载权重时清空；容量不足、
+chunk 内容变化或 server 重启会产生 miss。命中无需旧 chunk standalone prefill，
+但仍需 CPU/device 搬运、早期层全 token blend 和后续层选择性重计算。
+因此 r16 不是总 prefill 工作量只剩 16%，也不是 16% KV retention。
+逐请求 cost 输出 `cacheblend_chunk_cache_hit_tokens`、
+`cacheblend_chunk_prefill_tokens`、`cacheblend_chunk_cache_bytes` 和
+`cacheblend_dense_blend_prefix_tokens`；最后一项是早期 blend 层的输入 token
+数，不是所有层计算量之和。真实加速仍需运行后测量。
+
 `--benchmark` 可选 `bfcl`、`acebench`、`tau2`、`toolsandbox`、`acon_appworld`、`acon_qa`。更换 benchmark 时，同时设置它的目录和 task 选择参数：
 
 - ACEBench、tau2、QA：`--max-tasks`。

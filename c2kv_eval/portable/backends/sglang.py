@@ -284,6 +284,12 @@ class SglangBackend(Backend):
                 "request as a history-KV baseline")
         if spec.get("recovery_mode"):
             recovery_meta = result.get("history_selection_metadata") or {}
+            if method in {"h2o", "snapkv_persistent", "snapkv_refresh"}:
+                if (recovery_meta.get("recovery_semantics") != "headwise_raw_union_dense_completion_v1"
+                        or recovery_meta.get("recovery_target_coverage") != 1.0
+                        or recovery_meta.get("dense_alignment_extra_tokens_per_head_mean") is None):
+                    raise BackendError("history_kv_recovery_failed",
+                                       "headwise restore missing target-coverage/dense-alignment acknowledgement")
             if recovery_meta.get("recovery_mode") != spec["recovery_mode"]:
                 raise BackendError(
                     "history_kv_recovery_failed",
@@ -589,6 +595,10 @@ class SglangBackend(Backend):
             "cacheblend_deviation_max": acct.get("deviation_max"),
             "cacheblend_deviation_selected_min": acct.get("deviation_selected_min"),
             "cacheblend_cache_hit": bool(acct.get("cache_hit", False)),
+            **{f"cacheblend_{key}": acct.get(key) for key in (
+                "chunk_cache_enabled", "chunk_cache_hit_chunks", "chunk_cache_miss_chunks",
+                "chunk_cache_hit_tokens", "chunk_prefill_tokens", "chunk_cache_bytes",
+                "dense_blend_prefix_tokens")},
         }
         return out, hint
 
@@ -779,6 +789,10 @@ class SglangBackend(Backend):
             "cacheblend_chunking", "cacheblend_chunk_count",
             "cacheblend_deviation_max", "cacheblend_deviation_selected_min",
             "cacheblend_cache_hit",
+            "cacheblend_chunk_cache_enabled", "cacheblend_chunk_cache_hit_chunks",
+            "cacheblend_chunk_cache_miss_chunks", "cacheblend_chunk_cache_hit_tokens",
+            "cacheblend_chunk_prefill_tokens", "cacheblend_chunk_cache_bytes",
+            "cacheblend_dense_blend_prefix_tokens",
         )
         columns = {k: report.get(k) for k in keys}
         columns["kv_reuse_active_tokens"] = report.get("active_history_kv_tokens")

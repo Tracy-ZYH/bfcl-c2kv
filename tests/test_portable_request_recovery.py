@@ -224,3 +224,10 @@ def test_selected_record_requires_existing_proxy_out_index() -> None:
             {"operation": "append", "triggered": True},
             [{"decoded": "missing out index"}],
         )
+
+
+def test_last_window_selects_recent_documents_and_clips_short_history():
+    control = {"operation": "replace", "triggered": True, "selector": "last", "window": 2}
+    plan = plan_request_recovery(control, _records("one", "two", "three"), _decode)
+    assert plan.selected_indices == (1, 2)
+    assert plan_request_recovery(control, _records("one"), _decode).selected_indices == (0,)

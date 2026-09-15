@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import statistics
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,8 @@ METHOD_LABELS = {
     "c2kv": "C2KV",
     "streamingllm": "StreamingLLM",
     "h2o": "H2O",
-    "snapkv_persistent": "SnapKV-Persistent",
-    "snapkv": "SnapKV-Persistent",
+    "snapkv_persistent": "SnapKV",
+    "snapkv": "SnapKV",
     "snapkv_refresh": "SnapKV-Refresh",
     "pyramidkv": "PyramidKV",
     "kivi": "KIVI-QDQ",
@@ -23,6 +24,8 @@ METHOD_LABELS = {
 
 CSV_FIELDS = [
     "Method",
+    "KV Lifecycle",
+    "History KV Backend",
     "BFCL Accuracy",
     "Correct",
     "Total",
@@ -106,6 +109,9 @@ def _flatten_steps(details: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _step_rate(steps: list[dict[str, Any]], drift_key: str, match_key: str) -> float | None:
+    # Missing reference is not a successful comparison. Legacy state_drift
+    # defaults to False even when no reference state was available.
+    steps = [s for s in steps if s.get(match_key) is not None]
     if not steps:
         return None
     bad = sum(
@@ -122,7 +128,10 @@ def _turn_joint(details: list[dict[str, Any]]) -> float | None:
     for row in details:
         turns: dict[int, list[dict[str, Any]]] = {}
         for step in row.get("drift_steps") or []:
-            if isinstance(step, dict):
+            if isinstance(step, dict) and (
+                step.get("executed_action_matches_reference") is not None
+                and step.get("state_matches_reference") is not None
+            ):
                 turns.setdefault(int(step.get("turn") or 0), []).append(step)
         for steps in turns.values():
             total += 1
@@ -230,11 +239,12 @@ def _resident_storage_per_step(steps: list[dict[str, Any]]) -> float | None:
         report = step.get("kv_memory_report")
         if not isinstance(report, dict):
             continue
-        repair = _num(report.get("active_raw_repair_tokens"))
-        recomputed = _num(report.get("active_recomputed_raw_tokens"))
-        if repair is None and recomputed is None:
-            continue
-        values.append((repair or 0.0) + (recomputed or 0.0))
+        # Repair counters are NOT total resident storage. Prefer request-local
+        # canonical prompt KV; round to pages actually held by the session.
+        prompt = _num(report.get("persistent_session_prompt_physical_tokens"))
+        page = _num(report.get("page_size_tokens"))
+        if prompt is not None and page is not None and page > 0:
+            values.append(math.ceil(prompt / page) * page)
     return statistics.mean(values) if values else None
 
 
@@ -346,6 +356,8 @@ def summarize_method(run_root: Path, method: str) -> dict[str, Any]:
         status = "errors"
     return {
         "Method": METHOD_LABELS.get(method, method),
+        "KV Lifecycle": summary.get("history_kv_lifecycle_mode", "full" if method == "full" else "stateless_reselect"),
+        "History KV Backend": summary.get("runtime_history_kv_backend", "repair_extract"),
         "BFCL Accuracy": acc,
         "Correct": correct,
         "Total": total,
@@ -370,6 +382,8 @@ def summarize_method(run_root: Path, method: str) -> dict[str, Any]:
         "Measured Attention-Visible History-KV Compression": comp["measured_weighted"],
         "Estimated History-KV Byte Compression": _byte_compression(steps),
         "Resident KV Storage / Committed Step": _resident_storage_per_step(steps),
+        "Resident KV Storage Unit": "page-rounded prompt token slots",
+        "Resident KV Storage Scope": "session prompt including protected system/current; excludes decode KV",
         "Memory Report Coverage": comp["coverage"],
         "Model Calls / Committed Step": _rate(chat_calls, len(steps)),
         "Generation Prefill Tokens / Committed Step": _rate(generation_prefill, len(steps)),
@@ -411,6 +425,7 @@ def write_outputs(run_root: Path, rows: list[dict[str, Any]]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", required=True)
+    parser.add_argument("--output-root", help="Write reaggregated reports separately from original results")
     parser.add_argument("--methods", default="full,c2kv,streamingllm,h2o,snapkv_persistent,pyramidkv,kivi")
     parser.add_argument(
         "--assert-identity-against-full",
@@ -423,7 +438,9 @@ def main() -> None:
     if args.assert_identity_against_full:
         assert_identity_against_full(run_root, methods)
     rows = [summarize_method(run_root, method) for method in methods]
-    write_outputs(run_root, rows)
+    output_root = Path(args.output_root) if args.output_root else run_root
+    output_root.mkdir(parents=True, exist_ok=True)
+    write_outputs(output_root, rows)
     print(json.dumps({"run_root": str(run_root), "rows": len(rows)}, ensure_ascii=False))
 
 

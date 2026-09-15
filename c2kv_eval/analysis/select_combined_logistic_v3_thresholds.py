@@ -103,7 +103,9 @@ def main() -> None:
                 offline_rows,
                 key=lambda row: abs(float(row["threshold"]) - threshold),
             )
-            root = online_root / f"threshold_{_label(threshold)}"
+            label = (format(threshold, '.17g').replace('.', '_')
+                     if model.get('detector_variant', 'legacy') != 'legacy' else _label(threshold))
+            root = online_root / f"threshold_{label}"
             bfcl, _, _ = _score_summary(root)
             segment_diag = _segment_diagnostics(root)
             online_segments = [
@@ -154,7 +156,7 @@ def main() -> None:
                 "oracle_bfcl": oracle_bfcl,
                 "oracle_calibration_trigger_rate": oracle_trigger_rate,
                 "target_bfcl": target,
-                "detector_name": "Reference-Drift Logistic Detector",
+                "detector_name": model.get("detector_name", "Reference-Drift Logistic Detector"),
                 "online_score_min": online_shadow.get("score_min"),
                 "online_score_p10": online_shadow.get("score_p10"),
                 "online_score_p25": online_shadow.get("score_p25"),

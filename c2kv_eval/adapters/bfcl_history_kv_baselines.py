@@ -161,7 +161,7 @@ class HistoryKVCompressor:
             "pyramidkv",
             "kivi",
         }:
-            if self.runner.runtime_history_kv_backend == "physical_eviction":
+            if self.runner.runtime_history_kv_backend == "physical_eviction" and self.method != "kivi":
                 # Retention=1 is a correctness identity test. Do not route it
                 # through the multi-round eviction scheduler: even a no-op
                 # round changes request bookkeeping and cannot prove that the
@@ -196,12 +196,9 @@ class HistoryKVCompressor:
                     dropped_units=[],
                     runtime_eviction_required=True,
                     runtime_eviction_available=True,
-                    notes=[
-                        "physical history-KV baseline: SGLang full-prefills "
-                        "completed history, physically compacts surviving KV "
-                        "slots at the history/current boundary, and frees "
-                        "dropped slots before current-query prefill"
-                    ],
+                    notes=["persistent resident+delta physical eviction" if self.runner._persistent_session_enabled()
+                           else "stateless physical eviction: full-history prefill each request",
+                           "shared-token-slot selection; attention baselines are globalized approximations"],
                 )
             messages, active_tokens = self._build_runtime_history_kv(
                 completed, current, canonical_history_tokens, stats
@@ -215,7 +212,7 @@ class HistoryKVCompressor:
                 runtime_eviction_required=True,
                 runtime_eviction_available=True,
                 notes=[
-                    "runtime history-KV baseline: SGLang extracted full-causal "
+                    "stateless_reselect: SGLang extracted full-causal "
                     "history KV, selected surviving token slots, stored them in "
                     "C2KVPool, and injected the compressed entry at generation"
                 ],
@@ -413,6 +410,8 @@ class HistoryKVCompressor:
         raw_history_tokens: int,
         stats: DriftStats,
     ) -> tuple[list[dict[str, Any]], int]:
+        if self.runner._persistent_session_enabled():
+            raise RuntimeError("PERSISTENT_HISTORY_REPAIR_EXTRACT_FORBIDDEN")
         if not completed or raw_history_tokens <= 0:
             return deepcopy(list(current)), 0
         method = "snapkv_persistent" if self.method == "snapkv" else self.method
@@ -574,28 +573,30 @@ class HistoryKVBaselineRunner(HistoryDriftRunner):
         self.kivi_group_size = args.kivi_group_size
         self.kivi_residual_length = args.kivi_residual_length
         self.runtime_history_kv_backend = args.runtime_history_kv_backend
-        if self.runtime_history_kv_backend != "repair_extract":
-            raise RuntimeEvictionUnsupported(
-                "physical history-KV eviction is disabled for the baseline "
-                "benchmark; use repair_extract selection and reinjection"
-            )
-        self.persistent_history_kv_session = bool(
-            args.persistent_history_kv_session
-        )
+        if self.runtime_history_kv_backend == "stateless_reselect":
+            self.runtime_history_kv_backend = "repair_extract"
+        self.persistent_history_kv_session = (self.runtime_history_kv_backend == "physical_eviction"
+            if args.persistent_history_kv_session is None else bool(args.persistent_history_kv_session))
         self._history_kv_compressor = HistoryKVCompressor(self)
         self._active_tools: list[dict[str, Any]] = []
         self._last_runtime_history_kv_extract: dict[str, Any] | None = None
         self._last_physical_history_kv_eviction: dict[str, Any] | None = None
         self._persistent_history_session_id: str | None = None
+        self._history_kv_lifecycle_events: list[dict[str, Any]] = []
+        if self.persistent_history_kv_session and self.runtime_history_kv_backend != "physical_eviction":
+            raise RuntimeEvictionUnsupported("persistent session requires physical_eviction")
 
     def _persistent_session_enabled(self) -> bool:
         return bool(
             self.persistent_history_kv_session
             and self.runtime_history_kv_backend == "physical_eviction"
             and self.history_kv_method in RUNTIME_EVICTION_METHODS
+            and (self.history_kv_retention_ratio < 1.0 or self.history_kv_target_compression > 1.0)
         )
 
     def _open_persistent_history_session(self, sample_id: str) -> None:
+        if self._persistent_history_session_id is not None:
+            raise RuntimeError("PERSISTENT_HISTORY_SESSION_ALREADY_OPEN")
         session_id = f"bfcl-history-{sample_id}-{uuid.uuid4().hex}"
         response = HTTP.post(
             f"{self.base_url.rstrip('/')}/open_session",
@@ -618,10 +619,10 @@ class HistoryKVBaselineRunner(HistoryDriftRunner):
                 f"expected={session_id!r}, got={returned!r}"
             )
         self._persistent_history_session_id = session_id
+        self._history_kv_lifecycle_events.append({"event": "session_open", "episode_id": sample_id, "session_id": session_id})
 
     def _close_persistent_history_session(self) -> None:
         session_id = self._persistent_history_session_id
-        self._persistent_history_session_id = None
         if not session_id:
             return
         response = HTTP.post(
@@ -633,10 +634,13 @@ class HistoryKVBaselineRunner(HistoryDriftRunner):
             raise RuntimeError(
                 "PERSISTENT_HISTORY_SESSION_CLOSE_FAILED: " + response.text[:1000]
             )
+        self._persistent_history_session_id = None
+        self._history_kv_lifecycle_events.append({"event": "session_close", "session_id": session_id, "closed": True})
 
     def run_sample(self, test_case: dict[str, Any]) -> dict[str, Any]:
         stats = DriftStats(test_case["id"], self.mode, self.ratio)
         self._active_tools = _tool_payload(test_case["function"])
+        self._history_kv_lifecycle_events = []
         if self._persistent_session_enabled():
             self._open_persistent_history_session(test_case["id"])
         try:
@@ -651,10 +655,31 @@ class HistoryKVBaselineRunner(HistoryDriftRunner):
             self._close_persistent_history_session()
             self._active_tools = []
         metadata["c2kv_drift_metrics"] = stats.as_dict()
+        metadata["history_kv_lifecycle"] = deepcopy(self._history_kv_lifecycle_events)
         return {"id": test_case["id"], "result": result, **metadata}
 
     def _extract_history_unit(self, text: str, stats: DriftStats) -> ExtractRecord:
         return super()._extract_history_unit(text, stats)
+
+    def _query(self, messages, tools, stats):
+        if self._persistent_session_enabled() and not self._persistent_history_session_id:
+            raise RuntimeError("PERSISTENT_HISTORY_SESSION_NOT_OPEN")
+        result = super()._query(messages, tools, stats)
+        if self._persistent_session_enabled():
+            report = result[3].get("kv_memory_report") or {}
+            event = report.get("history_kv_lifecycle")
+            if not isinstance(event, dict):
+                raise RuntimeError("PERSISTENT_HISTORY_LIFECYCLE_REPORT_MISSING")
+            if event.get("session_id") != self._persistent_history_session_id:
+                raise RuntimeError("PERSISTENT_HISTORY_SESSION_CHANGED")
+            if event.get("full_history_reprefill_performed"):
+                raise RuntimeError("PERSISTENT_HISTORY_UNEXPECTED_FULL_REPREFILL")
+            previous = next((e.get("resident_position_summary") for e in reversed(self._history_kv_lifecycle_events)
+                             if e.get("resident_position_summary")), None)
+            if previous and event.get("previous_resident_position_summary") != previous:
+                raise RuntimeError("PERSISTENT_HISTORY_PREVIOUS_RESIDENT_NOT_REUSED")
+            self._history_kv_lifecycle_events.append(deepcopy(event))
+        return result
 
     def _build_request_messages(
         self,
@@ -677,12 +702,17 @@ class HistoryKVBaselineRunner(HistoryDriftRunner):
             ),
             "history_kv_method": self.history_kv_method,
             "estimated": True,
+            "history_kv_backend": self.runtime_history_kv_backend,
+            "history_kv_lifecycle_mode": "full" if self.history_kv_method == "full" else
+                ("persistent_eviction" if self._persistent_session_enabled() else "stateless_reselect"),
+            **getattr(self, "_history_kv_request_context", {}),
         }
         if isinstance(physical_eviction, dict):
             self._last_kv_memory_hint["history_kv_eviction"] = deepcopy(physical_eviction)
         if self._persistent_history_session_id:
             self._last_kv_memory_hint["persistent_history_session"] = {
                 "enabled": True,
+                "session_id": self._persistent_history_session_id,
             }
         runtime_extract = getattr(self, "_last_runtime_history_kv_extract", None)
         if isinstance(runtime_extract, dict):
@@ -763,6 +793,9 @@ def run(args: argparse.Namespace) -> None:
         "kivi_group_size": args.kivi_group_size,
         "kivi_residual_length": args.kivi_residual_length,
         "runtime_history_kv_backend": args.runtime_history_kv_backend,
+        "persistent_history_kv_session": runner._persistent_session_enabled(),
+        "history_kv_lifecycle_mode": "full" if args.history_kv_method == "full" else
+            ("persistent_eviction" if runner._persistent_session_enabled() else "stateless_reselect"),
         "errors": sum(
             1
             for row in details_rows
@@ -824,11 +857,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kivi-residual-length", type=int, default=32)
     parser.add_argument(
         "--runtime-history-kv-backend",
-        choices=["repair_extract", "physical_eviction"],
-        default="repair_extract",
+        choices=["repair_extract", "stateless_reselect", "physical_eviction"],
+        default="physical_eviction",
     )
     parser.add_argument("--strict-runtime-eviction", action="store_true")
-    parser.add_argument("--persistent-history-kv-session", action="store_true")
+    parser.add_argument("--persistent-history-kv-session", action="store_true", default=None)
+    parser.add_argument("--no-persistent-history-kv-session", action="store_false", dest="persistent_history_kv_session")
     parser.add_argument("--allow-client-fallback", action="store_true")
     parser.add_argument("--category", default="multi_turn_base")
     parser.add_argument("--max-examples", type=int, default=200)

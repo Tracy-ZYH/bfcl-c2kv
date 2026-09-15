@@ -26,7 +26,7 @@ TEST_IDS_TO_GENERATE_PATH = PROJECT_ROOT / "test_case_ids_to_generate.json"
 # Directory that stores all lock files (kept out of the results tree)
 LOCK_DIR = PROJECT_ROOT / ".file_locks"
 
-PROMPT_PATH = PACKAGE_ROOT / "data"
+PROMPT_PATH = Path(os.getenv("BFCL_DATA_ROOT", PACKAGE_ROOT / "data"))
 MULTI_TURN_FUNC_DOC_PATH = PROMPT_PATH / "multi_turn_func_doc"
 POSSIBLE_ANSWER_PATH = PROMPT_PATH / "possible_answer"
 MEMORY_PREREQ_CONVERSATION_PATH = PROMPT_PATH / "memory_prereq_conversation"

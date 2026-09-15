@@ -142,11 +142,6 @@ def history_kv_spec(arm: "Arm") -> Optional[Dict[str, Any]]:
         raise ValueError(f"arm {arm.name!r}: recovery_window must be >= 1")
     if int(spec.get("recovery_start_doc") or 0) < 0:
         raise ValueError(f"arm {arm.name!r}: recovery_start_doc must be >= 0")
-    if recovery_mode and method in {"h2o", "snapkv_persistent"}:
-        raise ValueError(
-            f"arm {arm.name!r}: exact deduplicated recovery is unavailable for "
-            f"headwise {method}; the current dense shared-slot entry does not "
-            "retain one common source-token set")
     if spec["persistent_session"] and backend != "physical_eviction":
         raise ValueError(
             f"arm {arm.name!r}: history_kv persistent_session requires backend "

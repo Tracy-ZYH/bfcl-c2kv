@@ -1301,6 +1301,12 @@ def retry_requested_recovery(control, messages, messages_out, counts, arm,
                                else "full_history_prefill"))})
     if getattr(arm, "history_kv", None):
         cost = retry_normalized.get("cost") or {}
+        selection_meta = cost.get("history_kv_selection") or {}
+        for key in ("recovery_semantics", "dense_alignment_extra_tokens_per_head_mean",
+                    "dense_alignment_extra_tokens_per_head_max", "target_restored_tokens_per_head_mean",
+                    "recovery_target_coverage", "operator_equivalent_for_raw_token_eviction"):
+            if key in selection_meta:
+                metadata[key] = selection_meta[key]
         metadata.update({
             "compression_backend": (arm.history_kv or {}).get("method"),
             "before_recovery_active_tokens": cost.get(

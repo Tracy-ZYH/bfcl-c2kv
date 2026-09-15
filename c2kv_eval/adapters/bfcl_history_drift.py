@@ -527,6 +527,9 @@ class HistoryDriftRunner:
         memory_hint = getattr(self, "_last_kv_memory_hint", None)
         if isinstance(memory_hint, dict):
             payload["c2kv_kv_memory_hint"] = memory_hint
+        session_id = getattr(self, "_persistent_history_session_id", None)
+        if session_id:
+            payload["session_params"] = {"id": session_id, "drop_previous_output": True}
         start = time.perf_counter()
         data = _post_json(self.base_url, "/v1/chat/completions", payload, self.timeout)
         elapsed = time.perf_counter() - start
@@ -708,6 +711,7 @@ class HistoryDriftRunner:
 
             count = 0
             while True:
+                self._history_kv_request_context = {"episode_id": test_entry_id, "turn_id": turn_idx, "step_id": count}
                 request_messages = self._build_request_messages(messages, stats)
                 text, response_message, elapsed, usage = self._query(
                     request_messages,

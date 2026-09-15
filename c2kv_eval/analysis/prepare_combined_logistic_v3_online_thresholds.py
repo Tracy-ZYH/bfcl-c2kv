@@ -72,7 +72,9 @@ def main() -> None:
     parser.add_argument("--shadow-root", required=True)
     parser.add_argument("--fold-dir", required=True)
     parser.add_argument("--target-rates", default="0.40,0.45,0.50,0.55,0.60")
+    parser.add_argument("--closed-loop-rates", default="0.45,0.50,0.55")
     args = parser.parse_args()
+    model = json.loads((Path(args.fold_dir) / "combined_logistic_v3_model.json").read_text())
     details = Path(args.shadow_root) / "logs" / "details.jsonl"
     scores = []
     detector_trigger_count = 0
@@ -81,6 +83,8 @@ def main() -> None:
         for line in handle:
             row = json.loads(line)
             for seg in row.get("repair_segments") or []:
+                if model.get("detector_variant") in {"trained", "rule"} and seg.get("logistic_detector_missing_features"):
+                    raise RuntimeError(f"online-safe coverage check failed: {seg['logistic_detector_missing_features']}")
                 if seg.get("logistic_detector_score") is not None:
                     scores.append(float(seg["logistic_detector_score"]))
                 detector_trigger_count += int(bool(seg.get("detector_trigger")))
@@ -103,18 +107,21 @@ def main() -> None:
             "target_trigger_rate": target,
             **point,
         }
-    closed_loop_candidates = _distinct_candidates(points, [0.45, 0.50, 0.55])
+    closed_loop_candidates = _distinct_candidates(points, [float(v) for v in args.closed_loop_rates.split(",")])
+    # A discrete rule may offer fewer behaviours than target budgets. Never
+    # rerun the same output directory or pretend ties meet separate budgets.
+    closed_loop_candidates = list({float(item["threshold"]): item for item in closed_loop_candidates}.values())
     fold_dir = Path(args.fold_dir)
     fold_dir.mkdir(parents=True, exist_ok=True)
     (fold_dir / "threshold_candidates.txt").write_text(
         ",".join(
-            f'{float(item["threshold"]):.12g}' for item in closed_loop_candidates
+            f'{float(item["threshold"]):.17g}' for item in closed_loop_candidates
         ) + "\n",
         encoding="utf-8",
     )
     payload = {
         "label_mode": "reference_drift",
-        "detector_name": "Reference-Drift Logistic Detector",
+        "detector_name": json.loads((fold_dir / "combined_logistic_v3_model.json").read_text()).get("detector_name", "Reference-Drift Logistic Detector"),
         "score_count": len(scores),
         "shadow_detector_trigger_count": detector_trigger_count,
         "shadow_recovery_count": recovery_count,

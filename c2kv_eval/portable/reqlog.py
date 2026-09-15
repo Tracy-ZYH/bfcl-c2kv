@@ -157,6 +157,11 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     summary["duplicate_raw_kv_tokens_total"] = sum(
         int(item.get("duplicate_raw_kv_tokens") or 0)
         for item in request_recovery_retried)
+    for key in ("dense_alignment_extra_tokens_per_head_mean",
+                "target_restored_tokens_per_head_mean", "recovery_target_coverage"):
+        summary[key] = _mean(item.get(key) for item in request_recovery_retried)
+    summary["recovery_semantics_counts"] = dict(Counter(
+        item.get("recovery_semantics", "legacy") for item in request_recovery_retried))
     summary["request_recovery_scope"] = (
         "request-local generation/KV retry; no external environment rollback")
     summary["model_calls_per_proxy_request"] = (

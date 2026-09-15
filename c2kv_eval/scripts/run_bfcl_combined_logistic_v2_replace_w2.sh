@@ -70,7 +70,18 @@ cleanup() {
   local status=$?
   for pid in "${SERVER_PIDS[@]}"; do
     if [ -n "${pid}" ] && kill -0 "${pid}" >/dev/null 2>&1; then
-      kill "${pid}" >/dev/null 2>&1 || true
+      local pgid
+      pgid="$(ps -o pgid= -p "$pid" | tr -d '[:space:]')"
+      if [ "$pgid" = "$pid" ]; then
+        kill -TERM -- "-$pid" >/dev/null 2>&1 || true
+        for attempt in $(seq 1 30); do
+          kill -0 -- "-$pid" >/dev/null 2>&1 || break
+          sleep 1
+        done
+        kill -KILL -- "-$pid" >/dev/null 2>&1 || true
+      else
+        kill "$pid" >/dev/null 2>&1 || true
+      fi
     fi
   done
   wait >/dev/null 2>&1 || true
@@ -122,7 +133,7 @@ start_server() {
     HTTP_PROXY='' \
     HTTPS_PROXY='' \
     ASCEND_RT_VISIBLE_DEVICES="${device}" \
-    exec "${SGLANG_PYTHON}" -m sglang.launch_server \
+    exec setsid "${SGLANG_PYTHON}" -m sglang.launch_server \
       --model-path "${MODEL_PATH}" \
       --tokenizer-path "${TOKENIZER_PATH}" \
       --served-model-name "${MODEL_ID}" \
@@ -289,10 +300,10 @@ run_job_list() {
 
 threshold_label() {
   local threshold="$1"
-  "${BFCL_PYTHON}" - "${threshold}" <<'PY'
+  "${BFCL_PYTHON}" - "${threshold}" "${DETECTOR_VARIANT:-legacy}" <<'PY'
 import sys
 value = float(sys.argv[1])
-print(f"{value:.6f}".rstrip("0").rstrip(".").replace(".", "_"))
+print((format(value, '.17g') if sys.argv[2] != 'legacy' else f"{value:.6f}".rstrip("0").rstrip(".")).replace(".", "_"))
 PY
 }
 
@@ -350,8 +361,10 @@ prepare_feature_csv() {
 
 train_v2_models() {
   local trainer="c2kv_eval.analysis.train_combined_logistic_v2"
+  local trainer_args=()
   if [ "${DETECTOR_VERSION}" = "3" ]; then
     trainer="c2kv_eval.analysis.train_combined_logistic_v3"
+    trainer_args+=(--variant "${DETECTOR_VARIANT:-legacy}")
   fi
   (
     cd "${ROOT}"
@@ -361,7 +374,7 @@ train_v2_models() {
       --output-dir "${RUN_ROOT}/detector_cv" \
       --folds "${FOLDS}" \
       --max-examples "${MAX_EXAMPLES}" \
-      --seed "${SEED}"
+      --seed "${SEED}" "${trainer_args[@]}"
   ) >"${RUN_ROOT}/detector_cv/train_combined_logistic_v2.log" 2>&1
 }
 
@@ -443,7 +456,8 @@ if [ "${DETECTOR_VERSION}" = "3" ] && [ "${ONLINE_SHADOW:-1}" = "1" ]; then
     "${BFCL_PYTHON}" -m c2kv_eval.analysis.prepare_combined_logistic_v3_online_thresholds \
       --shadow-root "${RUN_ROOT}/logistic_v3_online_shadow/fold_${fold}" \
       --fold-dir "${RUN_ROOT}/detector_cv/fold_${fold}" \
-      --target-rates "0.40,0.45,0.50,0.55,0.60"
+      --target-rates "0.40,0.45,0.50,0.55,0.60,0.65,0.85" \
+      --closed-loop-rates "${CLOSED_LOOP_RATES:-0.45,0.50,0.55}"
   done
 fi
 TRAIN_JOBS=()
@@ -473,6 +487,10 @@ if [ "${DETECTOR_VERSION}" = "3" ]; then
     selected_model="${RUN_ROOT}/detector_cv/fold_${fold}/combined_logistic_v3_selected_model.json"
     threshold="$(selected_v3_threshold_for_fold "${fold}")"
     FINAL_JOBS+=("combined_logistic_v3|combined_logistic_v3|${fold}|${test_ids}|${RUN_ROOT}/detector_combined_logistic_v3/fold_${fold}|${threshold}|${selected_model}")
+    if [ "${RUN_HELDOUT_CONTROLS:-0}" = "1" ]; then
+      FINAL_JOBS+=("oracle|oracle|${fold}|${test_ids}|${RUN_ROOT}/detector_oracle/fold_${fold}||")
+      FINAL_JOBS+=("never_trigger|never_trigger|${fold}|${test_ids}|${RUN_ROOT}/detector_never_trigger/fold_${fold}||")
+    fi
   done
   run_job_list FINAL_JOBS
   select_v2_thresholds

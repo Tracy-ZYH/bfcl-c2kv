@@ -137,6 +137,7 @@ def main() -> None:
     parser.add_argument("--max-examples", type=int, default=52)
     parser.add_argument("--seed", type=int, default=20260905)
     parser.add_argument("--max-features", type=int, default=12)
+    parser.add_argument("--variant", choices=["legacy", "trained", "rule"], default="legacy")
     args = parser.parse_args()
 
     import numpy as np
@@ -175,6 +176,18 @@ def main() -> None:
         cal_rows = [r for r in all_rows if str(r.get("id")) in calibration_ids]
         test_rows = [r for r in all_rows if str(r.get("id")) in test_ids]
         features, unavailable = _select_features(model_rows, max_features=args.max_features)
+        if args.variant == "trained":
+            # Avoid composite risk + its components and complementary grounding
+            # columns appearing together. Means preserve more resolution than max.
+            features = ["mean_observation_anomaly", "mean_argument_grounding_failure",
+                        "max_hard_error"]
+        elif args.variant == "rule":
+            features = ["max_risk_score"]
+        if args.variant != "legacy":
+            unavailable = []
+            for row in model_rows + cal_rows:
+                if any(_score_for_feature(f, row.get(f)) is None for f in features):
+                    raise RuntimeError("detector variant requires complete online-safe features")
         if not features:
             raise RuntimeError(f"fold {fold}: no usable model-train features")
 
@@ -182,8 +195,15 @@ def main() -> None:
         inner_train = [r for r in model_rows if str(r.get("id")) in inner_train_ids]
         inner_val = [r for r in model_rows if str(r.get("id")) in inner_val_ids]
         best = None
-        for c_value in (0.01, 0.1, 1.0, 10.0):
-            for l1_ratio in (0.0, 0.5, 1.0):
+        def weights(rows):
+            from collections import Counter
+            counts = Counter(str(r["id"]) for r in rows)
+            return np.asarray([len(rows) / (len(counts) * counts[str(r["id"])]) for r in rows])
+
+        for c_value in (() if args.variant == "rule" else (0.01, 0.1, 1.0, 10.0)):
+            # Three preselected features do not need L1 selection. In this
+            # small dataset L1 can collapse all coefficients to zero.
+            for l1_ratio in ((0.0,) if args.variant == "trained" else (0.0, 0.5, 1.0)):
                 train_x, inner_impute = _matrix(inner_train, features)
                 val_x, _ = _matrix(inner_val, features, inner_impute)
                 train_y = [int(r["_label"]) for r in inner_train]
@@ -192,7 +212,8 @@ def main() -> None:
                     continue
                 inner_scaler = StandardScaler().fit(np.asarray(train_x))
                 clf = LogisticRegression(penalty="elasticnet", solver="saga", max_iter=5000, C=c_value, l1_ratio=l1_ratio, random_state=args.seed + fold)
-                clf.fit(inner_scaler.transform(np.asarray(train_x)), np.asarray(train_y))
+                clf.fit(inner_scaler.transform(np.asarray(train_x)), np.asarray(train_y),
+                        sample_weight=weights(inner_train) if args.variant == "trained" else None)
                 scores = clf.predict_proba(inner_scaler.transform(np.asarray(val_x)))[:, 1].tolist()
                 rank = (_safe_metric(roc_auc_score, val_y, scores) or -1, _safe_metric(average_precision_score, val_y, scores) or -1)
                 if best is None or rank > best["rank"]:
@@ -201,20 +222,35 @@ def main() -> None:
 
         model_x, impute = _matrix(model_rows, features)
         model_y = [int(r["_label"]) for r in model_rows]
-        if len(set(model_y)) < 2:
+        if len(set(model_y)) < 2 and args.variant != "rule":
             raise RuntimeError(f"fold {fold}: model-train has one class")
         scaler = StandardScaler().fit(np.asarray(model_x))
         clf = LogisticRegression(penalty="elasticnet", solver="saga", max_iter=5000, C=best["C"], l1_ratio=best["l1_ratio"], random_state=args.seed + fold)
-        clf.fit(scaler.transform(np.asarray(model_x)), np.asarray(model_y))
         cal_x, _ = _matrix(cal_rows, features, impute)
         cal_y = [int(r["_label"]) for r in cal_rows]
-        cal_scores = clf.predict_proba(scaler.transform(np.asarray(cal_x)))[:, 1].tolist() if cal_rows else []
+        if args.variant == "rule":
+            # Fixed score: sigmoid(existing rule risk). No coefficient,
+            # normalizer, imputation or feature selection is learned.
+            scaler.mean_ = np.zeros(len(features))
+            scaler.scale_ = np.ones(len(features))
+            impute = {f: 0.0 for f in features}
+            clf.coef_ = np.ones((1, len(features)))
+            clf.intercept_ = np.zeros(1)
+            cal_scores = [1 / (1 + math.exp(-float(row[0]))) for row in cal_x]
+            best = {"C": None, "l1_ratio": None, "rank": (None, None)}
+        else:
+            clf.fit(scaler.transform(np.asarray(model_x)), np.asarray(model_y),
+                    sample_weight=weights(model_rows) if args.variant == "trained" else None)
+            cal_scores = clf.predict_proba(scaler.transform(np.asarray(cal_x)))[:, 1].tolist() if cal_rows else []
         dense = sorted({round(i / 100, 6) for i in range(1, 100)} | {round(s, 6) for s in cal_scores})
         shadow = [_metrics(cal_y, cal_scores, threshold) for threshold in dense]
         representatives = _representatives(shadow)
 
         model = {
             "version": "combined_logistic_v3", "fold": fold,
+            "detector_variant": args.variant,
+            "detector_name": "Fixed Rule Risk Detector" if args.variant == "rule" else "Reference-Drift Logistic Detector",
+            "supervised_training": args.variant != "rule",
             "feature_names": features, "feature_unavailable": unavailable,
             "means": dict(zip(features, map(float, scaler.mean_))),
             "scales": dict(zip(features, [float(v) or 1.0 for v in scaler.scale_])),

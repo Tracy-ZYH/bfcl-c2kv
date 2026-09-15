@@ -138,13 +138,15 @@ class TestRegistry:
             assert spec["retention_ratio"] == 0.25
 
     @pytest.mark.parametrize("method", ["h2o", "snapkv_persistent"])
-    def test_headwise_recovery_fails_loudly(self, method):
+    def test_headwise_recovery_retains_original_backend_and_budget(self, method):
         arm = Arm(
             name="unsafe", compress_history=False,
             history_kv={"method": method, "retention_ratio": 0.25,
                         "recovery_mode": "replace", "recovery_window": 2})
-        with pytest.raises(ValueError, match="headwise"):
-            history_kv_spec(arm)
+        spec = history_kv_spec(arm)
+        assert spec["method"] == method
+        assert spec["retention_ratio"] == 0.25
+        assert spec["recovery_mode"] == "replace"
 
     def test_existing_arms_untouched(self):
         for name, arm in ARMS.items():

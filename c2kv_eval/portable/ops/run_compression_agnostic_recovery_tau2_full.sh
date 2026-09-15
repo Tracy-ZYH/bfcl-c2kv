@@ -27,6 +27,9 @@ MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-4096}"
 TAU2_TASK_IDS="${TAU2_TASK_IDS:-$(seq -s, 0 49)}"
 EXPECTED_CASES="${EXPECTED_CASES:-50}"
 METHOD_FILTER="${METHOD_FILTER:-all}"
+RECOVERY_SELECTOR="${RECOVERY_SELECTOR:-first}"
+SERVER_SEED="${SERVER_SEED:-626729}"
+[[ "$RECOVERY_SELECTOR" == first || "$RECOVERY_SELECTOR" == last ]] || exit 2
 RUN_ROOT="${RUN_ROOT:-/home/zhuyuhan/runs/compression_agnostic_recovery_tau2_airline50_$(date +%Y%m%d_%H%M%S)}"
 
 IFS=, read -r DEVICE_A DEVICE_B <<<"${DEVICES}"
@@ -58,12 +61,14 @@ METHODS=(
   streamingllm_r25 streamingllm_r25_replace_w2 streamingllm_r25_append_w2
   h2o_r25 snapkv_r25
   pyramidkv_r25 pyramidkv_r25_replace_w2 pyramidkv_r25_append_w2
+  snapkv_r25_replace_w2 h2o_r25_replace_w2 snapkv_r25_append_w2 h2o_r25_append_w2
 )
 ARMS=(
   c2kv4 c2kv4 c2kv4
   history_kv_streamingllm_r25 history_kv_streamingllm_r25 history_kv_streamingllm_r25
   history_kv_h2o_r25 history_kv_snapkv_persistent_r25
   history_kv_pyramidkv_r25 history_kv_pyramidkv_r25 history_kv_pyramidkv_r25
+  history_kv_snapkv_persistent_r25 history_kv_h2o_r25 history_kv_snapkv_persistent_r25 history_kv_h2o_r25
 )
 RECOVERY=(
   ''
@@ -74,6 +79,10 @@ RECOVERY=(
   '{"operation":"append","triggered":true,"selector":"first","window":2}'
   '' '' ''
   '{"operation":"replace","triggered":true,"selector":"first","window":2}'
+  '{"operation":"append","triggered":true,"selector":"first","window":2}'
+  '{"operation":"replace","triggered":true,"selector":"first","window":2}'
+  '{"operation":"replace","triggered":true,"selector":"first","window":2}'
+  '{"operation":"append","triggered":true,"selector":"first","window":2}'
   '{"operation":"append","triggered":true,"selector":"first","window":2}'
 )
 
@@ -106,13 +115,13 @@ snapkv_r25	history_kv_snapkv_persistent_r25	compression_only
 pyramidkv_r25	history_kv_pyramidkv_r25	compression_only
 pyramidkv_r25_replace_w2	history_kv_pyramidkv_r25	replace_w2
 pyramidkv_r25_append_w2	history_kv_pyramidkv_r25	append_w2
+snapkv_r25_replace_w2	history_kv_snapkv_persistent_r25	replace_w2
+h2o_r25_replace_w2	history_kv_h2o_r25	replace_w2
+snapkv_r25_append_w2	history_kv_snapkv_persistent_r25	append_w2
+h2o_r25_append_w2	history_kv_h2o_r25	append_w2
 EOF
 cat >"${RUN_ROOT}/manifests/unsupported.tsv" <<'EOF'
 method	portable_arm	compression_backend	recovery_mode	reason
-h2o_r25_replace_w2	history_kv_h2o_r25	h2o	replace_w2	headwise source indices cannot be exactly deduplicated in the current shared dense-slot entry
-h2o_r25_append_w2	history_kv_h2o_r25	h2o	append_w2	headwise source indices cannot be exactly deduplicated in the current shared dense-slot entry
-snapkv_r25_replace_w2	history_kv_snapkv_persistent_r25	snapkv_persistent	replace_w2	headwise source indices cannot be exactly deduplicated in the current shared dense-slot entry
-snapkv_r25_append_w2	history_kv_snapkv_persistent_r25	snapkv_persistent	append_w2	headwise source indices cannot be exactly deduplicated in the current shared dense-slot entry
 EOF
 {
   echo "created_at=$(date --iso-8601=seconds)"
@@ -128,7 +137,8 @@ EOF
   echo "task_ids=${TAU2_TASK_IDS}"
   echo "method_filter=${METHOD_FILTER} selected_count=${SELECTED_COUNT}"
   echo "upstream_timeout=${UPSTREAM_TIMEOUT} max_completion_tokens=${MAX_COMPLETION_TOKENS}"
-  echo "trigger=controlled_always selector=first window=2 scope=request-local"
+  echo "trigger=controlled_always selector=${RECOVERY_SELECTOR} window=2 scope=request-local"
+  echo "headwise_recovery=headwise_raw_union_dense_completion_v1 server_seed=${SERVER_SEED}"
 } >"${RUN_ROOT}/manifests/run_manifest.txt"
 git -C "${BFCL_ROOT}" diff >"${RUN_ROOT}/manifests/bfcl_dirty.diff"
 git -C "${SGLANG_ROOT}" diff >"${RUN_ROOT}/manifests/sglang_dirty.diff"
@@ -147,6 +157,7 @@ start_server() {
         --attention-backend ascend --tool-call-parser qwen25 --enable-c2kv \
         --dtype bfloat16 --c2kv-pool-fraction "${C2KV_POOL_FRACTION}" \
         --mem-fraction-static "${MEM_FRACTION_STATIC}" --disable-cuda-graph \
+        --random-seed "${SERVER_SEED}" \
         --host 127.0.0.1 --port "${port}"
   ) >"${server_log}" 2>&1 &
   STARTED_SERVER_PID=$!
@@ -197,6 +208,7 @@ run_shard() {
   for index in "${!METHODS[@]}"; do
     if (( index % 2 != shard )); then continue; fi
     local method="${METHODS[$index]}" arm="${ARMS[$index]}" recovery="${RECOVERY[$index]}"
+    recovery="${recovery//\"selector\":\"first\"/\"selector\":\"${RECOVERY_SELECTOR}\"}"
     if ! method_selected "${method}"; then continue; fi
     local server_log="${RUN_ROOT}/logs/server_tau2_${method}_card${device}_${server_port}.log"
     local out="${RUN_ROOT}/full/tau2/${method}" proxy_port=$((proxy_base + index))

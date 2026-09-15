@@ -21,7 +21,7 @@ from .agent.d_witness_core import select_k_star
 RECOVERY_CONTROL_FIELD = "c2kv_recovery_control"
 
 _OPERATIONS = {"append", "replace", "retry_full"}
-_SELECTORS = {"first", "witness", "index"}
+_SELECTORS = {"first", "last", "witness", "index"}
 _CONTROL_KEYS = {
     "operation",
     "triggered",
@@ -205,6 +205,8 @@ def plan_request_recovery(
 
     if selector == "first":
         selected_index = 0
+    elif selector == "last":
+        selected_index = max(0, candidate_count - window)
     elif selector == "index":
         assert target_index is not None
         if not 0 <= target_index < candidate_count:
@@ -273,8 +275,8 @@ def apply_history_recovery_to_arm(arm: Any, plan: RequestRecoveryPlan) -> Any:
 
     The server receives exact source-token indices for the selected W-window
     and unions only missing raw tokens with the retained common-index cache.
-    Headwise H2O/SnapKV are rejected by ``history_kv_spec`` because a dense
-    shared slot cannot represent a different dedup mask for every KV head.
+    Headwise H2O/SnapKV use a raw-token superset to equalize dense lengths;
+    server accounting records the extra raw tokens used for alignment.
     """
     if not isinstance(plan, RequestRecoveryPlan):
         raise TypeError("plan must be a RequestRecoveryPlan")
