@@ -29,6 +29,10 @@ CSV_FIELDS = [
     "BFCL Accuracy",
     "Correct",
     "Total",
+    "Output Tokens",
+    "Max Completion Tokens",
+    "Output Limit Hits",
+    "Output Limit Hit Rate",
     "Turn Joint",
     "Candidate Action Drift",
     "Executed Action Drift",
@@ -41,6 +45,8 @@ CSV_FIELDS = [
     "Measured Attention-Visible History-KV Compression",
     "Estimated History-KV Byte Compression",
     "Resident KV Storage / Committed Step",
+    "Resident KV Storage Unit",
+    "Resident KV Storage Scope",
     "Memory Report Coverage",
     "Model Calls / Committed Step",
     "Generation Prefill Tokens / Committed Step",
@@ -347,8 +353,19 @@ def summarize_method(run_root: Path, method: str) -> dict[str, Any]:
         if isinstance(step.get("kv_memory_report"), dict)
         and step["kv_memory_report"].get("history_kv_runtime_status")
     }
+    def output_counts(value):
+        if isinstance(value, list):
+            return [number for item in value for number in output_counts(item)]
+        number = _num(value)
+        return [number] if number is not None else []
+    output_tokens = [number for detail in details
+                     for number in output_counts(detail.get("output_token_count"))]
+    output_limit = _num(summary.get("max_completion_tokens"))
+    saturated = (sum(number >= output_limit for number in output_tokens)
+                 if output_limit is not None else None)
     status = ",".join(sorted(runtime_statuses)) if runtime_statuses else "ok"
-    if comp["coverage"] is not None and comp["coverage"] < 1.0:
+    if (summary.get("history_kv_lifecycle_mode") == "persistent_eviction"
+            and comp["coverage"] is not None and comp["coverage"] < 1.0):
         status = f"{status},memory_report_incomplete"
     if not root.exists():
         status = "missing"
@@ -361,6 +378,10 @@ def summarize_method(run_root: Path, method: str) -> dict[str, Any]:
         "BFCL Accuracy": acc,
         "Correct": correct,
         "Total": total,
+        "Output Tokens": sum(output_tokens) if output_tokens else None,
+        "Max Completion Tokens": output_limit,
+        "Output Limit Hits": saturated,
+        "Output Limit Hit Rate": _rate(saturated, len(output_tokens)) if saturated is not None else None,
         "Turn Joint": _turn_joint(details),
         "Candidate Action Drift": _step_rate(
             steps, "candidate_action_drift", "candidate_action_matches_reference"

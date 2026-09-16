@@ -784,6 +784,7 @@ def run(args: argparse.Namespace) -> None:
         "history_kv_method": args.history_kv_method,
         "category": args.category,
         "num_examples": len(details_rows),
+        "max_completion_tokens": args.max_completion_tokens,
         "strict_runtime_eviction": args.strict_runtime_eviction,
         "allow_client_fallback": args.allow_client_fallback,
         "history_kv_retention_ratio": args.history_kv_retention_ratio,

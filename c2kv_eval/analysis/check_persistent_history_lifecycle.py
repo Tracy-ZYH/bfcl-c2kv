@@ -48,6 +48,16 @@ def main():
         assert len(current_ids) == len(set(current_ids)) == a.expected_examples, f'{m}: incomplete episodes'
         assert ids is None or ids == current_ids, 'baseline episode IDs/order differ'
         ids = current_ids
+        summary_path = a.run_root/m/'logs/summary.json'
+        summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+        lifecycle_mode = summary.get('history_kv_lifecycle_mode')
+        if lifecycle_mode != 'persistent_eviction':
+            # Retention=1 is deliberately routed through ordinary Full serving
+            # and therefore has no session events to validate. Still validate
+            # completeness and identical episode ordering above.
+            print(f'SKIP {m}: lifecycle={lifecycle_mode or "unknown"}; '
+                  'no persistent session expected')
+            continue
         requests = multi_turn = 0
         for row in rows:
             sid, n, turns = validate_episode(row)
