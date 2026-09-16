@@ -137,6 +137,15 @@ class TestRegistry:
             spec = history_kv_spec(get_arm(f"history_kv_{method}_r25"))
             assert spec["retention_ratio"] == 0.25
 
+    def test_r25_persistent_names_use_physical_sessions(self):
+        for method in ("streamingllm", "h2o", "snapkv_persistent", "pyramidkv"):
+            spec = history_kv_spec(
+                get_arm(f"history_kv_{method}_r25_persistent"))
+            assert spec["retention_ratio"] == 0.25
+            assert spec["target_tokens"] is None
+            assert spec["backend"] == "physical_eviction"
+            assert spec["persistent_session"] is True
+
     @pytest.mark.parametrize("method", ["h2o", "snapkv_persistent"])
     def test_headwise_recovery_retains_original_backend_and_budget(self, method):
         arm = Arm(
@@ -164,8 +173,6 @@ class TestRegistry:
         {"method": "streamingllm", "retention_ratio": 0.3, "recent_window": 0},
         {"method": "streamingllm", "retention_ratio": 0.3, "backend": "client"},
         {"method": "streamingllm", "retention_ratio": 0.3, "typo": 1},
-        # physical eviction has no server-side retention ratio
-        {"method": "h2o", "retention_ratio": 0.3, "backend": "physical_eviction"},
         # a streaming session only exists on the physical path
         {"method": "h2o", "retention_ratio": 0.3, "persistent_session": True},
     ])
@@ -399,8 +406,19 @@ class TestPhysicalEvictionPath:
             {"messages": out}, self.SESSION_ARM, None, context={"history_kv": ctx})
         assert prepared["session_params"] == {"id": "sess-1"}
         hint = prepared["c2kv_kv_memory_hint"]
-        assert hint["persistent_history_session"] == {"enabled": True}
+        assert hint["persistent_history_session"] == {
+            "enabled": True, "session_id": "sess-1"}
         assert hint["history_kv_eviction"]["persistent_session"] is True
+
+    def test_ratio_budget_is_deferred_to_server_tokenization(self):
+        arm = get_arm("history_kv_h2o_r25_persistent")
+        out, counts, ctx = _context(_messages(), arm)
+        ctx["session_id"] = "sess-ratio"
+        prepared = SglangBackend(FakePost({})).prepare_chat(
+            {"messages": out}, arm, None, context={"history_kv": ctx})
+        eviction = prepared["c2kv_kv_memory_hint"]["history_kv_eviction"]
+        assert eviction["retention_ratio"] == 0.25
+        assert "target_tokens" not in eviction
 
     def test_open_session_payload(self):
         post = FakePost({"/open_session": lambda p: p["session_id"]})
@@ -419,6 +437,15 @@ class TestPhysicalEvictionPath:
             SglangBackend(post).open_history_session("sess-3")
         assert excinfo.value.kind == "history_kv_session_failed"
 
+    def test_close_session_payload(self):
+        post = FakePost({"/close_session": {}})
+        SglangBackend(post).close_history_session("sess-4")
+        assert post.calls == [{
+            "path": "/close_session",
+            "payload": {"session_id": "sess-4"},
+            "timeout": 60,
+        }]
+
     def test_proxy_reuses_one_session_per_conversation(self, monkeypatch):
         opened = []
 
@@ -427,14 +454,41 @@ class TestPhysicalEvictionPath:
                 opened.append(session_id)
                 return session_id
 
+            def close_history_session(self, session_id, timeout=60):
+                pass
+
         monkeypatch.setattr(proxy_mod, "BACKEND", Fake(FakePost({})))
         monkeypatch.setattr(proxy_mod.STATE, "history_sessions", {})
+        monkeypatch.setattr(proxy_mod.STATE, "history_session_last_seen", {})
+        monkeypatch.setattr(proxy_mod.STATE, "max_history_sessions", 2)
         first = proxy_mod._history_session_id("conv-a")
         again = proxy_mod._history_session_id("conv-a")
         other = proxy_mod._history_session_id("conv-b")
         assert first == again and first != other
         assert opened == [first, other]
         assert first.startswith("c2kv-bench-history-conv-a")
+
+    def test_proxy_lru_closes_completed_conversation(self, monkeypatch):
+        opened, closed = [], []
+
+        class Fake(SglangBackend):
+            def open_history_session(self, session_id, timeout=600):
+                opened.append(session_id)
+                return session_id
+
+            def close_history_session(self, session_id, timeout=60):
+                closed.append(session_id)
+
+        monkeypatch.setattr(proxy_mod, "BACKEND", Fake(FakePost({})))
+        monkeypatch.setattr(proxy_mod.STATE, "history_sessions", {})
+        monkeypatch.setattr(proxy_mod.STATE, "history_session_last_seen", {})
+        monkeypatch.setattr(proxy_mod.STATE, "max_history_sessions", 1)
+        first = proxy_mod._history_session_id("conv-a")
+        second = proxy_mod._history_session_id("conv-b")
+        assert first != second
+        assert closed == [first]
+        proxy_mod._close_all_history_sessions()
+        assert closed == [first, second]
 
 
 # ------------------------------------------------------------ proxy wiring

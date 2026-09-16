@@ -22,6 +22,19 @@ retention 后缀统一表示保留比例：`r312=31.2%≈3.2×`、`r25=25%=4×`�
 `r125=12.5%=8×`。旧的 `r250` 仅保留为 `r25` 的兼容别名，新结果使用
 `r25`。
 
+正式多轮 history-KV baseline 使用带 `_persistent` 后缀的 arm，例如
+`history_kv_h2o_r25_persistent`。它们走 `physical_eviction`，同一 case 复用
+一个 streaming session；服务端按实际 tokenizer 得到的 completed-history span
+计算 25% budget，每轮只 prefill canonical 新增 delta。原来的 `*_r25`/`*_r312`
+继续表示 `repair_extract` 的每轮 full-history reselect，仅用于旧结果复现和
+request-local append/replace ablation，不能标成 persistent。
+
+portable proxy 将 session 数限制为 harness worker 数：新 case 开始时关闭 LRU
+已完成 case，proxy 退出时关闭全部剩余 session。正式结果必须在 request log 中
+同时看到 `history_kv_backend=physical_eviction`、同一 case 不变的 session id、
+`history_kv_lifecycle.full_history_reprefill_performed=false`，且下一轮的
+`previous_resident_position_summary` 对应上一轮的 `resident_position_summary`。
+
 受控 smoke 使用 always-trigger、`selector=first`、`window=2`，只用于隔离
 Selective Raw-KV Recovery operator；它是 request-local generation/KV retry，
 不会回滚 tau2 或 ToolSandbox 已执行的工具/环境状态。

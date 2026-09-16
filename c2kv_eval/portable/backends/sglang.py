@@ -335,6 +335,12 @@ class SglangBackend(Backend):
                 f"{json.dumps(result)[:500]}")
         return session_id
 
+    def close_history_session(self, session_id: str, timeout: int = 60) -> None:
+        """Release both the server session KV and its canonical-token ledger."""
+        self._post_json(
+            "/close_session", {"session_id": session_id}, timeout
+        )
+
     # ---- history-KV request shaping ----
     @staticmethod
     def _history_kv_carrier(method: str, key_hash: str) -> Dict[str, Any]:
@@ -371,12 +377,10 @@ class SglangBackend(Backend):
 
         if str(spec["backend"]) == "physical_eviction":
             count = int(history["history_message_count"])
-            target = int(spec["target_tokens"])
             eviction = {
                 "method": method,
                 # the server resolves the token range itself in its own frame
                 "history_message_count": count,
-                "target_tokens": target,
                 "retention_ratio": spec.get("retention_ratio"),
                 "history_kv_recent_window": int(spec["recent_window"]),
                 "history_kv_kernel_size": int(spec["kernel_size"]),
@@ -384,6 +388,8 @@ class SglangBackend(Backend):
                 "history_kv_h2o_recent_fraction": float(spec["h2o_recent_fraction"]),
                 "persistent_session": bool(session_id),
             }
+            if spec.get("target_tokens") is not None:
+                eviction["target_tokens"] = int(spec["target_tokens"])
             hint: Dict[str, Any] = {
                 # left at 0 on purpose: serving_chat._resolve_history_kv_
                 # eviction_range overwrites it with the server's own exact
@@ -401,7 +407,10 @@ class SglangBackend(Backend):
                 "history_kv_eviction": eviction,
             }
             if session_id:
-                hint["persistent_history_session"] = {"enabled": True}
+                hint["persistent_history_session"] = {
+                    "enabled": True,
+                    "session_id": session_id,
+                }
             return list(messages), hint, session_id
 
         record = self.history_kv_extract(
@@ -767,6 +776,18 @@ class SglangBackend(Backend):
                 "freed_physical_slots", report.get("physical_slots_freed")),
             "history_kv_freed_bytes": physical.get("freed_kv_bytes"),
             "history_kv_selection_reason": report.get("selection_reason"),
+            # Persistent lifecycle evidence emitted by SessionAwareCache /
+            # the scheduler.  Keeping the nested event as well as the two
+            # headline fields makes request logs directly auditable.
+            "history_kv_lifecycle": report.get("history_kv_lifecycle"),
+            "history_kv_persistent_session": report.get(
+                "persistent_history_session"),
+            "history_kv_full_reprefill": (
+                (report.get("history_kv_lifecycle") or {}).get(
+                    "full_history_reprefill_performed")
+                if isinstance(report.get("history_kv_lifecycle"), dict)
+                else None
+            ),
         }
         return {k: v for k, v in columns.items() if v is not None}
 

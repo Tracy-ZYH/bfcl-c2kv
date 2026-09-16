@@ -95,6 +95,10 @@ class Backend:
         session id the server acknowledged."""
         raise NotImplementedError
 
+    def close_history_session(self, session_id: str, timeout: int = 60) -> None:
+        """Close a physical history session and release its resident KV."""
+        raise NotImplementedError
+
     def kv_reuse_extract(self, history_docs: List[Dict[str, Any]],
                          system_text: str,
                          tools: Optional[List[Dict[str, Any]]],

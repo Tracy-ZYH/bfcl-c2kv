@@ -69,6 +69,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import threading
 import time
 import uuid
@@ -286,7 +287,7 @@ class UpstreamError(RuntimeError):
 
 
 def _post_json(path: str, payload: Dict[str, Any],
-               timeout: int, retries: int = 2) -> Dict[str, Any]:
+               timeout: int, retries: int = 2) -> Any:
     """POST JSON to UPSTREAM, retrying 5xx/network failures with backoff.
 
     4xx (except 429) are deterministic client errors and are not retried.
@@ -303,7 +304,9 @@ def _post_json(path: str, payload: Dict[str, Any],
         )
         try:
             with _OPENER.open(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                response_body = resp.read().decode("utf-8")
+                # /close_session intentionally returns HTTP 200 with no JSON.
+                return json.loads(response_body) if response_body.strip() else {}
         except HTTPError as error:
             text = ""
             try:
@@ -1402,6 +1405,8 @@ class ProxyState:
         # conversation_id -> server streaming-session id (physical-eviction
         # history-KV arms only)
         self.history_sessions: Dict[str, str] = {}
+        self.history_session_last_seen: Dict[str, float] = {}
+        self.max_history_sessions: int = 1
         self.gold_choices = {}
         self.gold_plans = {}
 
@@ -1409,33 +1414,54 @@ class ProxyState:
 STATE = ProxyState()
 
 
+def _close_history_session(session_id: str) -> None:
+    BACKEND.close_history_session(session_id)
+
+
 def _history_session_id(conv: str) -> str:
     """Streaming-session id for ``conv``, opened once on the server.
 
-    The physical-eviction baselines only mean anything when the compacted KV
-    survives across turns, which on this server needs a streaming session
-    (``--enable-streaming-session``) whose id rides on every chat request of
-    the conversation.  The upstream client holds that id per BFCL sample and
-    closes it at the end; a stateless HTTP proxy has no end-of-conversation
-    signal, so:
-
-    * the id is keyed by ``proxy.conversation_id``, which by construction
-      SHIFTS ONCE after a conversation grows past its first message (see
-      conversation_id) — such a conversation opens two sessions, the second
-      starting from an empty prefix;
-    * sessions are never closed, so they live until the server restarts.
-
-    Both limitations are documented in README "History-KV eviction arms".
+    The proxy has no benchmark-specific episode-end callback.  It therefore
+    bounds sessions to harness concurrency and closes the least-recently-used
+    conversation when the next worker starts a new case.  All remaining
+    sessions are closed on normal termination/SIGTERM.
     """
     with STATE.lock:
         session_id = STATE.history_sessions.get(conv)
         if session_id:
+            STATE.history_session_last_seen[conv] = time.monotonic()
             return session_id
+        evicted = None
+        if len(STATE.history_sessions) >= STATE.max_history_sessions:
+            oldest = min(
+                STATE.history_sessions,
+                key=lambda key: STATE.history_session_last_seen.get(key, 0.0),
+            )
+            evicted = STATE.history_sessions.pop(oldest)
+            STATE.history_session_last_seen.pop(oldest, None)
+    if evicted:
+        _close_history_session(evicted)
     session_id = f"c2kv-bench-history-{conv[:16]}-{uuid.uuid4().hex}"
     BACKEND.open_history_session(session_id)
     with STATE.lock:
-        STATE.history_sessions.setdefault(conv, session_id)
-        return STATE.history_sessions[conv]
+        existing = STATE.history_sessions.setdefault(conv, session_id)
+        STATE.history_session_last_seen[conv] = time.monotonic()
+    if existing != session_id:
+        _close_history_session(session_id)
+    return existing
+
+
+def _close_all_history_sessions() -> None:
+    with STATE.lock:
+        sessions = list(STATE.history_sessions.values())
+        STATE.history_sessions.clear()
+        STATE.history_session_last_seen.clear()
+    for session_id in sessions:
+        try:
+            _close_history_session(session_id)
+        except Exception as error:  # shutdown must continue releasing others
+            print(f"warning: failed to close history session {session_id}: {error}",
+                  flush=True)
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
@@ -1504,7 +1530,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     messages, ARM, counts, oracle, payload.get("tools"), messages_out)
             history_ctx = _history_kv_context(messages_out, counts, ARM)
             if history_ctx is not None:
-                if history_ctx["spec"]["persistent_session"]:
+                # Do not open a session for the no-history first request.  Its
+                # conversation fingerprint is intentionally less stable than
+                # the ID formed once the first completed turn exists.
+                if (history_ctx["spec"]["persistent_session"]
+                        and history_ctx.get("history_text")):
                     history_ctx["session_id"] = _history_session_id(conv)
                 counts["history_kv"] = {
                     k: history_ctx[k] for k in
@@ -1902,6 +1932,8 @@ def main(argv=None):
                         help="seconds for one generation request; timed-out requests are aborted, not retried")
     parser.add_argument("--max-completion-tokens", type=int, default=0,
                         help="inject this limit only when the harness omitted both OpenAI token limits (0 disables)")
+    parser.add_argument("--max-history-sessions", type=int, default=1,
+                        help="maximum persistent history sessions; set to harness worker count")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--record-reference", default="",
                         help="append a reference-trajectory row per request (full-arm run)")
@@ -1927,10 +1959,12 @@ def main(argv=None):
     MAX_DOC_LENGTH = int(args.max_doc_length)
     MAX_DOC_NUM = int(args.max_doc_num)
     QUERY_PROJECTION = args.query_projection
-    if args.upstream_timeout <= 0 or args.max_completion_tokens < 0:
-        parser.error("--upstream-timeout must be positive and --max-completion-tokens non-negative")
+    if (args.upstream_timeout <= 0 or args.max_completion_tokens < 0
+            or args.max_history_sessions < 1):
+        parser.error("timeouts/session limits must be positive and max-completion-tokens non-negative")
     UPSTREAM_TIMEOUT = int(args.upstream_timeout)
     MAX_COMPLETION_TOKENS = int(args.max_completion_tokens)
+    STATE.max_history_sessions = int(args.max_history_sessions)
     ARM = get_arm(args.arm)
     UPSTREAM = args.upstream.rstrip("/")
     REQUEST_LOG_PATH = args.request_log
@@ -1949,7 +1983,18 @@ def main(argv=None):
           f"upstream_timeout={UPSTREAM_TIMEOUT} "
           f"max_completion_tokens={MAX_COMPLETION_TOKENS or 'harness'} listening on "
           f"{args.host}:{args.port} -> {UPSTREAM}", flush=True)
-    server.serve_forever()
+    def _shutdown_signal(signum, frame):
+        raise SystemExit(128 + signum)
+
+    old_term = signal.signal(signal.SIGTERM, _shutdown_signal)
+    old_int = signal.signal(signal.SIGINT, _shutdown_signal)
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        _close_all_history_sessions()
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGINT, old_int)
 
 
 if __name__ == "__main__":

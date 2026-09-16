@@ -20,7 +20,7 @@ defined once in docs/hybrid_spec.md (canonical gist_first layout):
                 advances;
               in_place (*_repair_inplace) = D-harness replaceG, the span
                 replaces the doc's gist.
-* history_kv_<method>_r<per-mille> — the upstream history-KV eviction
+* history_kv_<method>_r<ratio> — the legacy stateless history-KV eviction
             baselines (StreamingLLM / H2O / SnapKV / PyramidKV) ported from
             kvoffload-sglang ``c2kv_eval.adapters.bfcl_history_kv_baselines``.
             No gist compression: the completed history is prefilled once by
@@ -28,8 +28,12 @@ defined once in docs/hybrid_spec.md (canonical gist_first layout):
             ``history_kv_retention_ratio``, the server selects the surviving
             token slots and stores them as ONE repair entry, and the chat
             request carries that entry on a repair-only carrier message in
-            place of the history text.  See README "History-KV eviction arms"
-            for the deviations from the upstream client.
+            place of the history text.  These arms reselect full history on
+            every request and are retained for recovery ablations.
+* history_kv_<method>_r25_persistent — the formal multi-turn baseline:
+            physical eviction plus one streaming KV session per episode.  A
+            turn appends only its canonical prompt delta to the prior resident
+            KV before applying the method-specific eviction again.
 * *_recover — step-level oracle recover (docs/hybrid_spec.md "Oracle
             recover"): the proxy diffs every generated action against a
             full-arm reference trajectory keyed by message fingerprint; at
@@ -123,17 +127,9 @@ def history_kv_spec(arm: "Arm") -> Optional[Dict[str, Any]]:
     if not 0.0 <= float(spec["h2o_recent_fraction"]) <= 1.0:
         raise ValueError(
             f"arm {arm.name!r}: history_kv h2o_recent_fraction must be in [0, 1]")
-    if backend == "physical_eviction" and target is None:
-        # The physical path takes an ABSOLUTE budget: the scheduler reads
-        # config["target_tokens"] only (scheduler.py
-        # _select_history_kv_eviction_indices, mem_cache/history_kv_eviction.py
-        # PhysicalHistoryKVEvictor.evict) and never derives it from a ratio,
-        # and this proxy has no tokenizer with which to convert one.  See
-        # README "History-KV eviction arms".
-        raise ValueError(
-            f"arm {arm.name!r}: history_kv backend 'physical_eviction' needs an "
-            "absolute target_tokens (the server has no retention_ratio on that "
-            "path and the proxy has no tokenizer)")
+    # Ratio-only physical eviction is resolved by the SGLang OpenAI serving
+    # layer after it has rendered the exact prompt and isolated the completed
+    # history span.  The proxy deliberately does not tokenize this itself.
     recovery_mode = spec.get("recovery_mode")
     if recovery_mode not in (None, "replace", "append"):
         raise ValueError(
@@ -629,8 +625,29 @@ for _method in ("h2o", "snapkv_persistent", "streamingllm", "pyramidkv"):
         ARMS[_name] = Arm(
             name=_name, compress_history=False,
             history_kv={"method": _method, "retention_ratio": _retention},
-            description=f"{_method} history KV at retention {_retention}; selection provenance must be read from server metadata",
+            description=f"{_method} stateless full-history reselect at retention {_retention}; retained for recovery/reproduction only",
         )
+
+# Formal persistent 4x baselines.  Keep the legacy r25 names above unchanged:
+# compression-agnostic append/replace experiments still use repair_extract,
+# whose request-local recovery protocol is not a physical-session restore.
+for _method in ("h2o", "snapkv_persistent", "streamingllm", "pyramidkv"):
+    _name = f"history_kv_{_method}_r25_persistent"
+    ARMS[_name] = Arm(
+        name=_name,
+        compress_history=False,
+        history_kv={
+            "method": _method,
+            "retention_ratio": 0.25,
+            "backend": "physical_eviction",
+            "persistent_session": True,
+        },
+        description=(
+            f"{_method} persistent physical history-KV eviction at 25% "
+            "retention; previous resident KV plus the new canonical turn "
+            "delta is evicted without full-history re-prefill"
+        ),
+    )
 
 # Compatibility aliases for the briefly-used per-mille spelling.  New output
 # and manifests use r25, whose meaning is unambiguously 25% retention.

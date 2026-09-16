@@ -498,6 +498,7 @@ def test_main_sha_suffixes_run_name_and_out(monkeypatch, tmp_path):
     assert seen["start"]["doc_packing"] == "turn"
     assert seen["start"]["upstream_timeout"] == 321
     assert seen["start"]["max_completion_tokens"] == 1024
+    assert seen["start"]["max_history_sessions"] == 4
 
 
 def test_main_text_arm_adds_textarm_summary(monkeypatch, tmp_path):

@@ -285,6 +285,11 @@ def apply_history_recovery_to_arm(arm: Any, plan: RequestRecoveryPlan) -> Any:
     config = dict(getattr(arm, "history_kv", None) or {})
     if not config:
         raise ValueError("history recovery requires a history_kv arm")
+    if config.get("backend") == "physical_eviction":
+        raise ValueError(
+            "request-local append/replace currently targets the stateless "
+            "repair_extract protocol; use the explicit *_r25 arm, not a "
+            "*_r25_persistent arm")
     config.update({
         "recovery_mode": plan.operation,
         "recovery_window": len(plan.selected_indices) or 1,

@@ -53,7 +53,8 @@ def start_proxy(upstream: str, arm: str, port: int, log_dir: Path,
                 max_doc_length: int = 512, max_doc_num: int = 12,
                 query_projection: str | None = None, witness_tokenizer: str = "",
                 python_bin: str | None = None, recovery_control: str = "",
-                upstream_timeout: int = 600, max_completion_tokens: int = 0):
+                upstream_timeout: int = 600, max_completion_tokens: int = 0,
+                max_history_sessions: int = 1):
     # A health probe alone cannot prove that *our* child owns the port: when a
     # stale/concurrent proxy was already listening, the new child failed bind
     # while run.py accepted the old proxy's /health and sent an entire harness
@@ -79,6 +80,7 @@ def start_proxy(upstream: str, arm: str, port: int, log_dir: Path,
         "--max-doc-num", str(max_doc_num),
         "--upstream-timeout", str(upstream_timeout),
         "--max-completion-tokens", str(max_completion_tokens),
+        "--max-history-sessions", str(max_history_sessions),
     ]
     if record_reference:
         command += ["--record-reference", record_reference]
@@ -307,7 +309,8 @@ def main(argv=None):
         if get_arm(args.arm).gold_recovery or args.recovery_control else "",
         python_bin=args.proxy_python, recovery_control=args.recovery_control,
         upstream_timeout=args.upstream_timeout,
-        max_completion_tokens=args.max_completion_tokens)
+        max_completion_tokens=args.max_completion_tokens,
+        max_history_sessions=max(1, int(args.num_workers)))
     try:
         # every adapter owns its own "/v1" (adapters/base.py:v1) and its own
         # cwd; run.py hands over the bare proxy URL and nothing else
