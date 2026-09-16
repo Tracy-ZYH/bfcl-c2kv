@@ -380,6 +380,8 @@ class SglangBackend(Backend):
             eviction = {
                 "method": method,
                 # the server resolves the token range itself in its own frame
+                "history_start_message_count": int(
+                    history.get("history_start_message_count") or 0),
                 "history_message_count": count,
                 "retention_ratio": spec.get("retention_ratio"),
                 "history_kv_recent_window": int(spec["recent_window"]),

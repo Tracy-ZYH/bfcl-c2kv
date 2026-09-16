@@ -200,6 +200,7 @@ class TestProxySplit:
         # history = everything before the current block, minus the system msg
         assert ctx["history_out_indices"] == list(range(1, cutoff))
         assert ctx["history_message_count"] == cutoff
+        assert ctx["history_start_message_count"] == 1
         assert ctx["system_text"] == "sys prompt"
         assert ctx["n_history_messages"] == cutoff - 1
         # turn-doc packing of the completed history (same text the c2kv arm
@@ -384,6 +385,7 @@ class TestPhysicalEvictionPath:
         hint = prepared["c2kv_kv_memory_hint"]
         assert hint["history_kv_eviction"] == {
             "method": "h2o",
+            "history_start_message_count": 1,
             "history_message_count": counts["current_start_out_index"],
             "target_tokens": 256,
             "retention_ratio": None,

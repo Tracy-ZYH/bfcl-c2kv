@@ -920,10 +920,10 @@ def _history_kv_context(out_messages: List[Dict[str, Any]],
     history normalized into the training dialect and packed into turn docs
     (``_normalize_history_message`` + ``_turn_docs``), joined into one span so
     a single budget covers the whole history exactly as upstream applies it.
-    ``history_message_count`` is instead a count of LEADING assembled
-    messages, which is what the physical-eviction path sends to the server
-    (system message included: the server's own range resolution starts at
-    message 0).
+    ``history_start_message_count`` / ``history_message_count`` are the two
+    LEADING-message boundaries sent to the physical-eviction server.  This
+    keeps the tool-bearing system prefix protected while selecting the exact
+    completed-history span in the server's tokenizer frame.
     """
     spec = history_kv_spec(arm)
     if spec is None:
@@ -944,6 +944,11 @@ def _history_kv_context(out_messages: List[Dict[str, Any]],
     docs = _turn_docs(indexed)
     doc_texts = [doc["content"] for doc in docs if doc["content"]]
     history_text = "\n\n".join(doc_texts)
+    history_start = history_indices[0] if history_indices else cutoff
+    if history_indices and history_indices != list(range(history_start, cutoff)):
+        raise ValueError(
+            "physical history KV requires one contiguous completed-history "
+            f"message span, got indices={history_indices}, cutoff={cutoff}")
     recovery_indices = None
     recovery_char_range = None
     recovery_docs: List[int] = []
@@ -965,6 +970,7 @@ def _history_kv_context(out_messages: List[Dict[str, Any]],
         "system_text": "\n".join(part for part in system_parts if part),
         "history_text": history_text,
         "history_out_indices": history_indices,
+        "history_start_message_count": history_start,
         "history_message_count": cutoff,
         "current_start_out_index": cutoff,
         "n_history_messages": len(history_indices),
