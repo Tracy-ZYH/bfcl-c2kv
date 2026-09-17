@@ -159,7 +159,7 @@ class TestRegistry:
 
     def test_existing_arms_untouched(self):
         for name, arm in ARMS.items():
-            if name.startswith("history_kv_"):
+            if name.startswith(("history_kv_", "joint_")):
                 continue
             assert arm.history_kv is None
             assert history_kv_spec(arm) is None
@@ -184,6 +184,30 @@ class TestRegistry:
         with pytest.raises(ValueError):
             Arm(name="bad", compress_history=True,
                 history_kv={"method": "h2o", "retention_ratio": 0.3}).validate()
+
+    @pytest.mark.parametrize("method", ["h2o", "snapkv_persistent", "pyramidkv"])
+    @pytest.mark.parametrize("mode,tools,history", [
+        ("tool_only", True, False),
+        ("history_only", False, True),
+        ("joint", True, True),
+    ])
+    def test_joint_arms_have_independent_native_scopes(
+            self, method, mode, tools, history):
+        spec = history_kv_spec(get_arm(f"joint_{method}_{mode}_r25"))
+        assert spec["backend"] == "physical_eviction"
+        assert spec["persistent_session"] is True
+        assert spec["retention_ratio"] == 0.25
+        assert spec["tool_retention_ratio"] == 0.25
+        assert spec["compress_tools"] is tools
+        assert spec["compress_completed_history"] is history
+
+    def test_joint_scope_cannot_disable_both_regions(self):
+        with pytest.raises(ValueError):
+            history_kv_spec(Arm(
+                name="bad", compress_history=False,
+                history_kv={"method": "h2o", "retention_ratio": 0.25,
+                            "compress_tools": False,
+                            "compress_completed_history": False}))
         with pytest.raises(ValueError):
             Arm(name="bad", compress_history=False, text_policy="hiagent",
                 history_kv={"method": "h2o", "retention_ratio": 0.3}).validate()
@@ -224,6 +248,22 @@ class TestProxySplit:
              {"role": "user", "content": "first question"}], arm)
         assert ctx["history_out_indices"] == []
         assert ctx["history_text"] == ""
+
+    def test_joint_tool_only_first_turn_still_builds_physical_hint(self):
+        arm = get_arm("joint_h2o_tool_only_r25")
+        out, counts, ctx = _context(
+            [{"role": "system", "content": "s"},
+             {"role": "user", "content": "first question"}], arm)
+        ctx["session_id"] = "joint-case"
+        backend = SglangBackend(FakePost())
+        prepared = backend.prepare_chat(
+            {"messages": out, "tools": _tools()}, arm, None,
+            context={"history_kv": ctx})
+        eviction = prepared["c2kv_kv_memory_hint"]["history_kv_eviction"]
+        assert eviction["compress_tools"] is True
+        assert eviction["compress_completed_history"] is False
+        assert "history_message_count" not in eviction
+        assert prepared["session_params"]["id"] == "joint-case"
 
 
 # ------------------------------------------------- repair_extract protocol

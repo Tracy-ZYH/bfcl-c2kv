@@ -191,6 +191,39 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     summary["history_kv_retention_mean"] = _mean(history_retention)
     summary["history_kv_compression_mean"] = _mean(
         1.0 / value for value in history_retention if value > 0)
+    # Joint ratios are ratios of cumulative token counts, not means of
+    # per-request ratios (short first turns would otherwise dominate).
+    joint_rows = [r for r in ok if isinstance(r.get("joint_kv_scopes"), list)]
+    for kind in ("tool", "history"):
+        full = sum(float(r.get(f"full_{kind}_kv") or 0) for r in joint_rows)
+        active = sum(float(r.get(f"active_{kind}_kv") or 0) for r in joint_rows)
+        summary[f"full_{kind}_kv"] = int(full)
+        summary[f"active_{kind}_kv"] = int(active)
+        summary[f"{kind}_retention"] = active / full if full else None
+    full_joint = summary["full_tool_kv"] + summary["full_history_kv"]
+    active_joint = summary["active_tool_kv"] + summary["active_history_kv"]
+    summary["joint_active_kv"] = active_joint
+    summary["joint_retention"] = active_joint / full_joint if full_joint else None
+    summary["joint_compression_ratio"] = (
+        full_joint / active_joint if active_joint else None)
+    if joint_rows:
+        # Legacy physical-eviction counters describe the broad compacted
+        # interval (Tool + History + protected gaps). Dividing that resident
+        # count by only full History yields impossible retention > 1. For a
+        # joint run, keep legacy headline names compatible but source them
+        # from the dedicated History semantic scope.
+        history_joint_rows = [
+            r for r in joint_rows
+            if isinstance(r.get("full_history_kv"), (int, float))
+            and float(r["full_history_kv"]) > 0
+            and isinstance(r.get("active_history_kv"), (int, float))
+        ]
+        summary["history_kv_active_tokens_mean"] = _mean(
+            r["active_history_kv"] for r in history_joint_rows)
+        summary["history_kv_retention_mean"] = summary["history_retention"]
+        summary["history_kv_compression_mean"] = (
+            1.0 / summary["history_retention"]
+            if summary["history_retention"] else None)
     tensor_request_rows = [
         r for r in ok if isinstance(r.get("history_tensor_accounting"), dict)
     ]

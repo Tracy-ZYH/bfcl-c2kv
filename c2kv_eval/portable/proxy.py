@@ -965,6 +965,10 @@ def _history_kv_context(out_messages: List[Dict[str, Any]],
         spec["recovery_char_range"] = recovery_char_range
     return {
         "spec": spec,
+        "joint_scope_mode": any(
+            key in (arm.history_kv or {}) for key in
+            ("compress_tools", "compress_completed_history",
+             "tool_retention_ratio")),
         "method": spec["method"],
         "backend": spec["backend"],
         "system_text": "\n".join(part for part in system_parts if part),
@@ -1536,12 +1540,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     messages, ARM, counts, oracle, payload.get("tools"), messages_out)
             history_ctx = _history_kv_context(messages_out, counts, ARM)
             if history_ctx is not None:
-                # Do not open a session for the no-history first request.  Its
-                # conversation fingerprint is intentionally less stable than
-                # the ID formed once the first completed turn exists.
+                # Joint Tool compression starts on the first request, before
+                # completed history exists.  BFCL supplies a stable task id;
+                # use it instead of the early conversation fingerprint (which
+                # intentionally changes once a second non-system message is
+                # present).  Legacy history-only arms retain the old delayed
+                # open behaviour when no stable benchmark id is available.
+                stable_case = self.eval_context.get("task_id")
+                needs_first_turn_session = bool(
+                    history_ctx["spec"].get("compress_tools"))
                 if (history_ctx["spec"]["persistent_session"]
-                        and history_ctx.get("history_text")):
-                    history_ctx["session_id"] = _history_session_id(conv)
+                        and (history_ctx.get("history_text")
+                             or (needs_first_turn_session and stable_case))):
+                    session_key = _digest(["bfcl-case", stable_case]) if stable_case else conv
+                    history_ctx["session_id"] = _history_session_id(session_key)
                 counts["history_kv"] = {
                     k: history_ctx[k] for k in
                     ("method", "backend", "n_history_messages",

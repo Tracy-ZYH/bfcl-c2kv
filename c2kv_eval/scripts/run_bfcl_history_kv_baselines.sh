@@ -193,6 +193,39 @@ print(json.dumps(manifest, ensure_ascii=False))
 PY
 }
 
+preflight_tokenizer() {
+  # The BFCL runner tokenizes history locally before its first HTTP request.
+  # Fail before starting an expensive model server when its Python environment
+  # has an older `tokenizers` build that cannot parse the selected tokenizer.
+  "${BFCL_PYTHON}" - "${TOKENIZER_PATH}" <<'PY'
+import pathlib
+import sys
+
+import tokenizers
+from tokenizers import Tokenizer
+
+root = pathlib.Path(sys.argv[1]).resolve()
+path = root / "tokenizer.json"
+if not path.is_file():
+    raise SystemExit(f"TOKENIZER_PREFLIGHT_FAILED: missing {path}")
+try:
+    tokenizer = Tokenizer.from_file(str(path))
+except Exception as error:
+    raise SystemExit(
+        "TOKENIZER_PREFLIGHT_FAILED: "
+        f"python={sys.executable} tokenizers={tokenizers.__version__} "
+        f"path={path}: {type(error).__name__}: {error}. "
+        "Use /home/liuyancheng/envs/sgl/bin/python as BFCL_PYTHON; "
+        "do not modify /home/liuyancheng/envs."
+    ) from error
+print(
+    "TOKENIZER_PREFLIGHT_OK "
+    f"python={sys.executable} tokenizers={tokenizers.__version__} "
+    f"vocab={tokenizer.get_vocab_size()} path={path}"
+)
+PY
+}
+
 start_server() {
   local slot="$1"
   local device="${DEVICE_LIST[$slot]}"
@@ -361,6 +394,8 @@ log_info "METHODS=${METHODS}"
 log_info "DEVICES=${DEVICES} PORTS=${PORTS}"
 source_env_file /usr/local/Ascend/cann-8.5.0/set_env.sh
 source_env_file /usr/local/Ascend/nnal/atb/set_env.sh
+
+preflight_tokenizer
 
 if [ -e "${RUN_ROOT}" ]; then
   echo "Refusing existing RUN_ROOT; use a new output directory: ${RUN_ROOT}" >&2

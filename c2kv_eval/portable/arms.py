@@ -70,6 +70,12 @@ HISTORY_KV_DEFAULTS: Dict[str, Any] = {
     "pooling": "avgpool",         # --history-kv-pooling
     "h2o_recent_fraction": 0.5,   # --history-kv-h2o-recent-fraction
     "persistent_session": False,  # --persistent-history-kv-session
+    # Joint Tool Definition + completed-History scopes.  Ordinary history
+    # arms retain the historical defaults below.  Enabled scopes are selected
+    # independently and materialised by one server-side physical compaction.
+    "compress_tools": False,
+    "compress_completed_history": True,
+    "tool_retention_ratio": None,
     # Controlled compression-agnostic recovery ablation.  The proxy derives
     # this only for the retry request; the baseline arm remains unchanged.
     "recovery_mode": None,         # replace | append (deduplicated)
@@ -121,6 +127,19 @@ def history_kv_spec(arm: "Arm") -> Optional[Dict[str, Any]]:
             f"arm {arm.name!r}: history_kv retention_ratio must be in (0, 1]")
     if target is not None and int(target) < 1:
         raise ValueError(f"arm {arm.name!r}: history_kv target_tokens must be >= 1")
+    spec["compress_tools"] = bool(spec["compress_tools"])
+    spec["compress_completed_history"] = bool(
+        spec["compress_completed_history"])
+    if not (spec["compress_tools"] or spec["compress_completed_history"]):
+        raise ValueError(
+            f"arm {arm.name!r}: at least one Tool/History scope must be enabled")
+    tool_ratio = spec.get("tool_retention_ratio")
+    if tool_ratio is None:
+        tool_ratio = ratio if ratio is not None else 1.0
+    if not 0.0 < float(tool_ratio) <= 1.0:
+        raise ValueError(
+            f"arm {arm.name!r}: tool_retention_ratio must be in (0, 1]")
+    spec["tool_retention_ratio"] = float(tool_ratio)
     if int(spec["recent_window"]) < 1 or int(spec["kernel_size"]) < 1:
         raise ValueError(
             f"arm {arm.name!r}: history_kv recent_window/kernel_size must be >= 1")
@@ -615,6 +634,20 @@ ARMS: Dict[str, Arm] = {
             description="CacheBlend (LMCache-monorepo lineage): same mechanism "
                         "with K-deviation and recomp_ratio 0.15 (blender.py)",
         ),
+        Arm(
+            name="joint_cacheblend_history_only_r16",
+            compress_history=False,
+            kv_reuse={"method": "cacheblend", "recomp_ratio": 0.16},
+            query_projection="base",
+            description=(
+                "CacheBlend history-only scope under the joint experiment "
+                "naming. Tool-only/joint are intentionally not registered: "
+                "the current native-tool prologue is non-contiguous with "
+                "history and CacheBlend only accepts one contiguous reusable "
+                "span; silently including System scaffold would violate the "
+                "experiment contract."
+            ),
+        ),
     )
 }
 
@@ -648,6 +681,36 @@ for _method in ("h2o", "snapkv_persistent", "streamingllm", "pyramidkv"):
             "delta is evicted without full-history re-prefill"
         ),
     )
+
+# Joint Tool Definition + persistent completed-History baselines.  These use
+# one native BFCL prompt, independent 25% budgets for each enabled semantic
+# scope, and one physical cache compaction.  C2KV is intentionally absent:
+# its checkpoint was not trained for joint Tool+History gist compression.
+for _method in ("h2o", "snapkv_persistent", "pyramidkv"):
+    for _mode, _tools, _history in (
+        ("tool_only", True, False),
+        ("history_only", False, True),
+        ("joint", True, True),
+    ):
+        _name = f"joint_{_method}_{_mode}_r25"
+        ARMS[_name] = Arm(
+            name=_name,
+            compress_history=False,
+            history_kv={
+                "method": _method,
+                "retention_ratio": 0.25,
+                "tool_retention_ratio": 0.25,
+                "backend": "physical_eviction",
+                "persistent_session": True,
+                "compress_tools": _tools,
+                "compress_completed_history": _history,
+            },
+            description=(
+                f"{_method} native-prompt {_mode} Tool/History compression: "
+                "independent semantic-scope selection followed by one "
+                "persistent physical cache compaction"
+            ),
+        )
 
 # Compatibility aliases for the briefly-used per-mille spelling.  New output
 # and manifests use r25, whose meaning is unambiguously 25% retention.

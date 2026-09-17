@@ -35,3 +35,22 @@ def test_explicit_history_kv_arm_keeps_scheduler_accounting():
     summary = reqlog.summarize([row])
     assert summary["history_kv_retention_mean"] == 0.312
     assert summary["history_kv_compression_mean"] == 1.0 / 0.312
+
+
+def test_joint_ratios_use_cumulative_counts_not_mean_request_ratios():
+    rows = [
+        {"status": "ok", "joint_kv_scopes": [{"kind": "tool"}],
+         "full_tool_kv": 100, "active_tool_kv": 25,
+         "full_history_kv": 20, "active_history_kv": 5},
+        {"status": "ok", "joint_kv_scopes": [{"kind": "tool"}],
+         "full_tool_kv": 20, "active_tool_kv": 10,
+         "full_history_kv": 100, "active_history_kv": 50},
+    ]
+    summary = reqlog.summarize(rows)
+    assert summary["tool_retention"] == 35 / 120
+    assert summary["history_retention"] == 55 / 120
+    assert summary["joint_retention"] == 90 / 240
+    assert summary["joint_compression_ratio"] == 240 / 90
+    assert summary["history_kv_active_tokens_mean"] == (5 + 50) / 2
+    assert summary["history_kv_retention_mean"] == 55 / 120
+    assert abs(summary["history_kv_compression_mean"] - 120 / 55) < 1e-12

@@ -368,7 +368,10 @@ class SglangBackend(Backend):
         method = str(spec["method"])
         indices = [int(i) for i in history.get("history_out_indices") or []]
         session_id = history.get("session_id")
-        if not indices or not history.get("history_text"):
+        compress_tools = bool(spec.get("compress_tools"))
+        compress_history = bool(spec.get("compress_completed_history", True))
+        if ((not indices or not history.get("history_text"))
+                and not compress_tools):
             # first turn of a conversation: nothing completed to compress.
             # Upstream returns the current block unchanged and issues no
             # extract; no hint is sent, so such a row simply carries no
@@ -380,9 +383,6 @@ class SglangBackend(Backend):
             eviction = {
                 "method": method,
                 # the server resolves the token range itself in its own frame
-                "history_start_message_count": int(
-                    history.get("history_start_message_count") or 0),
-                "history_message_count": count,
                 "retention_ratio": spec.get("retention_ratio"),
                 "history_kv_recent_window": int(spec["recent_window"]),
                 "history_kv_kernel_size": int(spec["kernel_size"]),
@@ -390,6 +390,18 @@ class SglangBackend(Backend):
                 "history_kv_h2o_recent_fraction": float(spec["h2o_recent_fraction"]),
                 "persistent_session": bool(session_id),
             }
+            if history.get("joint_scope_mode"):
+                eviction.update({
+                    "compress_tools": compress_tools,
+                    "compress_completed_history": compress_history,
+                    "tool_retention_ratio": float(spec["tool_retention_ratio"]),
+                })
+            if compress_history and indices:
+                eviction.update({
+                    "history_start_message_count": int(
+                        history.get("history_start_message_count") or 0),
+                    "history_message_count": count,
+                })
             if spec.get("target_tokens") is not None:
                 eviction["target_tokens"] = int(spec["target_tokens"])
             hint: Dict[str, Any] = {
@@ -790,7 +802,36 @@ class SglangBackend(Backend):
                 if isinstance(report.get("history_kv_lifecycle"), dict)
                 else None
             ),
+            # Joint Tool Definition + completed-History accounting.  These
+            # are measured after the single physical compaction; absent keys
+            # mean an old server, never an inferred zero.
+            "full_tool_kv": report.get("full_tool_kv"),
+            "active_tool_kv": report.get("active_tool_kv"),
+            "full_history_kv": report.get("full_history_kv"),
+            "active_history_kv": report.get("active_history_kv"),
+            "joint_active_kv": report.get("joint_active_kv"),
+            "joint_compression_ratio": report.get(
+                "joint_compression_ratio"),
+            "joint_kv_scopes": report.get("joint_kv_scopes"),
+            "joint_protected_kv": report.get("joint_protected_kv"),
+            "joint_current_full_kv": report.get("joint_current_full_kv"),
+            "joint_current_prefill_phase": report.get(
+                "joint_current_prefill_phase"),
+            "joint_system_current_full": report.get(
+                "joint_system_current_full"),
         }
+        full_tool = columns.get("full_tool_kv")
+        active_tool = columns.get("active_tool_kv")
+        full_history = columns.get("full_history_kv")
+        active_history = columns.get("active_history_kv")
+        if full_tool is not None and active_tool:
+            columns["tool_retention"] = active_tool / full_tool
+        if full_history is not None and active_history:
+            columns["history_retention"] = active_history / full_history
+        full_joint = (full_tool or 0) + (full_history or 0)
+        active_joint = (active_tool or 0) + (active_history or 0)
+        if full_joint:
+            columns["joint_retention"] = active_joint / full_joint
         return {k: v for k, v in columns.items() if v is not None}
 
     @staticmethod
