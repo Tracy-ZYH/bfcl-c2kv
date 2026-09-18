@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -112,6 +113,7 @@ def compressor_payload(policy: str, model: str, system_text: str,
 # compress(payload_dict) -> str : performs the POST, validates the finish
 # reason and non-empty content, raises TextarmCompressorError otherwise.
 Compress = Callable[[Dict[str, Any]], str]
+TokenCount = Callable[[List[Dict[str, Any]]], int]
 
 _LOCK = threading.Lock()
 _SUMMARY_CACHE: Dict[str, str] = {}
@@ -153,6 +155,96 @@ def _render_line(message: Dict[str, Any], action_dialect) -> str:
     if role == "user":
         return "User: " + _content_of(message)
     return f"{role}: " + _content_of(message)
+
+
+def recent_truncation_transform(
+    messages: List[Dict[str, Any]],
+    *,
+    cutoff: int,
+    retention_ratio: float,
+    token_count: TokenCount,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Keep the newest complete user turns under a prompt-token budget.
+
+    ``token_count`` measures the exact final chat-template prompt. Measuring
+    prompt deltas includes inter-message delimiters while leaving system,
+    tools and the current turn untouched. Tool results do not open a new
+    turn, so call/result pairs cannot be split by this transform.
+    """
+    if not 0.0 < float(retention_ratio) <= 1.0:
+        raise ValueError("recent truncation retention_ratio must be in (0, 1]")
+    if not 0 <= int(cutoff) <= len(messages):
+        raise ValueError(f"invalid recent truncation cutoff {cutoff}")
+
+    history_indices = [
+        index for index, message in enumerate(messages[:cutoff])
+        if (message.get("role") or "user") != "system"
+    ]
+    turns: List[List[int]] = []
+    current: List[int] = []
+    for index in history_indices:
+        role = messages[index].get("role") or "user"
+        if role == "user" and current:
+            turns.append(current)
+            current = []
+        current.append(index)
+    if current:
+        turns.append(current)
+
+    always = {
+        index for index, message in enumerate(messages)
+        if index >= cutoff or (message.get("role") or "user") == "system"
+    }
+
+    def staged(selected: set[int]) -> List[Dict[str, Any]]:
+        return [dict(message) for index, message in enumerate(messages)
+                if index in always or index in selected]
+
+    base_tokens = int(token_count(staged(set())))
+    full_tokens = int(token_count(staged(set(history_indices))))
+    raw_history_tokens = max(0, full_tokens - base_tokens)
+    target_tokens = int(math.ceil(raw_history_tokens * float(retention_ratio)))
+
+    selected: set[int] = set()
+    retained_history_tokens = 0
+    for turn in reversed(turns):
+        candidate = selected.union(turn)
+        candidate_tokens = max(0, int(token_count(staged(candidate))) - base_tokens)
+        if candidate_tokens <= target_tokens:
+            selected = candidate
+            retained_history_tokens = candidate_tokens
+            continue
+        # Whole-turn semantics take precedence. If no complete turn fits,
+        # retain the newest one instead of slicing through call/result pairs.
+        if not selected:
+            selected = set(turn)
+            retained_history_tokens = candidate_tokens
+        break
+
+    out = staged(selected)
+    kept_turns = sum(bool(set(turn) & selected) for turn in turns)
+    stats = {
+        "policy": "recent_trunc_r25",
+        "history_compressed": bool(
+            raw_history_tokens and retained_history_tokens < raw_history_tokens),
+        "n_compressor_calls": 0,
+        "raw_history_tokens": raw_history_tokens,
+        "target_history_tokens": target_tokens,
+        "retained_history_tokens": retained_history_tokens,
+        "history_retention": (
+            retained_history_tokens / raw_history_tokens
+            if raw_history_tokens else 1.0
+        ),
+        "effective_history_compression": (
+            raw_history_tokens / retained_history_tokens
+            if retained_history_tokens else None
+        ),
+        "history_turns": len(turns),
+        "retained_history_turns": kept_turns,
+        "dropped_history_turns": len(turns) - kept_turns,
+        "budget_alignment": "exact_chat_template_delta_whole_turn_suffix",
+    }
+    return out, stats
 
 
 def _summarize(cache_key: str, policy: str, model: str, system_text: str,

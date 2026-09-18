@@ -71,6 +71,8 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     dropped = [r.get("dropped_docs") for r in ok if isinstance(r.get("dropped_docs"), int)]
     walls = [float(r["wall_sec"]) for r in ok
              if isinstance(r.get("wall_sec"), (int, float))]
+    assembly = [float(r["assemble_sec"]) for r in ok
+                if isinstance(r.get("assemble_sec"), (int, float))]
     kv = [r["kv_resident_tokens"] for r in ok if isinstance(r.get("kv_resident_tokens"), int)]
     gist = sum(int(r.get("gist_tokens") or 0) for r in ok)
     original = sum(int(r.get("original_tokens") or 0) for r in ok)
@@ -111,6 +113,7 @@ def summarize(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
     summary["mixed_query_proj"] = len(modes) > 1
     summary["wall_sec_total"] = sum(walls)
+    summary["proxy_assembly_sec_total"] = sum(assembly) if assembly else None
     summary["server_total_gpu_kv_bytes_max"] = max(
         (r["total_gpu_kv_bytes"] for r in ok if isinstance(r.get("total_gpu_kv_bytes"), int)),
         default=None)

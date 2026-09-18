@@ -23,3 +23,9 @@ checkpoints/
 .vscode/
 .idea/
 .file_locks/
+
+# Local experiment outputs
+results/
+
+# Python package generated metadata
+bfcl_eval.egg-info/

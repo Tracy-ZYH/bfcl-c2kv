@@ -1,7 +1,7 @@
 # Joint Tool/History KV status
 
 The native BFCL serving path supports `tool_only`, `history_only`, and `joint`
-scopes for H2O, SnapKV-persistent, and PyramidKV at 25% retention. It keeps
+scopes for StreamingLLM, H2O, SnapKV-persistent, and PyramidKV at 25% retention. It keeps
 one persistent session per BFCL task and performs one physical cache
 compaction per turn.
 
@@ -20,9 +20,9 @@ compaction per turn.
 
 Registered arms:
 
-- `joint_{h2o,snapkv_persistent,pyramidkv}_tool_only_r25`
-- `joint_{h2o,snapkv_persistent,pyramidkv}_history_only_r25`
-- `joint_{h2o,snapkv_persistent,pyramidkv}_joint_r25`
+- `joint_{streamingllm,h2o,snapkv_persistent,pyramidkv}_tool_only_r25`
+- `joint_{streamingllm,h2o,snapkv_persistent,pyramidkv}_history_only_r25`
+- `joint_{streamingllm,h2o,snapkv_persistent,pyramidkv}_joint_r25`
 - `joint_cacheblend_history_only_r16`
 
 The response/request log includes `full_tool_kv`, `active_tool_kv`,

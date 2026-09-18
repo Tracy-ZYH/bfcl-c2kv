@@ -72,6 +72,61 @@ def test_compressor_failure_is_logged_as_textarm_error(monkeypatch, tmp_path):
     assert row["error_kind"] == "textarm_error"
 
 
+# ---- Recent truncation -------------------------------------------------------
+
+def _char_token_count(messages):
+    return sum(len(str(message.get("content") or "")) for message in messages)
+
+
+def test_recent_truncation_keeps_whole_newest_turn_and_full_current():
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "A" * 80},
+        {"role": "assistant", "content": "old call", "tool_calls": [{"id": "old"}]},
+        {"role": "tool", "content": "old result"},
+        {"role": "assistant", "content": "old final"},
+        {"role": "user", "content": "B" * 12},
+        {"role": "assistant", "content": "new call", "tool_calls": [{"id": "new"}]},
+        {"role": "tool", "content": "new result"},
+        {"role": "assistant", "content": "new final"},
+        {"role": "user", "content": "CURRENT"},
+        {"role": "assistant", "content": "current call", "tool_calls": [{"id": "cur"}]},
+        {"role": "tool", "content": "current result"},
+    ]
+    out, stats = textarms.recent_truncation_transform(
+        messages, cutoff=9, retention_ratio=0.25,
+        token_count=_char_token_count)
+    rendered = json.dumps(out)
+    assert "A" * 80 not in rendered
+    assert "B" * 12 in rendered
+    assert "new result" in rendered and "new final" in rendered
+    assert "CURRENT" in rendered and "current result" in rendered
+    assert out[0] == messages[0]
+    assert stats["history_turns"] == 2
+    assert stats["retained_history_turns"] == 1
+    assert stats["dropped_history_turns"] == 1
+    assert stats["n_compressor_calls"] == 0
+
+
+def test_recent_truncation_never_splits_oversized_newest_turn():
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "N" * 200},
+        {"role": "assistant", "content": "call"},
+        {"role": "tool", "content": "result"},
+        {"role": "user", "content": "current"},
+    ]
+    out, stats = textarms.recent_truncation_transform(
+        messages, cutoff=6, retention_ratio=0.01,
+        token_count=_char_token_count)
+    rendered = json.dumps(out)
+    assert "N" * 200 in rendered and "result" in rendered
+    assert stats["retained_history_turns"] == 1
+    assert stats["retained_history_tokens"] > stats["target_history_tokens"]
+
+
 # ---- HiAgent -----------------------------------------------------------------
 
 def test_hiagent_compresses_and_shrinks():

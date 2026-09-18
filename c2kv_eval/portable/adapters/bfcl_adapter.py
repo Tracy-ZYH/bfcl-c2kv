@@ -373,6 +373,11 @@ def collect_score_summary(project_root: "Path | str", handler_name: str,
         "n_scored": total,
         "correct_count": correct,
         "semantic_score": correct / total,
+        "bfcl_accuracy": correct / total,
+        "official_correct_count": correct,
+        "official_total_count": total,
+        "official_score": correct / total,
+        "official_metric_kind": "bfcl_accuracy",
         "official_score_headers": headers,
         "scored": True,
     }
@@ -505,11 +510,16 @@ def run_bfcl(base_url: str, categories: str = "multi_turn_base",
         else:
             selected_counts = category_counts
         expected = sum(selected_counts.values())
+        generation_started = time.perf_counter()
         if mode in ("generate", "both"):
             run_cli(generate_argv(
                 handler_name, categories, ids, num_threads=num_threads))
+        generation_phase_wall_time = time.perf_counter() - generation_started
+        official_scoring_time = 0.0
         if mode in ("evaluate", "both"):
+            scoring_started = time.perf_counter()
             run_cli(evaluate_argv(handler_name, categories, ids))
+            official_scoring_time = time.perf_counter() - scoring_started
         from .. import terminal_check
 
         ids_str = ",".join(ids or [])
@@ -527,6 +537,12 @@ def run_bfcl(base_url: str, categories: str = "multi_turn_base",
             "bfcl_project_root": str(project_root),
             "bfcl_num_threads": num_threads,
             "bfcl_oracle_max_events": bfcl_oracle_max_events,
+            "generation_phase_wall_time": generation_phase_wall_time,
+            "official_scoring_time": official_scoring_time,
+            "generation_phase_scope": (
+                "official BFCL generate phase: model/proxy requests, tool execution, "
+                "response parsing and harness overhead; excludes official scoring and server startup"
+            ),
         }
         if mode == "generate":
             summary.update({"n_generated": expected, "scored": False})

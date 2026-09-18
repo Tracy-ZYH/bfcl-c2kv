@@ -634,10 +634,14 @@ def resolve_checkpoint_profile(
         )
         profile = _legacy_profile(checkpoint_path, config, run_path, manifest_path)
 
+    profile_kind = profile.get("profile_kind")
     for key in ("gist_param", "gist_type", "gist_overlap", "gist_residual_type"):
         recorded = profile.get("model", {}).get(key)
-        if recorded is not None and recorded != config.get(key):
-            raise ProfileError(f"checkpoint {key}={config.get(key)!r} conflicts with profile {recorded!r}")
+        config_value = config.get(key)
+        if recorded is not None and config_value is None and profile_kind == "exported_adapter":
+            continue
+        if recorded is not None and recorded != config_value:
+            raise ProfileError(f"checkpoint {key}={config_value!r} conflicts with profile {recorded!r}")
     _apply_query_projection(profile, query_projection)
     profile["checkpoint"] = {
         "path": str(checkpoint_path),

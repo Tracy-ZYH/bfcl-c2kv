@@ -306,7 +306,8 @@ def main(argv=None):
         max_doc_length=args.max_doc_length, max_doc_num=args.max_doc_num,
         query_projection=args.query_projection,
         witness_tokenizer=str(args.tokenizer or args.checkpoint or "")
-        if get_arm(args.arm).gold_recovery or args.recovery_control else "",
+        if (get_arm(args.arm).gold_recovery or args.recovery_control
+            or get_arm(args.arm).text_policy == "recent_trunc_r25") else "",
         python_bin=args.proxy_python, recovery_control=args.recovery_control,
         upstream_timeout=args.upstream_timeout,
         max_completion_tokens=args.max_completion_tokens,
@@ -350,6 +351,11 @@ def main(argv=None):
         degenerate_requests = sum(1 for t in ta_rows if t.get("degenerate"))
         compressed_requests = sum(
             1 for t in ta_rows if t.get("history_compressed"))
+
+        def _textarm_mean(field):
+            values = [float(t[field]) for t in ta_rows
+                      if isinstance(t.get(field), (int, float))]
+            return sum(values) / len(values) if values else None
         summary["textarm_summary"] = {
             "textarm_requests": len(ta_rows),
             "degenerate_requests": degenerate_requests,
@@ -367,6 +373,12 @@ def main(argv=None):
             "compressor_wall_sec": round(sum(
                 float((t.get("compressor_usage") or {}).get("wall_sec") or 0)
                 for t in ta_rows), 1),
+            "history_retention_mean": _textarm_mean("history_retention"),
+            "effective_history_compression_mean": _textarm_mean(
+                "effective_history_compression"),
+            "raw_history_tokens": sum(int(t.get("raw_history_tokens") or 0) for t in ta_rows),
+            "retained_history_tokens": sum(int(t.get("retained_history_tokens") or 0) for t in ta_rows),
+            "dropped_history_turns": sum(int(t.get("dropped_history_turns") or 0) for t in ta_rows),
             "retrieval_calls": sum(int((t.get("retrieval_usage") or {}).get("calls") or 0)
                                    for t in ta_rows),
             "retrieval_prompt_tokens": sum(int((t.get("retrieval_usage") or {}).get("prompt_tokens") or 0)
@@ -390,6 +402,37 @@ def main(argv=None):
 
     summary["request_log_summary"] = reqlog.summarize_file(request_log)
     rl = summary["request_log_summary"]
+    episodes = int(summary.get("n") or summary.get("n_total") or 0)
+    committed_steps = int(rl.get("n_ok") or 0)
+    generation_time = summary.get("generation_time")
+    maintenance_time = rl.get("proxy_assembly_sec_total")
+    summary["runtime_breakdown"] = {
+        "e2e_wall_time": adapter_wall_sec,
+        "generation_time": generation_time,
+        "maintenance_time": maintenance_time,
+        "recovery_time": rl.get("recovery_extract_sec_total"),
+        "tool_execution_time": None,
+        "official_scoring_time": summary.get("official_scoring_time"),
+        "wall_time_per_episode": adapter_wall_sec / episodes if episodes else None,
+        "generation_time_per_committed_step": (
+            float(generation_time) / committed_steps
+            if isinstance(generation_time, (int, float)) and committed_steps else None
+        ),
+        "maintenance_time_per_committed_step": (
+            float(maintenance_time) / committed_steps
+            if isinstance(maintenance_time, (int, float)) and committed_steps else None
+        ),
+        "committed_step_proxy": "successful portable proxy requests",
+        "maintenance_time_scope": (
+            "proxy request assembly only; server-side physical eviction is included "
+            "inside generation_time and is not separately instrumented"
+        ),
+        "tool_execution_time_scope": (
+            "not separately exposed by the pinned BFCL harness; included in "
+            "episode/e2e wall time together with parsing and harness overhead"
+        ),
+        "server_startup_warmup_included": False,
+    }
     if rl.get("dropped_requests"):
         print(f"NOTE: {rl['dropped_requests']}/{rl['n_ok']} requests dropped history "
               f"docs (turn packing, max_doc_num={args.max_doc_num}); mean dropped "

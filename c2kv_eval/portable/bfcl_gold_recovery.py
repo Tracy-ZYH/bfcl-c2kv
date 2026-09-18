@@ -249,6 +249,8 @@ class TaskState:
     retry_final_valid: Optional[bool] = None
     replay_count: int = 0
     checker_seconds: float = 0.0
+    generation_seconds: float = 0.0
+    generation_calls: int = 0
     base_error: Optional[Dict[str, Any]] = None
     check_error: Optional[Dict[str, Any]] = None
     retry_check_error: Optional[Dict[str, Any]] = None
@@ -380,6 +382,8 @@ class GoldRecoveryController:
         state = self.state
         if state is None:
             return
+        state.generation_seconds += float(latency)
+        state.generation_calls += 1
         if state.attempt == 0 and state.selector is not None:
             state.response_cache[state.current_turn].append((response, latency))
             if (_has_proxy_gist_tokens(response)
@@ -583,6 +587,8 @@ class GoldRecoveryController:
             "replay_count": state.replay_count,
             "retry_instances_cleaned": state.retry_instances_cleaned,
             "gold_checker_seconds": state.checker_seconds,
+            "generation_seconds": state.generation_seconds,
+            "generation_calls": state.generation_calls,
             "total_wall_seconds": self.clock() - state.started_at,
         }
 
@@ -699,6 +705,8 @@ class MultiEventGoldRecoveryController(GoldRecoveryController):
         state = self.state
         if state is None:
             return
+        state.generation_seconds += float(latency)
+        state.generation_calls += 1
         state.http_call_count += 1
         cached = state.response_cache[state.current_turn]
         if len(cached) == state.step:
@@ -1069,6 +1077,8 @@ class MultiEventGoldRecoveryController(GoldRecoveryController):
             "retry_instances_cleaned": state.retry_instances_cleaned,
             "retry_namespaces_cleaned": state.retry_namespaces_cleaned,
             "gold_checker_seconds": state.checker_seconds,
+            "generation_seconds": state.generation_seconds,
+            "generation_calls": state.generation_calls,
             "total_wall_seconds": self.clock() - state.started_at,
         }
 
@@ -1170,7 +1180,21 @@ def summarize_audit(path: "Path | str") -> Dict[str, Any]:
             else int(row.get("attempts", 1)) - 1
             for row in oracle_rows),
         "total_gold_checker_seconds": sum(
-            float(row.get("gold_checker_seconds", 0.0)) for row in oracle_rows),
+            float(row.get("gold_checker_seconds", 0.0)) for row in rows),
+        "episode_e2e_wall_time": sum(
+            float(row.get("total_wall_seconds", 0.0)) for row in rows),
+        "generation_time": sum(
+            float(row.get("generation_seconds", 0.0)) for row in rows),
+        "generation_calls": sum(
+            int(row.get("generation_calls", 0)) for row in rows),
+        "episode_timing_scope": (
+            "BFCL handler inference per episode; includes model/proxy requests, "
+            "tool execution, response parsing and harness overhead; excludes official scoring"
+        ),
+        "generation_time_scope": (
+            "client-observed OpenAI request latency; includes proxy assembly, "
+            "server KV maintenance and model generation, which are not separable server-side"
+        ),
         "total_handler_http_calls": sum(
             int(row.get("http_call_count", 0)) for row in multi_event_rows),
         "total_handler_http_calls_scope": "v3 task rows only",

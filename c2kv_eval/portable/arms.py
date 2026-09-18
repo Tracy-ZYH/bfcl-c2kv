@@ -325,6 +325,7 @@ class Arm:
             raise ValueError(f"arm {self.name!r}: text_policy and KV compression are exclusive")
         text_policies = {
             "hiagent", "hiagent_summary", "hiagent_full",
+            "recent_trunc_r25",
             "acon_hist", "acon_obs",
             "acon_hist_base", "acon_hist_ut", "acon_hist_ut_co",
             "acon_obs_base", "acon_obs_ut", "acon_obs_ut_co",
@@ -360,6 +361,17 @@ ARMS: Dict[str, Arm] = {
         Arm(
             name="full_native", compress_history=False, native_messages=True,
             description="Uncompressed original model with native chat messages and tool-call history",
+        ),
+        Arm(
+            name="recent_trunc_r25",
+            compress_history=False,
+            text_policy="recent_trunc_r25",
+            description=(
+                "Text-level recent-history truncation: keep complete newest "
+                "user turns up to the closest whole-turn suffix at a 25% "
+                "completed-history token budget; system, tools and current "
+                "turn remain full"
+            ),
         ),
         Arm(
             name="c2kv4", compress_history=True, ratio=4,
@@ -682,11 +694,27 @@ for _method in ("h2o", "snapkv_persistent", "streamingllm", "pyramidkv"):
         ),
     )
 
+ARMS["history_kv_full_r100_persistent"] = Arm(
+    name="history_kv_full_r100_persistent",
+    compress_history=False,
+    history_kv={
+        "method": "streamingllm",
+        "retention_ratio": 1.0,
+        "backend": "physical_eviction",
+        "persistent_session": True,
+    },
+    description=(
+        "Persistent Full control: the same physical-eviction session, "
+        "canonical delta append, and lifecycle as persistent KV baselines, "
+        "with 100% completed-history retention"
+    ),
+)
+
 # Joint Tool Definition + persistent completed-History baselines.  These use
 # one native BFCL prompt, independent 25% budgets for each enabled semantic
 # scope, and one physical cache compaction.  C2KV is intentionally absent:
 # its checkpoint was not trained for joint Tool+History gist compression.
-for _method in ("h2o", "snapkv_persistent", "pyramidkv"):
+for _method in ("h2o", "snapkv_persistent", "streamingllm", "pyramidkv"):
     for _mode, _tools, _history in (
         ("tool_only", True, False),
         ("history_only", False, True),

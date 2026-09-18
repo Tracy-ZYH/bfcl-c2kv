@@ -109,6 +109,14 @@ def build_row(summary_path: Path, root: Path) -> dict[str, Any]:
         retention = request_summary.get("history_kv_retention_mean")
         compression = request_summary.get("history_kv_compression_mean")
         compression_scope = "history-KV selection"
+    elif isinstance((summary.get("textarm_summary") or {}).get("history_retention_mean"), (int, float)):
+        textarm = summary["textarm_summary"]
+        retention = float(textarm["history_retention_mean"])
+        compression = textarm.get("effective_history_compression_mean")
+        requests = int(textarm.get("textarm_requests") or 0)
+        active = (float(textarm.get("retained_history_tokens") or 0) / requests
+                  if requests else None)
+        compression_scope = "text history exact-template token delta"
     elif method_key in {"full", "full_kv_retry"}:
         # retry_full's committed response is regenerated with full history KV.
         active, retention, compression = None, 1.0, 1.0
@@ -152,12 +160,18 @@ def build_row(summary_path: Path, root: Path) -> dict[str, Any]:
         "num_cases": summary.get("n"),
         "official_metric_kind": (summary.get("official_metric_kind") or
                                  ("binary_task_success" if benchmark == "tau2"
+                                  else "bfcl_accuracy" if benchmark == "bfcl"
                                   else "continuous_scenario_similarity")),
+        "official_correct_count": summary.get("official_correct_count",
+                                               summary.get("correct_count")),
+        "official_total_count": summary.get("official_total_count",
+                                             summary.get("n_scored")),
         "task_success_rate": ((summary.get("official_success_rate")
                                if summary.get("official_success_rate") is not None
                                else summary.get("semantic_score"))
                               if benchmark == "tau2" else None),
-        "official_score": summary.get("semantic_score"),
+        "official_score": summary.get("official_score",
+                                      summary.get("semantic_score")),
         "normal_termination_rate": normal_rate,
         "premature_termination_count": premature,
         "termination_counts_json": json.dumps(
@@ -178,6 +192,12 @@ def build_row(summary_path: Path, root: Path) -> dict[str, Any]:
         "compression_scope": compression_scope,
         "active_kv_tokens": active,
         "runtime": summary.get("runner_adapter_wall_sec"),
+        "e2e_wall_time": summary.get("runner_adapter_wall_sec"),
+        "generation_time": summary.get("generation_phase_wall_time"),
+        "maintenance_time": request_summary.get("proxy_assembly_sec_total"),
+        "recovery_time": request_summary.get("recovery_extract_sec_total"),
+        "tool_execution_time": summary.get("tool_execution_time"),
+        "official_scoring_time": summary.get("official_scoring_time"),
         "recovery_scope": scope,
         "native_metrics_json": json.dumps(native, ensure_ascii=False,
                                             separators=(",", ":")),

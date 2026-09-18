@@ -1080,7 +1080,43 @@ def _apply_text_arm(payload: Dict[str, Any], arm, conv: str,
         usage_acc["wall_sec"] += time.perf_counter() - t0
         return out
 
-    if arm.text_policy in ("hiagent", "hiagent_summary", "hiagent_full"):
+    if arm.text_policy == "recent_trunc_r25":
+        tokenizer = _portable_tokenizer()
+
+        def token_count(candidate: List[Dict[str, Any]]) -> int:
+            normalized = []
+            for message in candidate:
+                item = _normalize_history_message(message)
+                if item is not None:
+                    normalized.append(item)
+            if not any(item.get("role") == "system" for item in normalized):
+                normalized.insert(
+                    0, {"role": "system", "content": DEFAULT_SYSTEM_PROMPT})
+            kwargs = {
+                "tokenize": True,
+                "add_generation_prompt": True,
+                "enable_thinking": False,
+            }
+            tools = payload.get("tools") or []
+            if tools:
+                kwargs["tools"] = tools
+            encoded = tokenizer.apply_chat_template(normalized, **kwargs)
+            if hasattr(encoded, "keys") and "input_ids" in encoded:
+                encoded = encoded["input_ids"]
+            if hasattr(encoded, "ndim") and int(encoded.ndim) > 1:
+                encoded = encoded[0]
+            elif (isinstance(encoded, (list, tuple)) and encoded
+                  and isinstance(encoded[0], (list, tuple))):
+                encoded = encoded[0]
+            return len(encoded)
+
+        out, stats = textarms.recent_truncation_transform(
+            messages,
+            cutoff=_history_cutoff(messages),
+            retention_ratio=0.25,
+            token_count=token_count,
+        )
+    elif arm.text_policy in ("hiagent", "hiagent_summary", "hiagent_full"):
         out, stats = textarms.hiagent_transform(
             messages, compress, _render_action_dialect, model=model,
             default_system=DEFAULT_SYSTEM_PROMPT,
@@ -1813,6 +1849,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             }
         self._send_json(200, data)
         counts["wall_sec"] = round(total_sec, 4)
+        counts["assemble_sec"] = round(assemble_sec, 4)
         self._log_request(payload, normalized, counts, recover=recover_flags,
                           fingerprint=fingerprint, conv=conv, turn=turn,
                           plan=self._slim_plan(repair_plan))
@@ -1893,6 +1930,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "history_retained_fraction": counts.get("history_retained_fraction"),
             "n_gist_messages": counts.get("n_gist_messages"),
             "wall_sec": counts.get("wall_sec"),
+            "assemble_sec": counts.get("assemble_sec"),
             "error": error,
             "usage": (normalized or {}).get("usage"),
             "finish_reason": (normalized or {}).get("finish_reason"),

@@ -11,6 +11,8 @@ from pathlib import Path
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--expected-retention", type=float)
+    parser.add_argument("--require-zero-eviction", action="store_true")
     args = parser.parse_args()
     reports = []
     errors = []
@@ -29,6 +31,9 @@ def main() -> None:
                 errors.append(f"{log}: persistent_session_enabled is not true")
             if event.get("full_history_reprefill_performed") is not False:
                 errors.append(f"{log}: full-history re-prefill was performed/unknown")
+            if (args.require_zero_eviction
+                    and int(event.get("evicted_tokens_this_turn") or 0) != 0):
+                errors.append(f"{log}: Persistent Full evicted history tokens")
         nonempty = {key: value for key, value in sessions.items() if key}
         reusable = any(len(events) >= 2 for events in nonempty.values())
         if bad:
@@ -46,6 +51,23 @@ def main() -> None:
                     chain_checks += 1
                     if saved != reused:
                         errors.append(f"{log}: resident-position chain mismatch")
+        retention_rows = [
+            row for row in rows
+            if isinstance(row.get("history_kv_active_tokens"), (int, float))
+            and isinstance(row.get("history_kv_full_equivalent_tokens"), (int, float))
+            and float(row["history_kv_full_equivalent_tokens"]) > 0
+        ]
+        retention = (
+            sum(float(row["history_kv_active_tokens"]) for row in retention_rows)
+            / sum(float(row["history_kv_full_equivalent_tokens"]) for row in retention_rows)
+            if retention_rows else None
+        )
+        if args.expected_retention is not None:
+            if retention is None:
+                errors.append(f"{log}: no measured history retention")
+            elif abs(retention - args.expected_retention) > 1e-9:
+                errors.append(
+                    f"{log}: retention={retention}, expected={args.expected_retention}")
         reports.append({
             "request_log": str(log),
             "requests": len(rows),
@@ -53,6 +75,9 @@ def main() -> None:
             "session_lengths": {key: len(value) for key, value in nonempty.items()},
             "resident_chain_checks": chain_checks,
             "persistent_reuse_proven": reusable,
+            "measured_history_retention": retention,
+            "measured_history_compression": 1.0 / retention if retention else None,
+            "zero_eviction_required": args.require_zero_eviction,
         })
     if not reports:
         errors.append(f"{args.root}: no proxy request logs found")

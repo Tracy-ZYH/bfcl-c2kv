@@ -17,7 +17,7 @@ CASE_SET="${CASE_SET:-smoke2}" # smoke2 | stable52 | full200
 RUN_ROOT="${RUN_ROOT:-/home/zhuyuhan/runs/bfcl_joint_kv_${CASE_SET}_$(date +%Y%m%d_%H%M%S)}"
 PROXY_PORT_BASE="${PROXY_PORT_BASE:-34650}"
 STABLE52_IDS="${STABLE52_IDS:-/home/zhuyuhan/recovery_zhuyuhan/fork192/inputs/correct_ids.txt}"
-ARMS_CSV="${ARMS:-joint_h2o_tool_only_r25,joint_h2o_history_only_r25,joint_h2o_joint_r25,joint_snapkv_persistent_tool_only_r25,joint_snapkv_persistent_history_only_r25,joint_snapkv_persistent_joint_r25,joint_pyramidkv_tool_only_r25,joint_pyramidkv_history_only_r25,joint_pyramidkv_joint_r25,joint_cacheblend_history_only_r16}"
+ARMS_CSV="${ARMS:-joint_streamingllm_tool_only_r25,joint_streamingllm_history_only_r25,joint_streamingllm_joint_r25,joint_h2o_tool_only_r25,joint_h2o_history_only_r25,joint_h2o_joint_r25,joint_snapkv_persistent_tool_only_r25,joint_snapkv_persistent_history_only_r25,joint_snapkv_persistent_joint_r25,joint_pyramidkv_tool_only_r25,joint_pyramidkv_history_only_r25,joint_pyramidkv_joint_r25,joint_cacheblend_history_only_r16}"
 
 case "${CASE_SET}" in
   smoke2) RUN_IDS="multi_turn_base_5,multi_turn_base_12" ;;
