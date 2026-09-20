@@ -95,6 +95,7 @@ from .request_recovery import (
 )
 
 DEFAULT_RECOVERY_CONTROL = None
+PARITY_DEBUG = False
 from .agent.d_witness_core import select_k_star, witness_scores
 
 WITNESS_TOKENIZER = None
@@ -1643,6 +1644,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                              "kv_reuse": reuse_ctx})
             else:
                 out_payload = BACKEND.prepare_chat(staged, request_arm, plan)
+            if PARITY_DEBUG:
+                hint = dict(out_payload.get("c2kv_kv_memory_hint") or {})
+                hint["parity_debug"] = True
+                out_payload["c2kv_kv_memory_hint"] = hint
+                # Returned logprobs are observational only; decoding remains
+                # greedy with the harness's original sampling parameters.
+                out_payload["logprobs"] = True
+                out_payload["top_logprobs"] = 5
             # OpenAI chat accepts a caller-provided rid in this SGLang fork.
             # It lets us cancel exactly this request if the HTTP client times
             # out.  Never retry a timed-out generation: doing so creates a
@@ -1971,7 +1980,7 @@ def main(argv=None):
     global ARM, BACKEND, UPSTREAM, REQUEST_LOG_PATH
     global DOC_PACKING, MAX_DOC_LENGTH, MAX_DOC_NUM, QUERY_PROJECTION
     global WITNESS_TOKENIZER_PATH
-    global DEFAULT_RECOVERY_CONTROL
+    global DEFAULT_RECOVERY_CONTROL, PARITY_DEBUG
     global UPSTREAM_TIMEOUT, MAX_COMPLETION_TOKENS
     textarms.reset_state()  # fresh caches/state per proxy process
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1990,6 +1999,8 @@ def main(argv=None):
                         help="inject this limit only when the harness omitted both OpenAI token limits (0 disables)")
     parser.add_argument("--max-history-sessions", type=int, default=1,
                         help="maximum persistent history sessions; set to harness worker count")
+    parser.add_argument("--parity-debug", action="store_true",
+                        help="ask SGLang for read-only canonical prompt parity metadata")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--record-reference", default="",
                         help="append a reference-trajectory row per request (full-arm run)")
@@ -2009,6 +2020,7 @@ def main(argv=None):
                              "the rest; supplied by the checkpoint profile")
     args = parser.parse_args(argv)
     DEFAULT_RECOVERY_CONTROL = json.loads(args.recovery_control) if args.recovery_control else None
+    PARITY_DEBUG = bool(args.parity_debug)
     if DEFAULT_RECOVERY_CONTROL is not None:
         plan_request_recovery(DEFAULT_RECOVERY_CONTROL, [], lambda record: "")
     DOC_PACKING = args.doc_packing

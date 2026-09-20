@@ -54,7 +54,7 @@ def start_proxy(upstream: str, arm: str, port: int, log_dir: Path,
                 query_projection: str | None = None, witness_tokenizer: str = "",
                 python_bin: str | None = None, recovery_control: str = "",
                 upstream_timeout: int = 600, max_completion_tokens: int = 0,
-                max_history_sessions: int = 1):
+                max_history_sessions: int = 1, parity_debug: bool = False):
     # A health probe alone cannot prove that *our* child owns the port: when a
     # stale/concurrent proxy was already listening, the new child failed bind
     # while run.py accepted the old proxy's /health and sent an entire harness
@@ -92,6 +92,8 @@ def start_proxy(upstream: str, arm: str, port: int, log_dir: Path,
         command += ["--witness-tokenizer", witness_tokenizer]
     if recovery_control:
         command += ["--recovery-control", recovery_control]
+    if parity_debug:
+        command += ["--parity-debug"]
     proc = subprocess.Popen(
         command,
         stdout=out_handle,
@@ -161,6 +163,8 @@ def add_core_arguments(parser: argparse.ArgumentParser) -> None:
                         help="proxy-to-model generation timeout in seconds")
     parser.add_argument("--max-completion-tokens", type=int, default=0,
                         help="fallback generation limit when a harness omits one (0 preserves harness/server default)")
+    parser.add_argument("--parity-debug", action="store_true",
+                        help="log token/position parity metadata; benchmark semantics are unchanged")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--exact-out", action="store_true",
                         help="use the supplied output directory verbatim (matrix cells)")
@@ -311,7 +315,8 @@ def main(argv=None):
         python_bin=args.proxy_python, recovery_control=args.recovery_control,
         upstream_timeout=args.upstream_timeout,
         max_completion_tokens=args.max_completion_tokens,
-        max_history_sessions=max(1, int(args.num_workers)))
+        max_history_sessions=max(1, int(args.num_workers)),
+        parity_debug=bool(args.parity_debug))
     try:
         # every adapter owns its own "/v1" (adapters/base.py:v1) and its own
         # cwd; run.py hands over the bare proxy URL and nothing else

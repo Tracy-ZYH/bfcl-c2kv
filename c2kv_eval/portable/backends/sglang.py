@@ -921,6 +921,15 @@ class SglangBackend(Backend):
             if k in runtime}
         if isinstance(metadata, dict) and metadata.get("finish_message") is not None:
             cost["finish_message"] = metadata["finish_message"]
+        parity = metadata.get("parity_debug") if isinstance(metadata, dict) else None
+        if isinstance(parity, dict):
+            cost["parity_debug"] = parity
+        logprob_items = ((choice.get("logprobs") or {}).get("content") or [])
+        if logprob_items:
+            first = logprob_items[0] if isinstance(logprob_items[0], dict) else {}
+            cost["parity_first_generated_token"] = first.get("token")
+            cost["parity_first_generated_token_id"] = first.get("token_id")
+            cost["parity_first_top_logprobs"] = first.get("top_logprobs")
         cost.update(self._history_kv_cost(data))
         cost.update(self._kv_reuse_cost(data))
         return {

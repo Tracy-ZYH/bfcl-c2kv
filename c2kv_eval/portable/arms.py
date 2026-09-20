@@ -353,6 +353,14 @@ ARMS: Dict[str, Arm] = {
             description="raw text history, no compression (upper reference)",
         ),
         Arm(
+            name="full_same_server",
+            compress_history=False,
+            description=(
+                "raw text history on the persistent-server configuration, "
+                "without a persistent session or history-KV eviction"
+            ),
+        ),
+        Arm(
             name="hiagent",
             compress_history=False,
             text_policy="hiagent",

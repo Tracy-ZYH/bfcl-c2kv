@@ -30,6 +30,9 @@ MAX_TASKS="${MAX_TASKS:-}"
 TAU2_MAX_STEPS="${TAU2_MAX_STEPS:-100}"
 TAU2_TIMEOUT="${TAU2_TIMEOUT:-1800}"
 NUM_WORKERS="${NUM_WORKERS:-1}"
+MAX_PARALLEL_METHODS="${MAX_PARALLEL_METHODS:-0}"
+PARITY_DEBUG="${PARITY_DEBUG:-0}"
+SGLANG_RANDOM_SEED="${SGLANG_RANDOM_SEED:-42}"
 MAX_COMPLETION_TOKENS="${MAX_COMPLETION_TOKENS:-4096}"
 
 DEVICES_CSV="${DEVICES:-4,5,6,7}"
@@ -72,6 +75,12 @@ if [[ "${RESOLVE_DEVICE_UUIDS}" == "1" ]]; then
 fi
 echo "GPU binding requested=${REQUESTED_DEVICES_CSV} resolved=${DEVICES_CSV}"
 SLOT_COUNT="${#DEVICES_ARR[@]}"
+if [[ "${MAX_PARALLEL_METHODS}" -gt 0 && "${MAX_PARALLEL_METHODS}" -lt "${SLOT_COUNT}" ]]; then
+  WAVE_WIDTH="${MAX_PARALLEL_METHODS}"
+else
+  WAVE_WIDTH="${SLOT_COUNT}"
+fi
+DEVICE_SLOT_OFFSET=0
 for path in "${BFCL_ROOT}" "${SGLANG_ROOT}" "${C2KV_ROOT}" "${TAU2_ROOT}" "${C2KV_MODEL_PATH}" "${TOKENIZER_PATH}"; do
   if [[ ! -e "${path}" ]]; then
     echo "missing required path: ${path}" >&2
@@ -124,6 +133,7 @@ mkdir -p "${RUN_ROOT}/compare/${BENCHMARK}"
   echo "c2kv_pool_fraction=${C2KV_POOL_FRACTION}"
   echo "cacheblend_c2kv_pool_fraction=${CACHEBLEND_C2KV_POOL_FRACTION}"
   echo "cacheblend_attn_query_chunk=${CACHEBLEND_ATTN_QUERY_CHUNK}"
+  echo "sglang_random_seed=${SGLANG_RANDOM_SEED}"
   echo "reuse_results_root=${REUSE_RESULTS_ROOT}"
   echo "reuse_methods=${REUSE_METHODS}"
 } >"${RUN_ROOT}/manifests/run_manifest.txt"
@@ -194,8 +204,9 @@ start_server() {
   local persistent_args=()
   local pool_fraction="${C2KV_POOL_FRACTION}"
   case "${method}" in
-    streamingllm_r25|h2o_r25|snapkv_r25|pyramidkv_r25|persistent_full_r100|joint_recent_trunc_r25|joint_snapkv_r25)
-      persistent_args=(--enable-streaming-session --disable-radix-cache)
+    full_same_server|streamingllm_r25|h2o_r25|snapkv_r25|pyramidkv_r25|persistent_full_r100|joint_recent_trunc_r25|joint_snapkv_r25)
+      # Keep ordinary RadixCache semantics; SessionAwareCache decorates it.
+      persistent_args=(--enable-streaming-session)
       ;;
     cacheblend)
       # CacheBlend stores the full raw history KV entry. Long tau2 sessions can
@@ -240,6 +251,7 @@ start_server() {
         --disable-piecewise-cuda-graph \
         --disable-overlap-schedule \
         --sampling-backend pytorch \
+        --random-seed "${SGLANG_RANDOM_SEED}" \
         --host 127.0.0.1 \
         "${persistent_args[@]}" \
         --port "${port}"
@@ -301,6 +313,9 @@ run_tau2_cell() {
   if [[ -n "${extra_features}" ]]; then
     cmd+=(--capability-features "${extra_features}")
   fi
+  if [[ "${PARITY_DEBUG}" == "1" ]]; then
+    cmd+=(--parity-debug)
+  fi
   case "${reference_mode}" in
     record) cmd+=(--record-reference "${REFERENCE_JSONL}") ;;
     use) cmd+=(--reference "${REFERENCE_JSONL}") ;;
@@ -310,6 +325,7 @@ run_tau2_cell() {
 
   echo "RUN method=${method} arm=${arm} gpu=${device} server=${server_port} proxy=${proxy_port}"
   env PYTHONPATH="${TAU2_ROOT}/src:${BFCL_ROOT}:${SGLANG_ROOT}/python:${C2KV_ROOT}" \
+    MALLOC_ARENA_MAX=2 \
     no_proxy='*' NO_PROXY='*' http_proxy='' https_proxy='' HTTP_PROXY='' HTTPS_PROXY='' \
     "${RUNNER_PYTHON}" "${cmd[@]}" >"${RUN_ROOT}/logs/run_${method}.log" 2>&1
 }
@@ -319,14 +335,18 @@ run_wave() {
   shift
   local specs=("$@")
   local i
+  local device_indices=()
   for i in "${!specs[@]}"; do
+    local device_index=$(( (DEVICE_SLOT_OFFSET + i) % SLOT_COUNT ))
+    device_indices+=("${device_index}")
     IFS='|' read -r method arm features refmode <<<"${specs[$i]}"
-    start_server "${method}" "${DEVICES_ARR[$i]}" "${PORTS_ARR[$i]}"
+    start_server "${method}" "${DEVICES_ARR[$device_index]}" "${PORTS_ARR[$device_index]}"
   done
   local pids=()
   for i in "${!specs[@]}"; do
+    local device_index="${device_indices[$i]}"
     IFS='|' read -r method arm features refmode <<<"${specs[$i]}"
-    run_tau2_cell "${method}" "${arm}" "${DEVICES_ARR[$i]}" "${PORTS_ARR[$i]}" "${PROXY_PORTS_ARR[$i]}" "${features}" "${refmode}" &
+    run_tau2_cell "${method}" "${arm}" "${DEVICES_ARR[$device_index]}" "${PORTS_ARR[$device_index]}" "${PROXY_PORTS_ARR[$device_index]}" "${features}" "${refmode}" &
     pids+=("$!")
   done
   local rc=0
@@ -334,6 +354,7 @@ run_wave() {
     wait "${pid}" || rc=1
   done
   stop_wave_servers
+  DEVICE_SLOT_OFFSET=$(( (DEVICE_SLOT_OFFSET + ${#specs[@]}) % SLOT_COUNT ))
   if [[ "${rc}" -ne 0 ]]; then
     echo "wave ${wave_name} failed; see ${RUN_ROOT}/logs" >&2
     return "${rc}"
@@ -342,6 +363,7 @@ run_wave() {
 
 ALL_SPECS=(
   "full|full||record"
+  "full_same_server|full_same_server||none"
   "persistent_full_r100|history_kv_full_r100_persistent||none"
   "streamingllm_r25|history_kv_streamingllm_r25_persistent||none"
   "joint_recent_trunc_r25|joint_streamingllm_joint_r25||none"
@@ -390,7 +412,7 @@ wave_id=1
 while [[ "${index}" -lt "${#SELECTED_SPECS[@]}" ]]; do
   batch=()
   slot=0
-  while [[ "${slot}" -lt "${SLOT_COUNT}" && "${index}" -lt "${#SELECTED_SPECS[@]}" ]]; do
+  while [[ "${slot}" -lt "${WAVE_WIDTH}" && "${index}" -lt "${#SELECTED_SPECS[@]}" ]]; do
     next_spec="${SELECTED_SPECS[${index}]}"
     IFS='|' read -r next_method next_arm next_features next_refmode <<<"${next_spec}"
     if [[ "${next_refmode}" == "use" && ! -s "${REFERENCE_JSONL}" ]]; then
