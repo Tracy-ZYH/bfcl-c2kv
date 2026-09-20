@@ -291,6 +291,9 @@ class Arm:
     #  "chunk_tokens"}.  kv_reuse_spec() fills the defaults and rejects
     # anything the server would refuse.
     kv_reuse: Optional[Dict[str, object]] = None
+    # Frozen T02 Racer controller. The proxy must fail closed if its
+    # feature/recovery bridge is unavailable.
+    racer: bool = False
     # Benchmark-owned turn-end correctness oracle. The proxy only selects
     # and appends KV after an explicit privileged repair request.
     gold_recovery: Optional[str] = None
@@ -298,6 +301,8 @@ class Arm:
     description: str = ""
 
     def validate(self) -> None:
+        if self.racer and self.name.endswith("_racer") is False:
+            raise ValueError(f"Racer arm {self.name!r} must use an explicit _racer suffix")
         if self.gold_recovery not in (None, "witness", "random"):
             raise ValueError(f"unknown gold recovery selector {self.gold_recovery!r}")
         if self.gold_recovery and (not self.compress_history or self.repair or self.recover):
@@ -717,6 +722,38 @@ ARMS["history_kv_full_r100_persistent"] = Arm(
         "with 100% completed-history retention"
     ),
 )
+
+# Cross-backend public names: the non-Racer names are persistent 25% controls.
+for _public, _method in ((
+    "streamingllm_r25", "streamingllm"), (
+    "h2o_r25", "h2o"), (
+    "snapkv_r25", "snapkv_persistent"), (
+    "pyramidkv_r25", "pyramidkv"),
+):
+    if _public not in ARMS:
+        ARMS[_public] = Arm(
+            name=_public, compress_history=False,
+            history_kv={"method": _method, "retention_ratio": 0.25,
+                        "backend": "physical_eviction", "persistent_session": True},
+            description=f"persistent {_public} control",
+        )
+
+# Cross-backend Racer arms. These are registered only with the explicit
+# frozen-detector marker; proxy startup validates the runtime bridge.
+_RACER_BACKENDS = {
+    "c2kv_racer": ("c2kv", None),
+    "streamingllm_r25_racer": ("streamingllm", "history_kv_streamingllm_r25_persistent"),
+    "h2o_r25_racer": ("h2o", "history_kv_h2o_r25_persistent"),
+    "snapkv_r25_racer": ("snapkv", "history_kv_snapkv_persistent_r25_persistent"),
+    "pyramidkv_r25_racer": ("pyramidkv", "history_kv_pyramidkv_r25_persistent"),
+}
+for _name, (_label, _base_arm) in _RACER_BACKENDS.items():
+    _base = ARMS["c2kv" if _base_arm is None else _base_arm]
+    ARMS[_name] = Arm(
+        name=_name, compress_history=_base.compress_history, ratio=_base.ratio,
+        racer=True, history_kv=_base.history_kv,
+        description=f"{_label} + frozen T02 Racer (R1=1)",
+    )
 
 # Joint Tool Definition + persistent completed-History baselines.  These use
 # one native BFCL prompt, independent 25% budgets for each enabled semantic

@@ -932,6 +932,16 @@ class SglangBackend(Backend):
             cost["parity_first_top_logprobs"] = first.get("top_logprobs")
         cost.update(self._history_kv_cost(data))
         cost.update(self._kv_reuse_cost(data))
+        # Racer consumes the same ordinary-chat response fields as the
+        # native C1 path. Hidden states are prompt-last only when the request
+        # explicitly sets c2kv_prompt_last_hidden_only=true.
+        hidden = choice.get("hidden_states")
+        if hidden is not None:
+            cost["prompt_last_prefill_hidden"] = hidden
+        output_logprobs = [item.get("logprob") for item in (logprob_items or [])
+                           if isinstance(item, dict) and item.get("logprob") is not None]
+        if output_logprobs:
+            cost["draft_logprobs"] = output_logprobs
         return {
             "content": message.get("content"),
             "tool_calls": message.get("tool_calls"),

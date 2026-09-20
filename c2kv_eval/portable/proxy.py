@@ -89,6 +89,7 @@ _OPENER = urlrequest.build_opener(urlrequest.ProxyHandler({}))
 from . import repair_policy, textarms
 from .arms import Arm, get_arm, history_kv_spec, kv_reuse_spec
 from .backends import BackendError, get_backend
+from .racer import FrozenT02Racer, RacerError, semantic_units
 from .request_recovery import (
     apply_history_recovery_to_arm, apply_recovery_plan_to_arm,
     plan_request_recovery, split_recovery_control,
@@ -100,6 +101,7 @@ from .agent.d_witness_core import select_k_star, witness_scores
 
 WITNESS_TOKENIZER = None
 WITNESS_TOKENIZER_PATH = ""
+RACER_CONTROLLER: Optional[FrozenT02Racer] = None
 
 
 def _portable_tokenizer():
@@ -1544,6 +1546,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         eval_context = payload.pop("c2kv_eval_context", None)
         oracle = payload.pop("c2kv_oracle", None)
         self.eval_context = eval_context if isinstance(eval_context, dict) else {}
+
         if recovery_control is not None:
             try:
                 plan_request_recovery(recovery_control, [], lambda record: "")
@@ -1644,6 +1647,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
                              "kv_reuse": reuse_ctx})
             else:
                 out_payload = BACKEND.prepare_chat(staged, request_arm, plan)
+            if getattr(request_arm, "racer", False) and request_arm is ARM:
+                # Draft is not committed to BFCL; SGLang still advances its canonical
+                # pre-decode prompt ledger because the persistent KV is already resident.
+                out_payload["return_hidden_states"] = True
+                out_payload["c2kv_prompt_last_hidden_only"] = True
+                out_payload["racer_draft"] = True
+                out_payload["logprobs"] = True
+                out_payload["top_logprobs"] = 0
             if PARITY_DEBUG:
                 hint = dict(out_payload.get("c2kv_kv_memory_hint") or {})
                 hint["parity_debug"] = True
@@ -1736,6 +1747,60 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         total_sec = time.perf_counter() - start
 
+        if getattr(ARM, "racer", False):
+            if RACER_CONTROLLER is None:
+                raise RuntimeError("Racer controller is not initialized")
+            cost = normalized.get("cost") or {}
+            hidden = cost.get("prompt_last_prefill_hidden")
+            logprobs = cost.get("draft_logprobs") or []
+            tool_calls = normalized.get("tool_calls") or []
+            is_stop = normalized.get("finish_reason") == "stop" and not tool_calls
+            parse_ok = bool(tool_calls) or is_stop
+            try:
+                racer_meta = RACER_CONTROLLER.score(
+                    hidden=hidden, logprobs=logprobs,
+                    is_stop=is_stop, parse_ok=parse_ok)
+            except RacerError as error:
+                self._log_request(payload, normalized, counts, status="racer_feature_error",
+                                  error=str(error), fingerprint=fingerprint, conv=conv, turn=turn)
+                self._send_json(502, {"error": f"Racer feature bridge failed: {error}"})
+                return
+            units = semantic_units(messages)
+            racer_meta.update({
+                "racer_enabled": True,
+                "prompt_last_hidden_available": bool(hidden),
+                "draft_logprob_count": len(logprobs),
+                "draft_mean_nll": -sum(float(x) for x in logprobs) / len(logprobs),
+                "is_stop": is_stop, "parse_ok": parse_ok,
+                "candidate_count": len(units),
+                "selected_unit_id": units[0]["unit_id"] if units and racer_meta["triggered"] else None,
+                "selected_unit_tokens": units[0].get("original_token_span") if units and racer_meta["triggered"] else None,
+                "draft_action_hash": _digest([action_canonical({"content": normalized.get("content"), "tool_calls": normalized.get("tool_calls")})]),
+                "final_action_hash": _digest([action_canonical({"content": normalized.get("content"), "tool_calls": normalized.get("tool_calls")})]),
+                "regeneration_count": 0,
+            })
+            counts["racer"] = racer_meta
+            if racer_meta["triggered"]:
+                # R1 top-1; request_recovery applies the backend-specific
+                # materialization and returns only the regenerated response.
+                op = "append" if ARM.compress_history else "replace"
+                control = {"operation": op, "triggered": True,
+                           "selector": "index", "target_index": 0, "window": 1}
+                data, normalized, recovery_plan = retry_requested_recovery(
+                    control, messages, messages_out, counts, ARM,
+                    payload.get("tools"), data, normalized, call_upstream,
+                    history_ctx=history_ctx)
+                final_hash = _digest([action_canonical({"content": normalized.get("content"), "tool_calls": normalized.get("tool_calls")})])
+                counts["racer"].update({
+                    "recovery_count": 1, "regeneration_count": 1,
+                    "recovery_materialization": "rebuild" if getattr(ARM, "history_kv", None) else "native_append",
+                    "restored_raw_tokens": (counts.get("request_recovery") or {}).get("restored_raw_kv_tokens") or (counts.get("request_recovery") or {}).get("recovered_segment_size"),
+                    "final_action_hash": final_hash,
+                    "action_changed": final_hash != counts["racer"].get("draft_action_hash"),
+                })
+            else:
+                counts["racer"].update({"recovery_count": 0, "regeneration_count": 0,
+                                        "recovery_materialization": None, "action_changed": False})
         if recovery_control is not None:
             try:
                 data, normalized, repair_plan = retry_requested_recovery(
@@ -1959,10 +2024,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if k in ("system_raw", "history_raw", "current_raw", "compressed")})
         row.update({k: counts.get(k) for k in
                     ("doc_packing", "n_docs", "dropped_docs", "repair_frame",
-                     "history_kv", "kv_reuse", "gold_recovery", "request_recovery", "history_tensor_accounting")
+                     "history_kv", "kv_reuse", "gold_recovery", "request_recovery", "racer", "history_tensor_accounting")
                     if k in counts})
         if counts.get("textarm") is not None:
             row["textarm"] = counts["textarm"]
+        if isinstance(counts.get("racer"), dict):
+            row.update(counts["racer"])
         # backend cost block (hfserver: cache/logical/prompt/system_len;
         # sglang: kv_resident/kv_peak/kv_pool) + repair columns
         cost = (normalized or {}).get("cost") or {}
@@ -2034,6 +2101,8 @@ def main(argv=None):
     MAX_COMPLETION_TOKENS = int(args.max_completion_tokens)
     STATE.max_history_sessions = int(args.max_history_sessions)
     ARM = get_arm(args.arm)
+    global RACER_CONTROLLER
+    RACER_CONTROLLER = FrozenT02Racer() if ARM.racer else None
     UPSTREAM = args.upstream.rstrip("/")
     REQUEST_LOG_PATH = args.request_log
     BACKEND = get_backend(args.backend, _post_json)

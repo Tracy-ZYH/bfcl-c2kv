@@ -22,6 +22,8 @@ METHODS = {
     "snapkv_r312": ("SnapKV-r312", "history_kv_snapkv_r312", None),
     "pyramidkv_r312": (
         "PyramidKV-r312", "history_kv_pyramidkv_r312", None),
+    "persistent_full_r100": (
+        "Persistent Full@100%", "history_kv_full_r100_persistent", None),
 }
 
 
@@ -104,7 +106,14 @@ def build_row(summary_path: Path, root: Path) -> dict[str, Any]:
         tool_execution_success = legacy.get("tool_execution_success_rate")
 
     tensor = request_summary.get("history_tensor_accounting") or {}
-    if method_key.startswith(("streamingllm_", "h2o_", "snapkv_", "pyramidkv_")):
+    if method_key == "persistent_full_r100":
+        # Persistent Full is a raw-history control. Use measured scheduler
+        # counters, never the C2KV logical:gist ledger.
+        active = request_summary.get("history_kv_active_tokens_mean")
+        retention = request_summary.get("history_kv_retention_mean")
+        compression = request_summary.get("history_kv_compression_mean")
+        compression_scope = "persistent raw history KV"
+    elif method_key.startswith(("streamingllm_", "h2o_", "snapkv_", "pyramidkv_")):
         active = request_summary.get("history_kv_active_tokens_mean")
         retention = request_summary.get("history_kv_retention_mean")
         compression = request_summary.get("history_kv_compression_mean")
