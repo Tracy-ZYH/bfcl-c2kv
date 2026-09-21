@@ -45,6 +45,7 @@ defined once in docs/hybrid_spec.md (canonical gist_first layout):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from typing import Any, Dict, Optional
 
 
@@ -101,6 +102,14 @@ def history_kv_spec(arm: "Arm") -> Optional[Dict[str, Any]]:
             f"arm {arm.name!r}: unknown history_kv keys {sorted(unknown)}")
     spec: Dict[str, Any] = dict(HISTORY_KV_DEFAULTS)
     spec.update(config)
+    budget_text = os.environ.get("HISTORY_KV_TARGET_TOKENS", "").strip()
+    if budget_text:
+        budget = int(budget_text)
+        if budget < 1:
+            raise ValueError("HISTORY_KV_TARGET_TOKENS must be positive")
+        spec["target_tokens"] = budget
+        spec["retention_ratio"] = None
+        spec["requested_history_budget"] = budget
     method = str(spec.get("method") or "").strip().lower()
     method = HISTORY_KV_METHOD_ALIASES.get(method, method)
     if method not in HISTORY_KV_METHODS:
@@ -202,6 +211,14 @@ def kv_reuse_spec(arm: "Arm") -> Optional[Dict[str, Any]]:
             f"arm {arm.name!r}: unknown kv_reuse keys {sorted(unknown)}")
     spec: Dict[str, Any] = dict(KV_REUSE_DEFAULTS)
     spec.update(config)
+    budget_text = os.environ.get("HISTORY_KV_TARGET_TOKENS", "").strip()
+    if budget_text:
+        budget = int(budget_text)
+        if budget < 1:
+            raise ValueError("HISTORY_KV_TARGET_TOKENS must be positive")
+        spec["target_tokens"] = budget
+        spec["retention_ratio"] = None
+        spec["requested_history_budget"] = budget
     method = str(spec.get("method") or "").strip().lower()
     if method not in KV_REUSE_METHODS:
         raise ValueError(

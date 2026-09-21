@@ -418,6 +418,7 @@ class SglangBackend(Backend):
                 "history_kv_method": method,
                 "estimated": True,
                 "history_kv_backend": "physical_eviction",
+                "requested_history_budget": spec.get("target_tokens"),
                 "history_kv_eviction": eviction,
             }
             if session_id:
@@ -765,6 +766,8 @@ class SglangBackend(Backend):
                 "full_equivalent_history_tokens_source"
             ),
             "history_kv_active_tokens": report.get("active_history_kv_tokens"),
+            "requested_history_budget": report.get("requested_history_budget") or report.get("history_kv_target_tokens"),
+            "actual_history_tokens": report.get("active_history_kv") or physical.get("kept_history_tokens") or report.get("active_history_kv_tokens"),
             "history_kv_active_tokens_source": report.get(
                 "active_history_kv_tokens_source"
             ),

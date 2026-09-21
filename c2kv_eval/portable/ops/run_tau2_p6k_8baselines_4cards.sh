@@ -204,7 +204,7 @@ start_server() {
   local persistent_args=()
   local pool_fraction="${C2KV_POOL_FRACTION}"
   case "${method}" in
-    full_same_server|streamingllm_r25|h2o_r25|snapkv_r25|pyramidkv_r25|persistent_full_r100|joint_recent_trunc_r25|joint_snapkv_r25)
+    full_same_server|streamingllm_r25|streamingllm_r25_racer|h2o_r25|h2o_r25_racer|snapkv_r25|snapkv_r25_racer|pyramidkv_r25|pyramidkv_r25_racer|persistent_full_r100|joint_recent_trunc_r25|joint_snapkv_r25)
       # Keep ordinary RadixCache semantics; SessionAwareCache decorates it.
       persistent_args=(--enable-streaming-session)
       ;;
@@ -239,6 +239,7 @@ start_server() {
         --device cuda \
         --attention-backend "${ATTENTION_BACKEND}" \
         --tool-call-parser qwen25 \
+        --enable-return-hidden-states \
         --enable-c2kv \
         --c2kv-gist-type dynamic-interleave \
         --c2kv-gist-param qkv \
@@ -285,6 +286,7 @@ run_tau2_cell() {
     --checkpoint "${C2KV_MODEL_PATH}"
     --tokenizer "${TOKENIZER_PATH}"
     --num-workers "${NUM_WORKERS}"
+    --max-doc-length "${MAX_DOC_LENGTH:-512}" --max-doc-num "${MAX_DOC_NUM:-12}"
     --max-completion-tokens "${MAX_COMPLETION_TOKENS}"
   )
   case "${BENCHMARK}" in
@@ -362,6 +364,12 @@ run_wave() {
 }
 
 ALL_SPECS=(
+  "c2kv|c2kv||none"
+  "c2kv_racer|c2kv_racer||none"
+  "streamingllm_r25_racer|streamingllm_r25_racer||none"
+  "h2o_r25_racer|h2o_r25_racer||none"
+  "snapkv_r25_racer|snapkv_r25_racer||none"
+  "pyramidkv_r25_racer|pyramidkv_r25_racer||none"
   "full|full||record"
   "full_same_server|full_same_server||none"
   "persistent_full_r100|history_kv_full_r100_persistent||none"

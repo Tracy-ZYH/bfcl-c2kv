@@ -50,10 +50,10 @@ cleanup() {
   for p in "${PIDS[@]:-}"; do wait "$p" 2>/dev/null || true; done
 }
 trap cleanup EXIT INT TERM
-GPU=(0 1 2 3); PORT=(34740 34750 34760 34770)
-BACKEND=(c2kv h2o snapkv pyramidkv)
-# GPU0 runs C2KV and StreamingLLM sequentially; other GPUs run one backend.
-ARMS=("c2kv c2kv_racer streamingllm_r25 streamingllm_r25_racer" "h2o_r25 h2o_r25_racer" "snapkv_r25 snapkv_r25_racer" "pyramidkv_r25 pyramidkv_r25_racer")
+GPU=("${GPU_ID:-0}"); PORT=("${SERVER_PORT:-34740}")
+BACKEND=(c2kv)
+# One physical GPU, one server, all ten arms serialized.
+ARMS=("${ARMS_SPEC:-c2kv c2kv_racer}")
 [[ -x "${CC_BIN}" && -x "${CXX_BIN}" ]] || { echo "gcc-12/g++-12 required; set CC_BIN/CXX_BIN" >&2; exit 1; }
 for i in "${!GPU[@]}"; do
   echo "starting ${BACKEND[$i]} on physical GPU ${GPU[$i]} (serialized JIT startup)"
@@ -100,7 +100,7 @@ for i in "${!PORT[@]}"; do
       --checkpoint "${MODEL_PATH}" --tokenizer "${TOKENIZER_PATH}" \
       --bfcl-dir "${BFCL_DIR}" \
       --run-ids "${RUN_IDS}" \
-      --num-workers 1 --max-tasks "${CASES}" --out "$out" --exact-out \
+      --num-workers 1 --max-tasks "${CASES}" --max-doc-length "${MAX_DOC_LENGTH:-512}" --max-doc-num "${MAX_DOC_NUM:-12}" --out "$out" --exact-out \
       2>&1 | tee "${RESULT_ROOT}/runs/${arm}.launcher.log"
   done
 done

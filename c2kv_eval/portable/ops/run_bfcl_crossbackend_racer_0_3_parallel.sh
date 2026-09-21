@@ -86,24 +86,27 @@ for i in "${!GPU[@]}"; do
   done
 done
 export PYTHONPATH="${ROOT}:${SGLANG_ROOT}/python:${PYTHONPATH:-}"
-ARM_INDEX=0
-for i in "${!PORT[@]}"; do
+run_gpu_arms() {
+  local i="$1" local_index=0 arm out proxy_port
+  local arms_for_gpu=()
   read -ra arms_for_gpu <<<"${ARMS[$i]}"
   for arm in "${arms_for_gpu[@]}"; do
     out="${RESULT_ROOT}/runs/${arm}"
-    proxy_port=$((PROXY_PORT_BASE + ARM_INDEX))
-    ARM_INDEX=$((ARM_INDEX + 1))
-    echo "running ${arm} via proxy port ${proxy_port}"
-    "${BFCL_PYTHON}" -m c2kv_eval.portable.run --benchmark bfcl --categories "${CATEGORY}" \
-      --arm "$arm" --upstream "http://127.0.0.1:${PORT[$i]}" --model c2kv-agent \
-      --proxy-port "${proxy_port}" \
-      --checkpoint "${MODEL_PATH}" --tokenizer "${TOKENIZER_PATH}" \
-      --bfcl-dir "${BFCL_DIR}" \
-      --run-ids "${RUN_IDS}" \
-      --num-workers 1 --max-tasks "${CASES}" --out "$out" --exact-out \
-      2>&1 | tee "${RESULT_ROOT}/runs/${arm}.launcher.log"
+    proxy_port=$((PROXY_PORT_BASE + i * 4 + local_index))
+    local_index=$((local_index + 1))
+    echo "[gpu ${GPU[$i]}] running ${arm} via proxy port ${proxy_port}"
+    "${BFCL_PYTHON}" -m c2kv_eval.portable.run --benchmark bfcl --categories "${CATEGORY}" --arm "$arm" --upstream "http://127.0.0.1:${PORT[$i]}" --model c2kv-agent --proxy-port "${proxy_port}" --checkpoint "${MODEL_PATH}" --tokenizer "${TOKENIZER_PATH}" --bfcl-dir "${BFCL_DIR}" --run-ids "${RUN_IDS}" --num-workers 1 --max-tasks "${CASES}" --out "$out" --exact-out 2>&1 | tee "${RESULT_ROOT}/runs/${arm}.launcher.log"
   done
+}
+WORKER_PIDS=()
+for i in "${!PORT[@]}"; do
+  run_gpu_arms "$i" & WORKER_PIDS+=("$!")
 done
+worker_status=0
+for p in "${WORKER_PIDS[@]}"; do
+  wait "$p" || worker_status=1
+done
+(( worker_status == 0 )) || { echo "one or more GPU arm workers failed" >&2; exit 1; }
 "${BFCL_PYTHON}" - "${RESULT_ROOT}" <<'PYEND'
 import csv,json,sys
 from pathlib import Path

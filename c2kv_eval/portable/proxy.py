@@ -1778,6 +1778,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "draft_action_hash": _digest([action_canonical({"content": normalized.get("content"), "tool_calls": normalized.get("tool_calls")})]),
                 "final_action_hash": _digest([action_canonical({"content": normalized.get("content"), "tool_calls": normalized.get("tool_calls")})]),
                 "regeneration_count": 0,
+                "risk_gt_0_5_count": int(bool(racer_meta["triggered"])),
+                "b0_admitted_count": int(bool(units) and bool(racer_meta["triggered"])),
+                "recovery_trigger_count": int(bool(racer_meta["triggered"])),
+                "recovery_success_count": 0,
+                "model_calls_per_step": 1,
+                "recovery_time": 0.0,
             })
             counts["racer"] = racer_meta
             if racer_meta["triggered"]:
@@ -1793,6 +1799,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 final_hash = _digest([action_canonical({"content": normalized.get("content"), "tool_calls": normalized.get("tool_calls")})])
                 counts["racer"].update({
                     "recovery_count": 1, "regeneration_count": 1,
+                    "recovery_success_count": 1,
+                    "model_calls_per_step": 2,
+                    "recovery_time": float((counts.get("request_recovery") or {}).get("retry_sec") or 0),
                     "recovery_materialization": "rebuild" if getattr(ARM, "history_kv", None) else "native_append",
                     "restored_raw_tokens": (counts.get("request_recovery") or {}).get("restored_raw_kv_tokens") or (counts.get("request_recovery") or {}).get("recovered_segment_size"),
                     "final_action_hash": final_hash,
